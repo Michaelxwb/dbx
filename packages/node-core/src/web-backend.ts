@@ -186,7 +186,7 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
         }),
       });
       const result = (await res.json()) as { documents: unknown[]; total: number };
-      return mongoDocumentsToQueryResult(result.documents.slice(0, options?.maxRows ?? result.documents.length), result.total);
+      return mongoDocumentsToQueryResult(result.documents, result.total);
     }
     const write = parseMongoWriteCommand(sql);
     if (write) {

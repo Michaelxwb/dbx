@@ -431,7 +431,7 @@ export async function executeQuery(config: ConnectionConfig, sql: string, option
         mongoAggregateDocuments(config, aggregate.collection, aggregate.pipeline, resolveMaxRows(options)),
         resolveTimeoutMs(options),
       );
-      return mongoDocumentsToQueryResult(result.documents.slice(0, resolveMaxRows(options)), result.total);
+      return mongoDocumentsToQueryResult(result.documents, result.total);
     }
     const write = parseMongoWriteCommand(sql);
     if (write) {

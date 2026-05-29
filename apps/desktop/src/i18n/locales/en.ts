@@ -361,6 +361,7 @@ export default {
   grid: {
     rows: "{count} rows",
     totalRows: "Total {count} rows",
+    totalRowCount: "({count} total)",
     rowsAffected: "{count} rows affected",
     querySuccess: "Query executed successfully",
     noRows: "No data",
@@ -1011,6 +1012,13 @@ export default {
     apply: "Apply Changes",
     ready: "Ready",
     saved: "Table structure updated",
+    extendedProperties: "Extended",
+    autoIncrement: "Auto Increment",
+    onUpdateCurrentTimestamp: "Auto Update Time",
+    identity: "Identity",
+    identityGeneration: "Generation",
+    identitySeed: "Seed",
+    identityIncrement: "Increment",
   },
   diagram: {
     title: "Relationship Diagram",
@@ -1414,6 +1422,13 @@ export default {
     sidebarActivationSingleDescription: "Open actionable sidebar items with one click.",
     sidebarActivationDouble: "Double click",
     sidebarActivationDoubleDescription: "Single click selects rows; double click opens items.",
+    sidebarObjectDisplay: "Sidebar object layout",
+    sidebarObjectDisplayGrouped: "Advanced view",
+    sidebarObjectDisplayGroupedDescription:
+      "Group objects by tables, views, procedures, and functions for databases with more object types.",
+    sidebarObjectDisplaySimple: "Simple view",
+    sidebarObjectDisplaySimpleDescription:
+      "List tables and views directly under each database or schema to reduce intermediate levels.",
     autoSelectActiveSidebarNode: "Always select opened item",
     autoSelectActiveSidebarNodeDescription:
       "When switching tabs, select the matching visible table, collection, or SQL file in the sidebar.",

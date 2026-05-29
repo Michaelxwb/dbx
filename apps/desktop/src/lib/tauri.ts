@@ -41,7 +41,11 @@ import type {
   DataComparePreparationOptions,
 } from "@/lib/dataCompare";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff } from "@/lib/schemaDiff";
-import type { BuildTableStructureChangeSqlOptions, TableStructureChangeSql } from "@/lib/tableStructureEditorSql";
+import type {
+  BuildTableStructureChangeSqlOptions,
+  BuildSingleColumnAlterSqlOptions,
+  TableStructureChangeSql,
+} from "@/lib/tableStructureEditorSql";
 import type { BuildTableSelectSqlOptions } from "@/lib/tableSelectSql";
 import type { DatabaseSearchSql, DatabaseSearchSqlOptions, SearchResultWhereOptions } from "@/lib/databaseSearch";
 import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceInput } from "@/lib/objectSourceEditor";
@@ -313,6 +317,10 @@ export async function pendingOpenSqlFiles(): Promise<string[]> {
   return invoke("pending_open_sql_files");
 }
 
+export async function pendingOpenDbFiles(): Promise<string[]> {
+  return invoke("pending_open_db_files");
+}
+
 export async function pendingOpenConnectionLinks(): Promise<string[]> {
   return invoke("pending_open_connection_links");
 }
@@ -450,6 +458,10 @@ export async function executeMulti(
   },
 ): Promise<QueryResult[]> {
   return invoke("execute_multi", { connectionId, database, sql, schema, executionId, ...options });
+}
+
+export async function refreshConnections(): Promise<void> {
+  return invoke("refresh_connections");
 }
 
 export async function cancelQuery(executionId: string): Promise<boolean> {
@@ -617,6 +629,12 @@ export async function buildCreateTableSql(
   options: BuildTableStructureChangeSqlOptions,
 ): Promise<TableStructureChangeSql> {
   return invoke("build_create_table_sql", { options });
+}
+
+export async function buildSingleColumnAlterSql(
+  options: BuildSingleColumnAlterSqlOptions,
+): Promise<TableStructureChangeSql> {
+  return invoke("build_single_column_alter_sql", { options });
 }
 
 export async function analyzeEditableQueryEditability(sql: string): Promise<QueryEditability> {

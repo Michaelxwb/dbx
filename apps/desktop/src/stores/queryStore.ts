@@ -708,14 +708,12 @@ export const useQueryStore = defineStore("query", () => {
         clientSessionId: tab.id,
         timeoutSecs: queryTimeoutSecs,
       };
-      const results = await api.executeMulti(
-        tab.connectionId,
-        tab.database,
-        sqlToExecute,
-        tab.schema,
-        executionId,
-        executionOptions,
-      );
+      const frontendTimeoutSecs = Math.max(queryTimeoutSecs * 2, 60);
+      const timeoutError = new Error(`查询超时 (${frontendTimeoutSecs}s)，请检查数据库连接是否正常`);
+      const results = await Promise.race([
+        api.executeMulti(tab.connectionId, tab.database, sqlToExecute, tab.schema, executionId, executionOptions),
+        new Promise<never>((_, reject) => setTimeout(() => reject(timeoutError), frontendTimeoutSecs * 1000)),
+      ]);
       console.info("[DBX][executeTabSql:execute-multi:done]", {
         traceId,
         resultCount: results.length,
@@ -742,26 +740,33 @@ export const useQueryStore = defineStore("query", () => {
         current.resultCountSql = countSql;
         current.resultSessionId = current.result?.session_id ?? undefined;
         if (countSql && current.result?.rows.length) {
-          const capturedExecutionId = executionId;
-          const capturedTabId = id;
-          const capturedCountSql = countSql;
-          const capturedConnectionId = tab.connectionId;
-          const capturedDatabase = tab.database;
-          const capturedSchema = tab.schema;
-          api
-            .executeQuery(capturedConnectionId, capturedDatabase ?? "", capturedCountSql, capturedSchema)
-            .then((countResult) => {
-              const tabAfterCount = tabs.value.find((t) => t.id === capturedTabId);
-              if (tabAfterCount?.executionId === capturedExecutionId) {
-                const total = Number(countResult.rows?.[0]?.[0] ?? 0);
-                if (total > 0) {
-                  tabAfterCount.resultTotalRowCount = total;
+          // When the result set is smaller than the page size we already have
+          // all rows — compute the total directly instead of running COUNT(*).
+          const resultRowCount = current.result.rows.length;
+          if (pageLimit !== undefined && resultRowCount < pageLimit) {
+            current.resultTotalRowCount = (pageOffset ?? 0) + resultRowCount;
+          } else {
+            const capturedExecutionId = executionId;
+            const capturedTabId = id;
+            const capturedCountSql = countSql;
+            const capturedConnectionId = tab.connectionId;
+            const capturedDatabase = tab.database;
+            const capturedSchema = tab.schema;
+            api
+              .executeQuery(capturedConnectionId, capturedDatabase ?? "", capturedCountSql, capturedSchema)
+              .then((countResult) => {
+                const tabAfterCount = tabs.value.find((t) => t.id === capturedTabId);
+                if (tabAfterCount?.executionId === capturedExecutionId) {
+                  const total = Number(countResult.rows?.[0]?.[0] ?? 0);
+                  if (total > 0) {
+                    tabAfterCount.resultTotalRowCount = total;
+                  }
                 }
-              }
-            })
-            .catch(() => {
-              // COUNT query failed — silently ignore
-            });
+              })
+              .catch(() => {
+                // COUNT query failed — silently ignore
+              });
+          }
         }
         console.info("[DBX][executeTabSql:metadata:start]", { traceId, elapsed: elapsed() });
         await analyzeQueryMetadata(current, queryBaseSql);
@@ -916,6 +921,18 @@ export const useQueryStore = defineStore("query", () => {
     tab.queryEditabilityReason = undefined;
   }
 
+  function notifyConnectionMayBeLost() {
+    const stuck = tabs.value.filter((t) => t.isExecuting);
+    if (stuck.length > 0) {
+      stuck.forEach((t) => {
+        t.isExecuting = false;
+        t.isCancelling = false;
+        t.executionId = undefined;
+        t.result = toErrorResult(new Error("连接可能已断开，请刷新数据重试"));
+      });
+    }
+  }
+
   async function trimResultCache() {
     const inactive = tabs.value.filter((t) => t.id !== activeTabId.value && (t.result || t.results));
     if (inactive.length > MAX_CACHED_RESULTS) {
@@ -964,5 +981,6 @@ export const useQueryStore = defineStore("query", () => {
     cancelTabExecution,
     cancelTabExplain,
     reloadEvictedTab,
+    notifyConnectionMayBeLost,
   };
 });

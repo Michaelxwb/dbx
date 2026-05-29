@@ -68,7 +68,11 @@ import type {
   DataGridSaveStatementOptions,
   HiveTablePropertiesSqlOptions,
 } from "@/lib/dataGridSql";
-import type { BuildTableStructureChangeSqlOptions, TableStructureChangeSql } from "@/lib/tableStructureEditorSql";
+import type {
+  BuildTableStructureChangeSqlOptions,
+  BuildSingleColumnAlterSqlOptions,
+  TableStructureChangeSql,
+} from "@/lib/tableStructureEditorSql";
 import type { BuildTableSelectSqlOptions } from "@/lib/tableSelectSql";
 import type { DatabaseSearchSql, DatabaseSearchSqlOptions, SearchResultWhereOptions } from "@/lib/databaseSearch";
 import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceInput } from "@/lib/objectSourceEditor";
@@ -636,6 +640,12 @@ export async function buildCreateTableSql(
   return post("/api/query/build-create-table-sql", { options });
 }
 
+export async function buildSingleColumnAlterSql(
+  options: BuildSingleColumnAlterSqlOptions,
+): Promise<TableStructureChangeSql> {
+  return post("/api/query/build-single-column-alter-sql", { options });
+}
+
 export async function analyzeEditableQueryEditability(sql: string): Promise<QueryEditability> {
   return post("/api/query/analyze-editability", { sql });
 }
@@ -896,6 +906,10 @@ export async function listenSqlFileProgress(_handler: (progress: SqlFileProgress
 }
 
 export async function pendingOpenSqlFiles(): Promise<string[]> {
+  return [];
+}
+
+export async function pendingOpenDbFiles(): Promise<string[]> {
   return [];
 }
 
@@ -1352,4 +1366,8 @@ export async function saveSidebarLayout(layout: SidebarLayout): Promise<void> {
 
 export async function loadSidebarLayout(): Promise<SidebarLayout | null> {
   return get("/api/layout/sidebar");
+}
+
+export async function refreshConnections(): Promise<void> {
+  // Web mode doesn't maintain persistent connection pools — no-op
 }

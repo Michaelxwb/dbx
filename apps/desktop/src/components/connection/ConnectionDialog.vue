@@ -119,6 +119,7 @@ const jdbcDrivers = ref<JdbcDriverInfo[]>([]);
 const agentDrivers = ref<AgentDriverInstallState[]>([]);
 const selectedJdbcDriverPath = ref("");
 const connectionUrlInput = ref("");
+const oceanbaseSubMode = ref<"mysql" | "oracle">("mysql");
 const dialogStep = ref<DialogStep>("select");
 const dbPickerView = ref<DbPickerView>("icon");
 const dbSearchQuery = ref("");
@@ -256,6 +257,7 @@ const driverProfiles: Record<
   sundb: { type: "sundb", port: 22000, user: "root", label: "SunDB", icon: "sundb" },
   jdbc: { type: "jdbc", port: 0, user: "", label: "JDBC", icon: "jdbc" },
   tdengine: { type: "tdengine", port: 6041, user: "root", label: "TDengine", icon: "tdengine" },
+  iris: { type: "iris", port: 1972, user: "_SYSTEM", label: "IRIS", icon: "iris" },
   custom_mysql: {
     type: "mysql",
     port: 3306,
@@ -275,8 +277,12 @@ const driverProfiles: Record<
 };
 
 function profileForConfig(config: ConnectionConfig) {
-  if (config.driver_profile && driverProfiles[config.driver_profile]) return config.driver_profile;
+  if (config.driver_profile && driverProfiles[config.driver_profile]) {
+    if (config.driver_profile === "oceanbase-oracle") return "oceanbase";
+    return config.driver_profile;
+  }
   if (config.db_type === "dameng") return "dm";
+  if (config.db_type === "oceanbase-oracle") return "oceanbase";
   return config.db_type;
 }
 
@@ -317,6 +323,17 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       jdbcDriverPathsInput.value = "";
     }
   }
+}
+
+function switchOceanbaseMode(mode: "mysql" | "oracle") {
+  oceanbaseSubMode.value = mode;
+  if (mode === "mysql") {
+    applyProfile("oceanbase", false);
+  } else {
+    applyProfile("oceanbase-oracle", false);
+    selectedType.value = "oceanbase";
+  }
+  resetTestState();
 }
 
 watch(
@@ -370,6 +387,9 @@ watch(
         redis_cluster_nodes: config.redis_cluster_nodes || "",
       };
       selectedType.value = profile;
+      if (profile === "oceanbase") {
+        oceanbaseSubMode.value = config.driver_profile === "oceanbase-oracle" ? "oracle" : "mysql";
+      }
       mongoUseUrl.value = !!config.connection_string;
       jdbcDriverPathsInput.value = (config.jdbc_driver_paths || []).join("\n");
       customDriverName.value = isCustomCompatibleProfile() ? config.driver_label || "" : "";
@@ -380,6 +400,7 @@ watch(
       form.value = defaultForm();
       selectedType.value = "mysql";
       customDriverName.value = "";
+      oceanbaseSubMode.value = "mysql";
       dialogStep.value = "select";
       configTab.value = "connection";
     }
@@ -472,6 +493,7 @@ const iconTypeMap: Record<string, string> = {
   hive: "hive",
   db2: "db2",
   informix: "informix",
+  iris: "iris",
   neo4j: "neo4j",
   cassandra: "cassandra",
   bigquery: "bigquery",
@@ -499,7 +521,6 @@ const dbOptions = [
   { value: "gaussdb", label: "GaussDB" },
   { value: "tidb", label: "TiDB" },
   { value: "oceanbase", label: "OceanBase" },
-  { value: "oceanbase-oracle", label: "OceanBase Oracle Mode" },
   { value: "goldendb", label: "GoldenDB" },
   { value: "tdsql", label: "TDSQL" },
   { value: "polardb", label: "PolarDB" },
@@ -533,6 +554,7 @@ const dbOptions = [
   { value: "bigquery", label: "BigQuery" },
   { value: "kylin", label: "Kylin" },
   { value: "sundb", label: "SunDB" },
+  { value: "iris", label: "IRIS" },
   { value: "jdbc", label: "JDBC" },
   { value: "custom_mysql", label: "Custom (MySQL)" },
   { value: "custom_postgres", label: "Custom (PostgreSQL)" },
@@ -982,6 +1004,7 @@ function resetForm() {
   selectedType.value = "mysql";
   customDriverName.value = "";
   mongoUseUrl.value = false;
+  oceanbaseSubMode.value = "mysql";
   jdbcDriverPathsInput.value = "";
   selectedJdbcDriverPath.value = "";
   connectionUrlInput.value = "";
@@ -1041,6 +1064,10 @@ function applyConnectionPrefill(draft: ConnectionDeepLinkDraft) {
     one_time: draft.oneTime || undefined,
   };
   selectedType.value = draft.driverProfile;
+  if (draft.driverProfile === "oceanbase-oracle") {
+    oceanbaseSubMode.value = "oracle";
+    selectedType.value = "oceanbase";
+  }
   customDriverName.value = isCustomCompatibleProfile() ? draft.driverLabel : "";
   mongoUseUrl.value = !!draft.useMongoUrl;
   if (draft.name?.trim()) {
@@ -1501,6 +1528,27 @@ function openExternalUrl(url: string) {
                   </button>
                 </div>
 
+                <!-- OceanBase mode toggle -->
+                <div v-if="selectedType === 'oceanbase'" class="grid grid-cols-4 items-center gap-4">
+                  <Label class="text-right text-xs">{{ t("connection.mode") }}</Label>
+                  <div class="col-span-3 flex gap-2">
+                    <Button
+                      size="sm"
+                      :variant="oceanbaseSubMode === 'mysql' ? 'default' : 'outline'"
+                      @click="switchOceanbaseMode('mysql')"
+                    >
+                      {{ t("connection.oceanbaseMySQLMode") }}
+                    </Button>
+                    <Button
+                      size="sm"
+                      :variant="oceanbaseSubMode === 'oracle' ? 'default' : 'outline'"
+                      @click="switchOceanbaseMode('oracle')"
+                    >
+                      {{ t("connection.oceanbaseOracleMode") }}
+                    </Button>
+                  </div>
+                </div>
+
                 <div v-if="isCustomCompatibleProfile()" class="grid grid-cols-4 items-center gap-4">
                   <Label class="text-right">{{ t("connection.driverName") }}</Label>
                   <Input
@@ -1918,23 +1966,7 @@ function openExternalUrl(url: string) {
                     </label>
                   </div>
 
-                  <div
-                    v-if="
-                      form.db_type === 'mysql' ||
-                      form.db_type === 'postgres' ||
-                      form.db_type === 'redshift' ||
-                      form.db_type === 'informix' ||
-                      form.db_type === 'kingbase' ||
-                      form.db_type === 'highgo' ||
-                      form.db_type === 'yashandb' ||
-                      form.db_type === 'vastbase' ||
-                      form.db_type === 'goldendb' ||
-                      form.db_type === 'clickhouse' ||
-                      form.db_type === 'saphana' ||
-                      form.db_type === 'bigquery'
-                    "
-                    class="grid grid-cols-4 items-center gap-4"
-                  >
+                  <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right">{{ t("connection.urlParams") }}</Label>
                     <Input
                       v-model="form.url_params"

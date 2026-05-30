@@ -522,6 +522,7 @@ fn mysql_error_should_retry_without_ssl(error: &str) -> bool {
 fn mysql_error_should_retry_with_text_protocol(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     (lower.contains("1105") && lower.contains("hy000"))
+        || lower.contains("com_stmt_prepare")
         || lower.contains("prepared statement protocol")
         || lower.contains("this command is not supported in the prepared statement protocol yet")
 }
@@ -848,13 +849,12 @@ pub async fn get_conn_with_health_check(pool: &MySqlPool) -> Result<mysql_async:
     }
 }
 
-async fn execute_result_set_with_text_protocol(
-    pool: &MySqlPool,
+async fn execute_result_set_with_text_protocol_on_conn(
+    conn: &mut mysql_async::Conn,
     sql: &str,
     row_limit: usize,
     start: Instant,
 ) -> Result<QueryResult, String> {
-    let mut conn = get_conn_with_health_check(pool).await?;
     let mut result = conn.query_iter(sql).await.map_err(|e| e.to_string())?;
     let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
 
@@ -890,13 +890,12 @@ async fn execute_result_set_with_text_protocol(
     })
 }
 
-async fn execute_result_set_with_prepared_protocol(
-    pool: &MySqlPool,
+async fn execute_result_set_with_prepared_protocol_on_conn(
+    conn: &mut mysql_async::Conn,
     sql: &str,
     row_limit: usize,
     start: Instant,
 ) -> Result<QueryResult, String> {
-    let mut conn = get_conn_with_health_check(pool).await?;
     let mut result = conn.exec_iter(sql, ()).await.map_err(|e| e.to_string())?;
     let columns: Vec<String> = result.columns_ref().iter().map(|c| c.name_str().to_string()).collect();
 
@@ -942,34 +941,43 @@ pub async fn execute_query_with_max_rows(
     bare: bool,
     max_rows: Option<usize>,
 ) -> Result<QueryResult, String> {
+    let mut conn = get_conn_with_health_check(pool).await?;
+    execute_query_on_conn_with_max_rows(&mut conn, sql, bare, max_rows).await
+}
+
+pub async fn execute_query_on_conn_with_max_rows(
+    conn: &mut mysql_async::Conn,
+    sql: &str,
+    bare: bool,
+    max_rows: Option<usize>,
+) -> Result<QueryResult, String> {
     let start = Instant::now();
     let row_limit = query_result_row_limit(max_rows);
 
     if is_result_set_query(sql) {
         if bare || requires_text_protocol_query(sql) {
-            execute_result_set_with_text_protocol(pool, sql, row_limit, start).await
+            execute_result_set_with_text_protocol_on_conn(conn, sql, row_limit, start).await
         } else {
-            match execute_result_set_with_prepared_protocol(pool, sql, row_limit, start).await {
+            match execute_result_set_with_prepared_protocol_on_conn(conn, sql, row_limit, start).await {
                 Ok(result) => Ok(result),
                 Err(err) if mysql_error_should_retry_with_text_protocol(&err) => {
-                    execute_result_set_with_text_protocol(pool, sql, row_limit, start).await
+                    execute_result_set_with_text_protocol_on_conn(conn, sql, row_limit, start).await
                 }
                 Err(err) => Err(err),
             }
         }
     } else {
-        let mut conn = get_conn_with_health_check(pool).await?;
-        let previous_explicit_timestamp_defaults = enable_explicit_timestamp_defaults_for_query(&mut conn, sql).await;
+        let previous_explicit_timestamp_defaults = enable_explicit_timestamp_defaults_for_query(conn, sql).await;
         let result = match conn.query_iter(sql).await {
             Ok(result) => result,
             Err(err) => {
-                restore_explicit_timestamp_defaults_for_query(&mut conn, previous_explicit_timestamp_defaults).await;
+                restore_explicit_timestamp_defaults_for_query(conn, previous_explicit_timestamp_defaults).await;
                 return Err(err.to_string());
             }
         };
         let affected_rows = result.affected_rows();
         let drop_result = result.drop_result().await;
-        restore_explicit_timestamp_defaults_for_query(&mut conn, previous_explicit_timestamp_defaults).await;
+        restore_explicit_timestamp_defaults_for_query(conn, previous_explicit_timestamp_defaults).await;
         drop_result.map_err(|e| e.to_string())?;
 
         Ok(QueryResult {
@@ -1310,6 +1318,13 @@ mod tests {
     #[test]
     fn mysql_unknown_error_can_retry_with_text_protocol() {
         let error = "error returned from database: 1105 (HY000): Unknown error";
+
+        assert!(mysql_error_should_retry_with_text_protocol(error));
+    }
+
+    #[test]
+    fn mysql_unsupported_prepare_command_can_retry_with_text_protocol() {
+        let error = "ERROR PX000 (3000): [a2jupsonbbv6zai1gomo5whu36ndqy] Unsupported command: COM_STMT_PREPARE";
 
         assert!(mysql_error_should_retry_with_text_protocol(error));
     }

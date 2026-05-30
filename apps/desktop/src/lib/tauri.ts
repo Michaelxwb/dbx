@@ -371,6 +371,10 @@ export async function disconnectDb(connectionId: string): Promise<void> {
   return invoke("disconnect_db", { connectionId });
 }
 
+export async function closeDatabaseConnection(connectionId: string, database: string): Promise<boolean> {
+  return invoke("close_database_connection", { connectionId, database });
+}
+
 export async function listDatabases(connectionId: string): Promise<DatabaseInfo[]> {
   return invoke("list_databases", { connectionId });
 }
@@ -904,6 +908,7 @@ export interface UpdateInfo {
   current_version: string;
   latest_version: string;
   update_available: boolean;
+  portable_mode: boolean;
   release_name: string;
   release_url: string;
   release_notes: string;

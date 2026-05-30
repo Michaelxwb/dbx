@@ -45,6 +45,7 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   opengauss: { type: "gaussdb", profile: "opengauss", label: "openGauss", defaultPort: 5432 },
   tdengine: { type: "tdengine", profile: "tdengine", label: "TDengine", defaultPort: 6041 },
   "taos-ws": { type: "tdengine", profile: "tdengine", label: "TDengine", defaultPort: 6041 },
+  xugu: { type: "xugu", profile: "xugu", label: "XuguDB", defaultPort: 5138 },
   iris: { type: "iris", profile: "iris", label: "IRIS", defaultPort: 1972 },
 };
 
@@ -140,6 +141,30 @@ function parseJdbcSqlServerUrl(source: string): ParsedConnectionUrl | null {
 }
 
 function parseJdbcOracleUrl(source: string): ParsedConnectionUrl | null {
+  const descriptorMatch = source.match(/^jdbc:oracle:thin:@\s*\((.+)\)\s*$/i);
+  if (descriptorMatch) {
+    const profile = SCHEME_PROFILES.oracle;
+    const host = oracleDescriptorValue(source, "HOST");
+    const port = oracleDescriptorValue(source, "PORT");
+    const serviceName = oracleDescriptorValue(source, "SERVICE_NAME");
+    const sid = oracleDescriptorValue(source, "SID");
+    if (!host) return null;
+    return {
+      dbType: profile.type,
+      driverProfile: profile.profile,
+      driverLabel: profile.label,
+      host,
+      port: port ? Number(port) : profile.defaultPort,
+      username: "",
+      password: "",
+      database: serviceName || sid || undefined,
+      urlParams: "",
+      ssl: false,
+      connectionString: source,
+      oracleConnectionType: sid && !serviceName ? "sid" : "service_name",
+    };
+  }
+
   const serviceMatch = source.match(/^jdbc:oracle:thin:@\/\/([^:/?#]+)(?::(\d+))?\/([^?]+)(?:\?(.*))?$/i);
   if (serviceMatch) {
     const profile = SCHEME_PROFILES.oracle;
@@ -177,6 +202,11 @@ function parseJdbcOracleUrl(source: string): ParsedConnectionUrl | null {
   }
 
   return null;
+}
+
+function oracleDescriptorValue(source: string, key: string): string | undefined {
+  const match = new RegExp(`\\(${key}\\s*=\\s*([^\\)]+)\\)`, "i").exec(source);
+  return match?.[1]?.trim();
 }
 
 function parseJdbcUCanAccessUrl(source: string): ParsedConnectionUrl | null {
@@ -229,6 +259,11 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
   }
 
   const urlParams = parsed.search.replace(/^\?/, "");
+  const normalizedFragment = decodeUrlPart(parsed.hash.replace(/^#/, "")).trim().toLowerCase();
+  const parsedUrlParams =
+    profile.type === "redis" && normalizedFragment === "insecure"
+      ? [urlParams, "insecure=true"].filter(Boolean).join("&")
+      : urlParams;
   if (profile.type === "mongodb") {
     return {
       dbType: profile.type,
@@ -239,7 +274,7 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
       username: decodeUrlPart(parsed.username),
       password: decodeUrlPart(parsed.password),
       database: databaseFromPath(parsed.pathname),
-      urlParams,
+      urlParams: parsedUrlParams,
       ssl: scheme === "mongodb+srv",
       connectionString: source,
       useMongoUrl: true,
@@ -255,8 +290,8 @@ export function parseConnectionUrl(value: string, preferredProfile?: string): Pa
     username: decodeUrlPart(parsed.username),
     password: decodeUrlPart(parsed.password),
     database: databaseFromPath(parsed.pathname),
-    urlParams,
-    ssl: scheme === "rediss" || scheme === "https" || urlParamsRequireTls(profile.type, urlParams),
+    urlParams: parsedUrlParams,
+    ssl: scheme === "rediss" || scheme === "https" || urlParamsRequireTls(profile.type, parsedUrlParams),
   };
 }
 

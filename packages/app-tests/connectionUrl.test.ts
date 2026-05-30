@@ -35,6 +35,19 @@ test("parses mysql TLS URL params into the SSL switch state", () => {
   assert.equal(parseConnectionUrl("mysql://root@tidb.example.com:4000/test?require_ssl=true").ssl, true);
 });
 
+test("parses Redis insecure TLS URL fragments into URL params", () => {
+  const parsed = parseConnectionUrl("rediss://default:secret@redis.example.com:6379/0#insecure");
+
+  assert.equal(parsed.dbType, "redis");
+  assert.equal(parsed.host, "redis.example.com");
+  assert.equal(parsed.port, 6379);
+  assert.equal(parsed.username, "default");
+  assert.equal(parsed.password, "secret");
+  assert.equal(parsed.database, "0");
+  assert.equal(parsed.urlParams, "insecure=true");
+  assert.equal(parsed.ssl, true);
+});
+
 test("parses JDBC URLs by using the inner database URL", () => {
   const postgres = parseConnectionUrl("jdbc:postgresql://alice:secret@db.example.com:5433/app?sslmode=require");
   assert.equal(postgres.dbType, "postgres");
@@ -69,6 +82,20 @@ test("parses TDengine WebSocket JDBC URLs", () => {
   assert.equal(parsed.password, "taosdata");
   assert.equal(parsed.database, "power");
   assert.equal(parsed.urlParams, "timezone=UTC");
+});
+
+test("parses XuguDB JDBC URLs", () => {
+  const parsed = parseConnectionUrl("jdbc:xugu://alice:secret@xugu.example.com:5138/demo?charset=utf8");
+
+  assert.equal(parsed.dbType, "xugu");
+  assert.equal(parsed.driverProfile, "xugu");
+  assert.equal(parsed.driverLabel, "XuguDB");
+  assert.equal(parsed.host, "xugu.example.com");
+  assert.equal(parsed.port, 5138);
+  assert.equal(parsed.username, "alice");
+  assert.equal(parsed.password, "secret");
+  assert.equal(parsed.database, "demo");
+  assert.equal(parsed.urlParams, "charset=utf8");
 });
 
 test("parses UCanAccess JDBC URLs as Access database files", () => {
@@ -118,6 +145,20 @@ test("parses Oracle JDBC SID URLs", () => {
   assert.equal(parsed.port, 1521);
   assert.equal(parsed.database, "ORCL");
   assert.equal(parsed.oracleConnectionType, "sid");
+});
+
+test("parses Oracle JDBC descriptors and keeps the original connection string", () => {
+  const source =
+    "jdbc:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=oracle.example.com)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=orcl)))";
+  const parsed = parseConnectionUrl(source);
+
+  assert.equal(parsed.dbType, "oracle");
+  assert.equal(parsed.driverProfile, "oracle");
+  assert.equal(parsed.host, "oracle.example.com");
+  assert.equal(parsed.port, 1521);
+  assert.equal(parsed.database, "orcl");
+  assert.equal(parsed.oracleConnectionType, "service_name");
+  assert.equal(parsed.connectionString, source);
 });
 
 test("keeps MongoDB URLs as connection strings", () => {

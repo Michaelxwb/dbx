@@ -65,7 +65,7 @@ import {
   setActiveTableReferencePayload,
   type QueryEditorTableReferencePayload,
 } from "@/lib/queryEditorTableDrop";
-import { editablePrimaryKeys, usesSyntheticRowIdKey } from "@/lib/tableEditing";
+import { editablePrimaryKeys } from "@/lib/tableEditing";
 import {
   supportsDatabaseCreation,
   supportsDatabaseSearch,
@@ -129,7 +129,10 @@ const labelRef = ref<HTMLElement>();
 const rowRef = ref<HTMLElement>();
 function isLabelTruncated(): boolean {
   const el = labelRef.value;
-  return !!el && el.scrollWidth > el.clientWidth;
+  if (!el) return false;
+  const style = window.getComputedStyle(el);
+  if (style.overflowX === "visible" || style.textOverflow !== "ellipsis") return false;
+  return el.scrollWidth - el.clientWidth > 2;
 }
 const connectionStore = useConnectionStore();
 const queryStore = useQueryStore();
@@ -218,6 +221,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: ScrollText, colorClass: "text-blue-500" };
     case "group-functions":
       return { icon: Braces, colorClass: "text-amber-500" };
+    case "group-partitions":
+      return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-green-400" };
     default:
       return { icon: Database, colorClass: "text-muted-foreground" };
   }
@@ -232,6 +237,7 @@ const groupTypes: Set<TreeNodeType> = new Set([
   "group-views",
   "group-procedures",
   "group-functions",
+  "group-partitions",
   "saved-sql-root",
   "saved-sql-folder",
 ]);
@@ -263,8 +269,8 @@ function visibleLabel(node: TreeNode): string {
   return displayLabel(node);
 }
 
-function isTooltipDisabled(node: TreeNode): boolean {
-  return !isLabelTruncated() && visibleLabel(node) === displayLabel(node);
+function isTooltipDisabled(): boolean {
+  return !isLabelTruncated();
 }
 
 async function toggle() {
@@ -290,7 +296,8 @@ async function toggle() {
     node.type === "group-tables" ||
     node.type === "group-views" ||
     node.type === "group-procedures" ||
-    node.type === "group-functions"
+    node.type === "group-functions" ||
+    node.type === "group-partitions"
   ) {
     node.isExpanded = !node.isExpanded;
     emit("node-toggled", node, wasExpanded);
@@ -516,49 +523,57 @@ async function openData() {
     if (!config) throw new Error("Connection config not found");
 
     const querySchema = node.schema || node.database;
-    console.info("[DBX][openData:get-columns:start]", {
-      traceId,
-      database: node.database,
-      schema: querySchema,
-      table: node.label,
-      elapsed: elapsed(),
-    });
-    const columns = await api.getColumns(node.connectionId, node.database, querySchema, node.label);
-    console.info("[DBX][openData:get-columns:done]", {
-      traceId,
-      columnCount: columns.length,
-      primaryKeys: columns.filter((column) => column.is_primary_key).map((column) => column.name),
-      elapsed: elapsed(),
-    });
-    const pks = editablePrimaryKeys(config.db_type, columns);
     const limit = settingsStore.editorSettings.pageSize;
     const sql = await buildTableSelectSql({
       databaseType: config.db_type,
       schema: node.schema,
       tableName: node.label,
-      columns: columns.map((column) => column.name),
-      primaryKeys: pks,
+      columns: [],
+      primaryKeys: [],
       limit,
-      includeRowId: usesSyntheticRowIdKey(config.db_type, pks),
+      includeRowId: false,
     });
     console.info("[DBX][openData:sql-built]", {
       traceId,
-      primaryKeys: pks,
-      includeRowId: usesSyntheticRowIdKey(config.db_type, pks),
+      primaryKeys: [],
+      includeRowId: false,
       sql,
       elapsed: elapsed(),
     });
     queryStore.updateSql(tabId, sql);
-    queryStore.setTableMeta(tabId, {
-      schema: node.schema,
-      tableName: node.label,
-      columns,
-      primaryKeys: pks,
-    });
+
+    const loadTableMeta = async () => {
+      try {
+        console.info("[DBX][openData:get-columns:start]", {
+          traceId,
+          database: node.database,
+          schema: querySchema,
+          table: node.label,
+          elapsed: elapsed(),
+        });
+        const columns = await api.getColumns(node.connectionId, node.database, querySchema, node.label);
+        console.info("[DBX][openData:get-columns:done]", {
+          traceId,
+          columnCount: columns.length,
+          primaryKeys: columns.filter((column) => column.is_primary_key).map((column) => column.name),
+          elapsed: elapsed(),
+        });
+        const pks = editablePrimaryKeys(config.db_type, columns);
+        queryStore.setTableMeta(tabId, {
+          schema: node.schema,
+          tableName: node.label,
+          columns,
+          primaryKeys: pks,
+        });
+      } catch (error) {
+        console.warn("[DBX][openData:get-columns:error]", { traceId, elapsed: elapsed(), error });
+      }
+    };
 
     console.info("[DBX][openData:execute:start]", { traceId, tabId, elapsed: elapsed() });
     await queryStore.executeTabSql(tabId, sql);
     console.info("[DBX][openData:execute:done]", { traceId, tabId, elapsed: elapsed() });
+    void loadTableMeta();
   } catch (e: any) {
     console.error("[DBX][openData:error]", { traceId, elapsed: elapsed(), error: e });
     queryStore.setErrorResult(tabId, e);
@@ -2203,7 +2218,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
       });
       items.push({ label: "", separator: true });
     }
-    if (node.type !== "saved-sql-root" && node.type !== "saved-sql-folder") {
+    if (node.type !== "saved-sql-root" && node.type !== "saved-sql-folder" && node.type !== "group-partitions") {
       items.push({ label: t("contextMenu.refreshChildren"), action: refresh, icon: RefreshCw });
     }
     return items;
@@ -2300,13 +2315,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
           @keydown.escape.prevent="isRenamingGroup = false"
           @click.stop
         />
-        <LightTooltip
-          v-else
-          :text="displayLabel(node)"
-          :disabled="isTooltipDisabled(node)"
-          side="right"
-          :side-offset="8"
-        >
+        <LightTooltip v-else :text="displayLabel(node)" :disabled="isTooltipDisabled" side="right" :side-offset="8">
           <span ref="labelRef" class="min-w-0 flex-1 truncate">{{ visibleLabel(node) }}</span>
         </LightTooltip>
         <span
@@ -2314,7 +2323,8 @@ function treeItemMenuItems(): ContextMenuItem[] {
             (node.type === 'group-tables' ||
               node.type === 'group-views' ||
               node.type === 'group-procedures' ||
-              node.type === 'group-functions') &&
+              node.type === 'group-functions' ||
+              node.type === 'group-partitions') &&
             node.objectCount != null
           "
           class="text-muted-foreground text-[10px] shrink-0"

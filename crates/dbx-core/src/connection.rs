@@ -8,7 +8,7 @@ use mysql_async::Row as MysqlRow;
 
 use crate::agent_connection::{
     agent_connect_params, mongo_legacy_error_with_auth_hint, oracle_alternate_connect_config,
-    should_retry_oracle_with_10g_driver,
+    oracle_auth_fallback_profiles, should_retry_oracle_with_10g_driver,
 };
 use crate::database_capabilities;
 use crate::db;
@@ -155,7 +155,7 @@ impl AppState {
         };
 
         let base_pool_key = base_pool_key_for(db_type, connection_id, database, false);
-        let pool_key = session_scoped_pool_key(base_pool_key, client_session_id);
+        let pool_key = session_scoped_pool_key_for(db_type, base_pool_key, client_session_id);
 
         let conns = self.connections.read().await;
         if conns.contains_key(&pool_key) {
@@ -333,19 +333,39 @@ impl AppState {
                             })?;
                     } else if should_retry_oracle_with_10g_driver(&db_config, &err) {
                         log::warn!(
-                            "Oracle connect failed with profile {:?}: {}. Retrying with oracle-10g profile.",
+                            "Oracle connect failed with profile {:?}: {}. Retrying with legacy Oracle profiles.",
                             db_config.driver_profile,
                             err
                         );
-                        let mut fallback_client =
-                            self.agent_manager.spawn(&db_config.db_type, Some("oracle-10g")).await?;
-                        fallback_client
-                            .call_method::<serde_json::Value>(AgentMethod::Connect, connect_params)
-                            .await
-                            .map_err(|fallback_err| {
-                                format!("{err}\n\nFallback with oracle-10g driver failed: {fallback_err}")
-                            })?;
-                        client = fallback_client;
+                        let mut fallback_errors = Vec::new();
+                        let mut connected_client = None;
+                        for profile in oracle_auth_fallback_profiles(&db_config, &err) {
+                            match self.agent_manager.spawn(&db_config.db_type, Some(profile)).await {
+                                Ok(mut fallback_client) => {
+                                    match fallback_client
+                                        .call_method::<serde_json::Value>(AgentMethod::Connect, connect_params.clone())
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            connected_client = Some(fallback_client);
+                                            break;
+                                        }
+                                        Err(fallback_err) => {
+                                            fallback_errors.push(format!("{profile}: {fallback_err}"));
+                                        }
+                                    }
+                                }
+                                Err(fallback_err) => {
+                                    fallback_errors.push(format!("{profile}: {fallback_err}"));
+                                }
+                            }
+                        }
+                        client = connected_client.ok_or_else(|| {
+                            format!(
+                                "{err}\n\nFallback with legacy Oracle drivers failed: {}",
+                                fallback_errors.join("\n")
+                            )
+                        })?;
                     } else {
                         return Err(err);
                     }
@@ -471,7 +491,7 @@ impl AppState {
             configs.get(connection_id).map(|c| c.db_type)
         };
         let base_pool_key = base_pool_key_for(db_type, connection_id, database, true);
-        let pool_key = session_scoped_pool_key(base_pool_key, client_session_id);
+        let pool_key = session_scoped_pool_key_for(db_type, base_pool_key, client_session_id);
         if self.uses_forwarded_transport(connection_id).await {
             self.remove_connection_pools(connection_id).await;
             self.reset_connection_transport(connection_id).await;
@@ -499,7 +519,10 @@ impl AppState {
             configs.get(connection_id).map(|c| c.db_type)
         };
         let base_pool_key = base_pool_key_for(db_type, connection_id, database, false);
-        let pool_key = session_scoped_pool_key(base_pool_key, Some(&session));
+        let pool_key = session_scoped_pool_key_for(db_type, base_pool_key.clone(), Some(&session));
+        if pool_key == base_pool_key {
+            return Ok(false);
+        }
         let removed = self.connections.write().await.remove(&pool_key);
         if let Some(pool) = removed {
             close_pool_kind(pool).await;
@@ -682,6 +705,17 @@ fn session_scoped_pool_key(base_pool_key: String, client_session_id: Option<&str
     normalize_client_session_id(client_session_id)
         .map(|session| format!("{base_pool_key}:session:{session}"))
         .unwrap_or(base_pool_key)
+}
+
+fn session_scoped_pool_key_for(
+    db_type: Option<DatabaseType>,
+    base_pool_key: String,
+    client_session_id: Option<&str>,
+) -> String {
+    if matches!(db_type, Some(DatabaseType::DuckDb)) {
+        return base_pool_key;
+    }
+    session_scoped_pool_key(base_pool_key, client_session_id)
 }
 
 fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
@@ -1090,6 +1124,10 @@ mod tests {
 
         config.driver_profile = Some("oracle-10g".to_string());
         assert!(!should_retry_oracle_with_10g_driver(&config, "Agent RPC error (-1): ORA-12541: TNS:no listener"));
+        assert!(!should_retry_oracle_with_10g_driver(
+            &config,
+            "Agent RPC error (-1): ORA-28040: No matching authentication protocol"
+        ));
 
         config.driver_profile = Some("oracle".to_string());
         assert!(!should_retry_oracle_with_10g_driver(
@@ -1455,7 +1493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_client_session_pool_removes_session_scoped_duckdb_pool() {
+    async fn duckdb_client_session_reuses_base_pool_to_avoid_file_locks() {
         let (state, dir) = test_app_state().await;
         let db_path = dir.join("session.duckdb");
         let mut config = mysql_config(None);
@@ -1466,12 +1504,14 @@ mod tests {
         config.port = 0;
 
         state.configs.write().await.insert(config.id.clone(), config.clone());
+        let base_pool_key = state.get_or_create_pool("duckdb-conn", None).await.unwrap();
         let pool_key = state.get_or_create_pool_for_session("duckdb-conn", Some("main"), Some("tab-1")).await.unwrap();
-        assert_eq!(pool_key, "duckdb-conn:session:tab-1");
+        assert_eq!(pool_key, base_pool_key);
 
-        assert!(state.close_client_session_pool("duckdb-conn", Some("main"), "tab-1").await.unwrap());
+        assert!(!state.close_client_session_pool("duckdb-conn", Some("main"), "tab-1").await.unwrap());
 
         let conns = state.connections.read().await;
+        assert!(conns.contains_key("duckdb-conn"));
         assert!(!conns.contains_key("duckdb-conn:session:tab-1"));
 
         let _ = std::fs::remove_dir_all(dir);

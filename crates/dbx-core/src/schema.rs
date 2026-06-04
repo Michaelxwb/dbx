@@ -1,7 +1,9 @@
 use crate::connection::{AppState, MysqlMode, PoolKind};
 use crate::db;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
+use crate::query::{agent_execute_query_params, QueryExecutionOptions};
 use std::future::Future;
+use std::sync::Arc;
 
 macro_rules! extract_pool {
     ($connections:expr, $key:expr, $variant:ident) => {
@@ -287,10 +289,14 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
     }
 
     let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
+    let db_config = connection_config(state, connection_id).await;
     let connections = state.connections.read().await;
     let pool = connections.get(connection_id).ok_or("Connection not found")?;
 
     match pool {
+        PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_doris_family_config) => {
+            db::mysql::list_databases_show(p).await
+        }
         PoolKind::Mysql(p, mode) => dispatch_mysql!(p, mode, db::mysql::list_databases, db::ob_oracle::list_databases),
         PoolKind::Postgres(p) => db::postgres::list_databases(p).await,
         PoolKind::Sqlite(p) => db::sqlite::list_databases(p).await,
@@ -367,6 +373,7 @@ async fn list_tables_once(
 ) -> Result<Vec<db::TableInfo>, String> {
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
     let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
+    let db_config = connection_config(state, connection_id).await;
 
     {
         let connections = state.connections.read().await;
@@ -408,6 +415,9 @@ async fn list_tables_once(
     let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
     match pool {
+        PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_doris_family_config) => {
+            db::mysql::list_tables_show(p, database).await.map(|tables| filter_table_infos(tables, filter, limit))
+        }
         PoolKind::Mysql(p, mode) => {
             dispatch_mysql!(p, mode, db::mysql::list_tables, db::ob_oracle::list_tables, schema)
                 .map(|tables| filter_table_infos(tables, filter, limit))
@@ -456,8 +466,24 @@ fn filter_table_infos(tables: Vec<db::TableInfo>, filter: Option<&str>, limit: O
 #[cfg(test)]
 mod tests {
     use super::{
-        clickhouse_metadata_database, duckdb_attach_database, duckdb_list_databases, duckdb_query_tables_in_database,
+        clickhouse_metadata_database, deduplicate_column_infos, duckdb_attach_database, duckdb_list_databases,
+        duckdb_query_tables_in_database,
     };
+
+    fn test_column(name: &str, comment: Option<&str>, is_primary_key: bool) -> super::db::ColumnInfo {
+        super::db::ColumnInfo {
+            name: name.to_string(),
+            data_type: "VARCHAR".to_string(),
+            is_nullable: true,
+            column_default: None,
+            is_primary_key,
+            extra: None,
+            comment: comment.map(|value| value.to_string()),
+            numeric_precision: None,
+            numeric_scale: None,
+            character_maximum_length: None,
+        }
+    }
 
     #[test]
     fn duckdb_list_databases_includes_attached_database() {
@@ -503,6 +529,23 @@ mod tests {
         assert_eq!(clickhouse_metadata_database("testdb", ""), "testdb");
         assert_eq!(clickhouse_metadata_database("default", "testdb"), "default");
     }
+
+    #[test]
+    fn deduplicates_columns_and_preserves_later_comment() {
+        let columns = deduplicate_column_infos(vec![
+            test_column("ID", None, false),
+            test_column("ID", Some("源主键"), true),
+            test_column("TFBH", Some(""), false),
+            test_column("TFBH", Some("台账编号"), false),
+        ]);
+
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "ID");
+        assert_eq!(columns[0].comment.as_deref(), Some("源主键"));
+        assert!(columns[0].is_primary_key);
+        assert_eq!(columns[1].name, "TFBH");
+        assert_eq!(columns[1].comment.as_deref(), Some("台账编号"));
+    }
 }
 
 pub async fn list_objects_core(
@@ -517,6 +560,18 @@ pub async fn list_objects_core(
     .await
 }
 
+pub async fn list_completion_objects_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<db::ObjectInfo>, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || {
+        list_completion_objects_once(state, connection_id, database, schema)
+    })
+    .await
+}
+
 async fn list_objects_once(
     state: &AppState,
     connection_id: &str,
@@ -524,6 +579,7 @@ async fn list_objects_once(
     schema: &str,
 ) -> Result<Vec<db::ObjectInfo>, String> {
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+    let db_config = connection_config(state, connection_id).await;
 
     {
         let connections = state.connections.read().await;
@@ -561,7 +617,15 @@ async fn list_objects_once(
                 .await;
         }
         try_sqlserver!(connections, &pool_key, list_objects, schema);
-        try_agent!(connections, &pool_key, list_objects, database, schema);
+        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+            let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
+            drop(connections);
+            if is_oracle {
+                return oracle_agent_list_objects(client, database, schema).await;
+            }
+            let mut client = client.lock().await;
+            return client.list_objects(database, schema).await;
+        }
     }
 
     let connections = state.connections.read().await;
@@ -572,6 +636,8 @@ async fn list_objects_once(
             // Note: mysql and ob_oracle take different second args (database vs schema)
             if *mode == MysqlMode::OceanBaseOracle {
                 db::ob_oracle::list_objects(p, schema).await
+            } else if db_config.as_ref().is_some_and(is_doris_family_config) {
+                db::mysql::list_table_objects_show(p, database).await
             } else {
                 db::mysql::list_objects(p, database).await
             }
@@ -595,6 +661,68 @@ async fn list_objects_once(
                 .collect())
         }
     }
+}
+
+async fn list_completion_objects_once(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<db::ObjectInfo>, String> {
+    let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+    let db_config = connection_config(state, connection_id).await;
+
+    let connections = state.connections.read().await;
+    if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+        let config = config.clone();
+        let session = session.clone();
+        drop(connections);
+        return session
+            .invoke::<Vec<db::ObjectInfo>>(
+                "listObjects",
+                serde_json::json!({ "connection": config.as_ref(), "database": database, "schema": schema }),
+            )
+            .await
+            .map(filter_completion_objects);
+    }
+    if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+        let is_oracle = db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle);
+        drop(connections);
+        let objects = if is_oracle {
+            oracle_agent_list_objects(client, database, schema).await?
+        } else {
+            let mut client = client.lock().await;
+            client.list_objects(database, schema).await?
+        };
+        return Ok(filter_completion_objects(objects));
+    }
+
+    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+    match pool {
+        PoolKind::Mysql(p, mode) if *mode != MysqlMode::OceanBaseOracle => {
+            db::mysql::list_completion_objects(p, database).await
+        }
+        PoolKind::Mysql(p, mode) if *mode == MysqlMode::OceanBaseOracle => {
+            db::ob_oracle::list_objects(p, schema).await.map(filter_completion_objects)
+        }
+        PoolKind::Postgres(p) => db::postgres::list_objects(p, schema).await.map(filter_completion_objects),
+        PoolKind::SqlServer(_) => {
+            drop(connections);
+            let objects = list_objects_once(state, connection_id, database, schema).await?;
+            Ok(filter_completion_objects(objects))
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn filter_completion_objects(objects: Vec<db::ObjectInfo>) -> Vec<db::ObjectInfo> {
+    objects
+        .into_iter()
+        .filter(|object| {
+            let object_type = object.object_type.to_ascii_uppercase();
+            object_type.contains("PROCEDURE") || object_type.contains("FUNCTION") || object_type.contains("TRIGGER")
+        })
+        .collect()
 }
 
 async fn retry_metadata_connection<T, F, Fut>(
@@ -626,6 +754,7 @@ pub async fn get_columns_core(
 ) -> Result<Vec<db::ColumnInfo>, String> {
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
     let duckdb_attached_names = duckdb_attached_database_names(state, connection_id).await;
+    let db_config = connection_config(state, connection_id).await;
 
     {
         let connections = state.connections.read().await;
@@ -644,7 +773,7 @@ pub async fn get_columns_core(
             let config = config.clone();
             let session = session.clone();
             drop(connections);
-            return session
+            let columns = session
                 .invoke::<Vec<db::ColumnInfo>>(
                     "getColumns",
                     serde_json::json!({
@@ -654,7 +783,8 @@ pub async fn get_columns_core(
                         "table": table,
                     }),
                 )
-                .await;
+                .await?;
+            return Ok(deduplicate_column_infos(columns));
         }
         if let Some(con) = extract_pool!(&connections, &pool_key, DuckDb) {
             drop(connections);
@@ -670,22 +800,75 @@ pub async fn get_columns_core(
         if let Some(client) = extract_pool!(&connections, &pool_key, ClickHouse) {
             drop(connections);
             return db::clickhouse_driver::get_columns(&client, clickhouse_metadata_database(database, schema), table)
-                .await;
+                .await
+                .map(deduplicate_column_infos);
         }
         try_sqlserver!(connections, &pool_key, get_columns, schema, table);
-        try_agent!(connections, &pool_key, get_columns, database, schema, table);
+        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+            drop(connections);
+            let mut client = client.lock().await;
+            let columns = client.get_columns::<Vec<db::ColumnInfo>>(database, schema, table).await?;
+            return Ok(deduplicate_column_infos(columns));
+        }
     }
 
     let connections = state.connections.read().await;
     let pool = connections.get(&pool_key).ok_or("Pool not found")?;
 
     match pool {
+        PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(is_doris_family_config) => {
+            db::mysql::get_columns_show(p, database, table).await.map(deduplicate_column_infos)
+        }
         PoolKind::Mysql(p, mode) => {
             dispatch_mysql!(p, mode, db::mysql::get_columns, db::ob_oracle::get_columns, database, table)
+                .map(deduplicate_column_infos)
         }
-        PoolKind::Postgres(p) => db::postgres::get_columns(p, schema, table).await,
-        PoolKind::Sqlite(p) => db::sqlite::get_columns(p, schema, table).await,
+        PoolKind::Postgres(p) => db::postgres::get_columns(p, schema, table).await.map(deduplicate_column_infos),
+        PoolKind::Sqlite(p) => db::sqlite::get_columns(p, schema, table).await.map(deduplicate_column_infos),
         _ => Ok(vec![]),
+    }
+}
+
+fn deduplicate_column_infos(columns: Vec<db::ColumnInfo>) -> Vec<db::ColumnInfo> {
+    let mut result: Vec<db::ColumnInfo> = Vec::with_capacity(columns.len());
+    for column in columns {
+        if let Some(existing) = result.iter_mut().find(|existing| existing.name == column.name) {
+            existing.is_primary_key |= column.is_primary_key;
+            existing.is_nullable &= column.is_nullable;
+            merge_optional_string(&mut existing.column_default, column.column_default);
+            merge_optional_string(&mut existing.extra, column.extra);
+            merge_optional_string(&mut existing.comment, column.comment);
+            if existing.numeric_precision.is_none() {
+                existing.numeric_precision = column.numeric_precision;
+            }
+            if existing.numeric_scale.is_none() {
+                existing.numeric_scale = column.numeric_scale;
+            }
+            if existing.character_maximum_length.is_none() {
+                existing.character_maximum_length = column.character_maximum_length;
+            }
+            if existing.data_type.trim().is_empty() && !column.data_type.trim().is_empty() {
+                existing.data_type = column.data_type;
+            }
+        } else {
+            result.push(column);
+        }
+    }
+    result
+}
+
+fn merge_optional_string(target: &mut Option<String>, candidate: Option<String>) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    if candidate.trim().is_empty() {
+        if target.is_none() {
+            *target = Some(candidate);
+        }
+        return;
+    }
+    if target.as_ref().map_or(true, |value| value.trim().is_empty()) {
+        *target = Some(candidate);
     }
 }
 
@@ -849,6 +1032,11 @@ fn is_opengauss_family_config(config: &ConnectionConfig) -> bool {
         || matches!(config.driver_profile.as_deref(), Some("opengauss" | "gaussdb"))
 }
 
+fn is_doris_family_config(config: &ConnectionConfig) -> bool {
+    matches!(config.db_type, DatabaseType::Doris | DatabaseType::StarRocks)
+        || matches!(config.driver_profile.as_deref(), Some("doris" | "selectdb" | "starrocks"))
+}
+
 fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -864,7 +1052,10 @@ fn mysql_ident(value: &str) -> String {
 fn sqlite_object_type(kind: &db::ObjectSourceKind) -> &'static str {
     match kind {
         db::ObjectSourceKind::View => "view",
-        db::ObjectSourceKind::Procedure | db::ObjectSourceKind::Function => "routine",
+        db::ObjectSourceKind::Procedure
+        | db::ObjectSourceKind::Function
+        | db::ObjectSourceKind::Package
+        | db::ObjectSourceKind::PackageBody => "routine",
     }
 }
 
@@ -873,6 +1064,7 @@ fn sqlserver_object_type_filter(kind: &db::ObjectSourceKind) -> &'static str {
         db::ObjectSourceKind::View => "'V'",
         db::ObjectSourceKind::Procedure => "'P'",
         db::ObjectSourceKind::Function => "'FN','IF','TF','FS','FT'",
+        db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => "''",
     }
 }
 
@@ -914,6 +1106,7 @@ pub fn postgres_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSou
                 prokind
             )
         }
+        db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => "SELECT NULL WHERE FALSE".to_string(),
     }
 }
 
@@ -922,13 +1115,19 @@ pub fn oracle_object_source_sql(schema: &str, name: &str, kind: &db::ObjectSourc
         db::ObjectSourceKind::View => "VIEW",
         db::ObjectSourceKind::Procedure => "PROCEDURE",
         db::ObjectSourceKind::Function => "FUNCTION",
+        db::ObjectSourceKind::Package => "PACKAGE",
+        db::ObjectSourceKind::PackageBody => "PACKAGE_BODY",
     };
-    format!(
-        "SELECT DBMS_METADATA.GET_DDL({}, {}, {}) FROM DUAL",
-        sql_string(object_type),
-        sql_string(name),
-        sql_string(schema)
-    )
+    if schema.trim().is_empty() {
+        format!("SELECT DBMS_METADATA.GET_DDL({}, {}) FROM DUAL", sql_string(object_type), sql_string(name))
+    } else {
+        format!(
+            "SELECT DBMS_METADATA.GET_DDL({}, {}, {}) FROM DUAL",
+            sql_string(object_type),
+            sql_string(name),
+            sql_string(schema)
+        )
+    }
 }
 
 pub fn sqlite_object_source_sql(name: &str, kind: &db::ObjectSourceKind) -> String {
@@ -944,6 +1143,7 @@ pub fn mysql_object_source_sql(name: &str, kind: &db::ObjectSourceKind) -> Strin
         db::ObjectSourceKind::View => format!("SHOW CREATE VIEW {}", mysql_ident(name)),
         db::ObjectSourceKind::Procedure => format!("SHOW CREATE PROCEDURE {}", mysql_ident(name)),
         db::ObjectSourceKind::Function => format!("SHOW CREATE FUNCTION {}", mysql_ident(name)),
+        db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => String::new(),
     }
 }
 
@@ -998,8 +1198,27 @@ pub async fn get_object_source_core(
     object_type: db::ObjectSourceKind,
 ) -> Result<db::ObjectSource, String> {
     let pool_key = state.get_or_create_pool(connection_id, Some(database)).await?;
+    let db_config = connection_config(state, connection_id).await;
     let source = {
         let connections = state.connections.read().await;
+        if let Some(PoolKind::ExternalDriver { config, session, .. }) = connections.get(&pool_key) {
+            let config = config.clone();
+            let session = session.clone();
+            drop(connections);
+            let result: db::ObjectSource = session
+                .invoke(
+                    "getObjectSource",
+                    serde_json::json!({
+                        "connection": config.as_ref(),
+                        "database": database,
+                        "schema": schema,
+                        "name": name,
+                        "object_type": &object_type,
+                    }),
+                )
+                .await?;
+            return Ok(result);
+        }
         if let Some(client) = extract_pool!(&connections, &pool_key, SqlServer) {
             drop(connections);
             let mut client = client.lock().await;
@@ -1009,9 +1228,15 @@ pub async fn get_object_source_core(
             )?
         } else if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
             drop(connections);
-            let mut client = client.lock().await;
-            let result: db::ObjectSource = client.get_object_source(database, schema, name, &object_type).await?;
-            return Ok(result);
+            if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle)
+                && matches!(object_type, db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody)
+            {
+                oracle_agent_object_source(client, database, schema, name, &object_type).await?
+            } else {
+                let mut client = client.lock().await;
+                let result: db::ObjectSource = client.get_object_source(database, schema, name, &object_type).await?;
+                return Ok(result);
+            }
         } else {
             match connections.get(&pool_key).ok_or("Pool not found")? {
                 PoolKind::Mysql(pool, _) => mysql_object_source(pool, name, &object_type).await?,
@@ -1039,6 +1264,79 @@ pub async fn get_object_source_core(
         schema: if schema.is_empty() { None } else { Some(schema.to_string()) },
         source,
     })
+}
+
+fn oracle_owner_filter(schema: &str) -> String {
+    let schema = schema.trim();
+    if schema.is_empty() {
+        "USER".to_string()
+    } else {
+        sql_string(&schema.to_uppercase())
+    }
+}
+
+pub fn oracle_list_objects_sql(schema: &str) -> String {
+    format!(
+        "SELECT object_name, CASE object_type WHEN 'PACKAGE BODY' THEN 'PACKAGE_BODY' ELSE object_type END AS object_type, owner \
+         FROM all_objects \
+         WHERE owner = {} AND object_type IN ('TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', 'PACKAGE', 'PACKAGE BODY') \
+         ORDER BY CASE object_type WHEN 'TABLE' THEN 0 WHEN 'VIEW' THEN 1 WHEN 'PROCEDURE' THEN 2 WHEN 'FUNCTION' THEN 3 WHEN 'PACKAGE' THEN 4 ELSE 5 END, object_name",
+        oracle_owner_filter(schema)
+    )
+}
+
+async fn oracle_agent_list_objects(
+    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<db::ObjectInfo>, String> {
+    let sql = oracle_list_objects_sql(schema);
+    let params = agent_execute_query_params(
+        &sql,
+        if database.is_empty() { None } else { Some(database) },
+        if schema.is_empty() { None } else { Some(schema) },
+        QueryExecutionOptions { max_rows: Some(10_000), ..Default::default() },
+    );
+    let mut client = client.lock().await;
+    let result: db::QueryResult = client.execute_query(params).await?;
+    Ok(result
+        .rows
+        .into_iter()
+        .filter_map(|row| {
+            let name = row.first()?.as_str()?.to_string();
+            let object_type = row.get(1)?.as_str()?.to_string();
+            let schema = row.get(2).and_then(|value| value.as_str()).map(str::to_string);
+            Some(db::ObjectInfo {
+                name,
+                object_type,
+                schema,
+                comment: None,
+                created_at: None,
+                updated_at: None,
+                parent_schema: None,
+                parent_name: None,
+            })
+        })
+        .collect())
+}
+
+async fn oracle_agent_object_source(
+    client: Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>,
+    database: &str,
+    schema: &str,
+    name: &str,
+    object_type: &db::ObjectSourceKind,
+) -> Result<String, String> {
+    let sql = oracle_object_source_sql(schema, name, object_type);
+    let params = agent_execute_query_params(
+        &sql,
+        if database.is_empty() { None } else { Some(database) },
+        if schema.is_empty() { None } else { Some(schema) },
+        QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+    );
+    let mut client = client.lock().await;
+    let result: db::QueryResult = client.execute_query(params).await?;
+    first_string_cell(result)
 }
 
 async fn postgres_object_source(
@@ -1111,6 +1409,24 @@ mod object_source_tests {
             oracle_object_source_sql("HR", "ACTIVE_USERS", &ObjectSourceKind::View),
             "SELECT DBMS_METADATA.GET_DDL('VIEW', 'ACTIVE_USERS', 'HR') FROM DUAL"
         );
+        assert_eq!(
+            oracle_object_source_sql("HR", "PAYROLL", &ObjectSourceKind::PackageBody),
+            "SELECT DBMS_METADATA.GET_DDL('PACKAGE_BODY', 'PAYROLL', 'HR') FROM DUAL"
+        );
+        assert_eq!(
+            oracle_object_source_sql("", "PAYROLL", &ObjectSourceKind::Package),
+            "SELECT DBMS_METADATA.GET_DDL('PACKAGE', 'PAYROLL') FROM DUAL"
+        );
+    }
+
+    #[test]
+    fn builds_oracle_list_objects_sql_with_packages() {
+        let sql = oracle_list_objects_sql("hr");
+
+        assert!(sql.contains("'PACKAGE'"));
+        assert!(sql.contains("'PACKAGE BODY'"));
+        assert!(sql.contains("CASE object_type WHEN 'PACKAGE BODY' THEN 'PACKAGE_BODY'"));
+        assert!(sql.contains("owner = 'HR'"));
     }
 }
 

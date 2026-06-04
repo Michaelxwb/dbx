@@ -5,10 +5,12 @@ use mysql_async::prelude::*;
 use percent_encoding::percent_decode_str;
 use rust_decimal::Decimal;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::models::connection::DatabaseType;
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
     ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, ObjectInfo, QueryResult, TableInfo, TriggerInfo,
@@ -17,6 +19,21 @@ use crate::types::{
 use super::file_validator::validate_file_path;
 
 pub type MySqlPool = mysql_async::Pool;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MySqlQueryDialect {
+    supports_admin_show_results: bool,
+}
+
+impl MySqlQueryDialect {
+    pub fn for_connection(db_type: DatabaseType, driver_profile: Option<&str>) -> Self {
+        let profile = driver_profile.map(str::to_ascii_lowercase);
+        Self {
+            supports_admin_show_results: matches!(db_type, DatabaseType::Doris | DatabaseType::StarRocks)
+                || profile.as_deref().is_some_and(|profile| matches!(profile, "doris" | "selectdb" | "starrocks")),
+        }
+    }
+}
 
 fn quote_value(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
@@ -49,6 +66,13 @@ fn get_str_by_name(row: &mysql_async::Row, name: &str) -> String {
 fn get_opt_str(row: &mysql_async::Row, name: &str) -> Option<String> {
     row_get::<String, _>(row, name)
         .or_else(|| row_get::<Vec<u8>, _>(row, name).map(|b| String::from_utf8_lossy(&b).to_string()))
+}
+
+fn get_opt_metadata_string(row: &mysql_async::Row, name: &str) -> Option<String> {
+    get_opt_str(row, name)
+        .or_else(|| row_get::<NaiveDateTime, _>(row, name).map(|value| value.to_string()))
+        .or_else(|| row_get::<NaiveDate, _>(row, name).map(|value| value.to_string()))
+        .or_else(|| row_get::<NaiveTime, _>(row, name).map(|value| value.to_string()))
 }
 
 fn numeric_metadata_u64_to_i32(value: Option<u64>) -> Option<i32> {
@@ -129,6 +153,9 @@ fn mysql_printable_binary_preview(bytes: &[u8]) -> Option<String> {
 }
 
 fn mysql_blob_preview(bytes: &[u8], label: &str) -> serde_json::Value {
+    if label == "BLOB" {
+        return super::binary_value_to_json(bytes);
+    }
     serde_json::Value::String(format!("({label}) {} bytes", bytes.len()))
 }
 
@@ -700,6 +727,15 @@ pub async fn list_databases(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, Strin
     Ok(rows.iter().map(|row| DatabaseInfo { name: get_str(row, 0) }).collect())
 }
 
+pub async fn list_databases_show(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, String> {
+    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let result = conn.query_iter("SHOW DATABASES").await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    let mut databases: Vec<DatabaseInfo> = rows.iter().map(|row| DatabaseInfo { name: get_str(row, 0) }).collect();
+    databases.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(databases)
+}
+
 pub async fn list_tables(pool: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, String> {
     let sql = format!(
         "SELECT TABLE_NAME, TABLE_TYPE, TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = {} ORDER BY TABLE_NAME",
@@ -721,6 +757,87 @@ pub async fn list_tables(pool: &MySqlPool, database: &str) -> Result<Vec<TableIn
         .collect())
 }
 
+#[derive(Clone, Debug, Default)]
+struct TableStatusMeta {
+    comment: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+}
+
+async fn list_table_status_show(pool: &MySqlPool, database: &str) -> Result<HashMap<String, TableStatusMeta>, String> {
+    let sql = format!("SHOW TABLE STATUS FROM {}", quote_identifier(database));
+    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            (
+                get_str_by_name(row, "Name"),
+                TableStatusMeta {
+                    comment: get_opt_metadata_string(row, "Comment").filter(|s| !s.is_empty()),
+                    created_at: get_opt_metadata_string(row, "Create_time"),
+                    updated_at: get_opt_metadata_string(row, "Update_time"),
+                },
+            )
+        })
+        .filter(|(name, _)| !name.is_empty())
+        .collect())
+}
+
+async fn list_table_names_show(pool: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, String> {
+    let sql = format!("SHOW FULL TABLES FROM {}", quote_identifier(database));
+    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = match conn.query_iter(&sql).await {
+        Ok(result) => result.collect_and_drop().await.map_err(|e| e.to_string())?,
+        Err(_) => {
+            let sql = format!("SHOW TABLES FROM {}", quote_identifier(database));
+            let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
+            result.collect_and_drop().await.map_err(|e| e.to_string())?
+        }
+    };
+    let mut tables: Vec<TableInfo> = rows
+        .iter()
+        .map(|row| {
+            let table_type = get_str(row, 1);
+            TableInfo {
+                name: get_str(row, 0),
+                table_type: if table_type.is_empty() { "TABLE".to_string() } else { table_type },
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            }
+        })
+        .collect();
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(tables)
+}
+
+async fn list_tables_show_with_status(
+    pool: &MySqlPool,
+    database: &str,
+) -> Result<(Vec<TableInfo>, HashMap<String, TableStatusMeta>), String> {
+    let (tables, status) = tokio::join!(list_table_names_show(pool, database), list_table_status_show(pool, database));
+    let mut tables = tables?;
+    let status = match status {
+        Ok(status) => status,
+        Err(err) => {
+            log::warn!("Skipping table status for database `{}`: {}", database, err);
+            HashMap::new()
+        }
+    };
+    for table in &mut tables {
+        if let Some(meta) = status.get(&table.name) {
+            table.comment = meta.comment.clone();
+        }
+    }
+    Ok((tables, status))
+}
+
+pub async fn list_tables_show(pool: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, String> {
+    list_tables_show_with_status(pool, database).await.map(|(tables, _)| tables)
+}
+
 fn list_tables_objects_sql(database: &str) -> String {
     format!(
         "SELECT TABLE_NAME AS object_name, \
@@ -728,6 +845,7 @@ fn list_tables_objects_sql(database: &str) -> String {
            TABLE_COMMENT AS object_comment, \
            CREATE_TIME AS created_at, \
            UPDATE_TIME AS updated_at, \
+           NULL AS parent_schema, NULL AS parent_name, \
            CASE WHEN TABLE_TYPE = 'VIEW' THEN 1 ELSE 0 END AS sort_order \
          FROM information_schema.TABLES \
          WHERE TABLE_SCHEMA = {db} \
@@ -740,10 +858,24 @@ fn list_routines_sql(database: &str) -> String {
     format!(
         "SELECT ROUTINE_NAME AS object_name, ROUTINE_TYPE AS object_type, NULL AS object_comment, \
            NULL AS created_at, NULL AS updated_at, \
+           NULL AS parent_schema, NULL AS parent_name, \
            CASE WHEN ROUTINE_TYPE = 'PROCEDURE' THEN 2 ELSE 3 END AS sort_order \
          FROM information_schema.ROUTINES \
          WHERE ROUTINE_SCHEMA = {db} AND ROUTINE_TYPE IN ('PROCEDURE', 'FUNCTION') \
          ORDER BY sort_order, object_name",
+        db = quote_value(database),
+    )
+}
+
+fn list_completion_triggers_sql(database: &str) -> String {
+    format!(
+        "SELECT TRIGGER_NAME AS object_name, 'TRIGGER' AS object_type, NULL AS object_comment, \
+           CREATED AS created_at, NULL AS updated_at, \
+           TRIGGER_SCHEMA AS parent_schema, EVENT_OBJECT_TABLE AS parent_name, \
+           4 AS sort_order \
+         FROM information_schema.TRIGGERS \
+         WHERE TRIGGER_SCHEMA = {db} \
+         ORDER BY object_name",
         db = quote_value(database),
     )
 }
@@ -756,8 +888,8 @@ fn row_to_object(row: &mysql_async::Row, database: &str) -> ObjectInfo {
         comment: get_opt_str(row, "object_comment").filter(|s| !s.is_empty()),
         created_at: get_opt_str(row, "created_at"),
         updated_at: get_opt_str(row, "updated_at"),
-        parent_schema: None,
-        parent_name: None,
+        parent_schema: get_opt_str(row, "parent_schema"),
+        parent_name: get_opt_str(row, "parent_name"),
     }
 }
 
@@ -785,6 +917,68 @@ pub async fn list_objects(pool: &MySqlPool, database: &str) -> Result<Vec<Object
         Err(e) => {
             log::warn!("Skipping routines for database `{}` in object browser: {}", database, e);
         }
+    }
+
+    Ok(objects)
+}
+
+pub async fn list_table_objects_show(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
+    let (tables, routines) =
+        tokio::join!(list_tables_show_with_status(pool, database), list_routine_objects(pool, database));
+    let (tables, status) = tables?;
+    let mut objects: Vec<ObjectInfo> = tables
+        .into_iter()
+        .map(|table| {
+            let meta = status.get(&table.name);
+            ObjectInfo {
+                name: table.name,
+                object_type: if table.table_type.eq_ignore_ascii_case("VIEW") { "VIEW" } else { "TABLE" }.to_string(),
+                schema: Some(database.to_string()),
+                comment: table.comment,
+                created_at: meta.and_then(|meta| meta.created_at.clone()),
+                updated_at: meta.and_then(|meta| meta.updated_at.clone()),
+                parent_schema: table.parent_schema,
+                parent_name: table.parent_name,
+            }
+        })
+        .collect();
+
+    match routines {
+        Ok(routines) => objects.extend(routines),
+        Err(err) => log::warn!("Skipping routines for database `{}` in object browser: {}", database, err),
+    }
+
+    Ok(objects)
+}
+
+async fn list_routine_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
+    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let routines_sql = list_routines_sql(database);
+    let result = conn.query_iter(&routines_sql).await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    Ok(rows.iter().map(|row| row_to_object(row, database)).collect())
+}
+
+pub async fn list_completion_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
+    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut objects = Vec::new();
+
+    let routines_sql = list_routines_sql(database);
+    match conn.query_iter(&routines_sql).await {
+        Ok(result) => match result.collect_and_drop::<mysql_async::Row>().await {
+            Ok(rows) => objects.extend(rows.iter().map(|row| row_to_object(row, database))),
+            Err(e) => log::warn!("Skipping routines for completion in database `{}`: {}", database, e),
+        },
+        Err(e) => log::warn!("Skipping routines for completion in database `{}`: {}", database, e),
+    }
+
+    let triggers_sql = list_completion_triggers_sql(database);
+    match conn.query_iter(&triggers_sql).await {
+        Ok(result) => match result.collect_and_drop::<mysql_async::Row>().await {
+            Ok(rows) => objects.extend(rows.iter().map(|row| row_to_object(row, database))),
+            Err(e) => log::warn!("Skipping triggers for completion in database `{}`: {}", database, e),
+        },
+        Err(e) => log::warn!("Skipping triggers for completion in database `{}`: {}", database, e),
     }
 
     Ok(objects)
@@ -831,6 +1025,37 @@ pub async fn get_columns(pool: &MySqlPool, database: &str, table: &str) -> Resul
                 numeric_precision: get_opt_i32(row, "NUMERIC_PRECISION"),
                 numeric_scale: get_opt_i32(row, "NUMERIC_SCALE"),
                 character_maximum_length: get_opt_i32(row, "CHARACTER_MAXIMUM_LENGTH"),
+            }
+        })
+        .collect())
+}
+
+pub async fn get_columns_show(pool: &MySqlPool, database: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
+    let sql = format!("SHOW FULL COLUMNS FROM {}.{}", quote_identifier(database), quote_identifier(table));
+    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = match conn.query_iter(&sql).await {
+        Ok(result) => result.collect_and_drop().await.map_err(|e| e.to_string())?,
+        Err(_) => {
+            let sql = format!("SHOW COLUMNS FROM {}.{}", quote_identifier(database), quote_identifier(table));
+            let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
+            result.collect_and_drop().await.map_err(|e| e.to_string())?
+        }
+    };
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let key = get_str_by_name(row, "Key");
+            ColumnInfo {
+                name: get_str_by_name(row, "Field"),
+                data_type: get_str_by_name(row, "Type"),
+                is_nullable: get_str_by_name(row, "Null").eq_ignore_ascii_case("YES"),
+                column_default: get_opt_str(row, "Default"),
+                is_primary_key: key.eq_ignore_ascii_case("PRI"),
+                extra: get_opt_str(row, "Extra"),
+                comment: get_opt_str(row, "Comment").filter(|s| !s.is_empty()),
+                numeric_precision: None,
+                numeric_scale: None,
+                character_maximum_length: None,
             }
         })
         .collect())
@@ -936,7 +1161,7 @@ async fn execute_result_set_with_prepared_protocol_on_conn(
 }
 
 pub async fn execute_query(pool: &MySqlPool, sql: &str, bare: bool) -> Result<QueryResult, String> {
-    execute_query_with_max_rows(pool, sql, bare, None).await
+    execute_query_with_max_rows(pool, sql, bare, None, MySqlQueryDialect::default()).await
 }
 
 pub async fn execute_query_with_max_rows(
@@ -944,9 +1169,10 @@ pub async fn execute_query_with_max_rows(
     sql: &str,
     bare: bool,
     max_rows: Option<usize>,
+    dialect: MySqlQueryDialect,
 ) -> Result<QueryResult, String> {
     let mut conn = get_conn_with_health_check(pool).await?;
-    execute_query_on_conn_with_max_rows(&mut conn, sql, bare, max_rows).await
+    execute_query_on_conn_with_max_rows(&mut conn, sql, bare, max_rows, dialect).await
 }
 
 pub async fn execute_query_on_conn_with_max_rows(
@@ -954,12 +1180,13 @@ pub async fn execute_query_on_conn_with_max_rows(
     sql: &str,
     bare: bool,
     max_rows: Option<usize>,
+    dialect: MySqlQueryDialect,
 ) -> Result<QueryResult, String> {
     let start = Instant::now();
     let row_limit = query_result_row_limit(max_rows);
 
-    if is_result_set_query(sql) {
-        if bare || requires_text_protocol_query(sql) {
+    if is_result_set_query(sql, dialect) {
+        if bare || requires_text_protocol_query(sql, dialect) {
             execute_result_set_with_text_protocol_on_conn(conn, sql, row_limit, start).await
         } else {
             match execute_result_set_with_prepared_protocol_on_conn(conn, sql, row_limit, start).await {
@@ -996,11 +1223,16 @@ pub async fn execute_query_on_conn_with_max_rows(
     }
 }
 
-fn is_result_set_query(sql: &str) -> bool {
+fn is_result_set_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
     starts_with_executable_sql_keyword(sql, &["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH"])
+        || dialect.supports_admin_show_results && is_admin_show_query(sql)
 }
 
-fn requires_text_protocol_query(sql: &str) -> bool {
+fn requires_text_protocol_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
+    if dialect.supports_admin_show_results && is_admin_show_query(sql) {
+        return true;
+    }
+
     if !starts_with_executable_sql_keyword(sql, &["SHOW"]) {
         return false;
     }
@@ -1018,6 +1250,66 @@ fn requires_text_protocol_query(sql: &str) -> bool {
             | ["show", "slave", "status"]
             | ["show", "replica", "status"]
     )
+}
+
+fn is_admin_show_query(sql: &str) -> bool {
+    let tokens = leading_sql_word_tokens(sql, 2);
+    tokens.get(0).is_some_and(|token| token == "admin") && tokens.get(1).is_some_and(|token| token == "show")
+}
+
+fn leading_sql_word_tokens(sql: &str, limit: usize) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut tokens = Vec::new();
+
+    while i < bytes.len() && tokens.len() < limit {
+        i = skip_sql_whitespace_and_comments(bytes, i);
+        let start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i == start {
+            break;
+        }
+        tokens.push(sql[start..i].to_ascii_lowercase());
+    }
+
+    tokens
+}
+
+fn skip_sql_whitespace_and_comments(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        if i < bytes.len() && bytes[i] == b'#' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+
+        return i;
+    }
 }
 
 pub async fn list_indexes(pool: &MySqlPool, database: &str, table: &str) -> Result<Vec<IndexInfo>, String> {
@@ -1057,11 +1349,11 @@ pub async fn list_indexes(pool: &MySqlPool, database: &str, table: &str) -> Resu
 pub async fn list_foreign_keys(pool: &MySqlPool, database: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
     let sql = format!(
         "SELECT kcu.CONSTRAINT_NAME, kcu.COLUMN_NAME, \
-         kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME \
+         kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME \
          FROM information_schema.KEY_COLUMN_USAGE kcu \
          WHERE kcu.TABLE_SCHEMA = {} AND kcu.TABLE_NAME = {} \
          AND kcu.REFERENCED_TABLE_NAME IS NOT NULL \
-         ORDER BY kcu.CONSTRAINT_NAME",
+         ORDER BY kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION",
         quote_value(database),
         quote_value(table),
     );
@@ -1074,6 +1366,7 @@ pub async fn list_foreign_keys(pool: &MySqlPool, database: &str, table: &str) ->
         .map(|row| ForeignKeyInfo {
             name: get_str_by_name(row, "CONSTRAINT_NAME"),
             column: get_str_by_name(row, "COLUMN_NAME"),
+            ref_schema: Some(get_str_by_name(row, "REFERENCED_TABLE_SCHEMA")),
             ref_table: get_str_by_name(row, "REFERENCED_TABLE_NAME"),
             ref_column: get_str_by_name(row, "REFERENCED_COLUMN_NAME"),
         })
@@ -1111,12 +1404,63 @@ mod tests {
     #[test]
     fn mysql_with_queries_are_treated_as_result_sets() {
         let sql = "WITH RECURSIVE org_tree AS (SELECT 1 AS id) SELECT id FROM org_tree";
-        assert!(is_result_set_query(sql));
+        assert!(is_result_set_query(sql, MySqlQueryDialect::default()));
     }
 
     #[test]
     fn mysql_desc_queries_are_treated_as_result_sets() {
-        assert!(is_result_set_query("DESC users"));
+        assert!(is_result_set_query("DESC users", MySqlQueryDialect::default()));
+    }
+
+    #[test]
+    fn starrocks_admin_show_queries_are_treated_as_result_sets() {
+        let sql = "ADMIN SHOW FRONTEND CONFIG LIKE '%default_replication_num%'";
+        let dialect = MySqlQueryDialect::for_connection(DatabaseType::StarRocks, None);
+
+        assert!(is_result_set_query(sql, dialect));
+        assert!(requires_text_protocol_query(sql, dialect));
+    }
+
+    #[test]
+    fn doris_admin_show_queries_are_treated_as_result_sets() {
+        let sql = "ADMIN SHOW FRONTEND CONFIG LIKE '%default_replication_num%'";
+        let dialect = MySqlQueryDialect::for_connection(DatabaseType::Doris, None);
+
+        assert!(is_result_set_query(sql, dialect));
+        assert!(requires_text_protocol_query(sql, dialect));
+    }
+
+    #[test]
+    fn mysql_starrocks_profile_admin_show_queries_are_treated_as_result_sets() {
+        let sql = "ADMIN SHOW FRONTEND CONFIG LIKE '%default_replication_num%'";
+        let dialect = MySqlQueryDialect::for_connection(DatabaseType::Mysql, Some("starrocks"));
+
+        assert!(is_result_set_query(sql, dialect));
+        assert!(requires_text_protocol_query(sql, dialect));
+    }
+
+    #[test]
+    fn mysql_admin_show_queries_are_not_treated_as_result_sets() {
+        let sql = "ADMIN SHOW FRONTEND CONFIG LIKE '%default_replication_num%'";
+        let dialect = MySqlQueryDialect::for_connection(DatabaseType::Mysql, None);
+
+        assert!(!is_result_set_query(sql, dialect));
+        assert!(!requires_text_protocol_query(sql, dialect));
+    }
+
+    #[test]
+    fn admin_show_detection_skips_leading_comments() {
+        let sql = "-- inspect FE config\nADMIN /* StarRocks */ SHOW FRONTEND CONFIG";
+        let dialect = MySqlQueryDialect::for_connection(DatabaseType::StarRocks, None);
+
+        assert!(is_result_set_query(sql, dialect));
+        assert!(requires_text_protocol_query(sql, dialect));
+    }
+
+    #[test]
+    fn admin_set_queries_are_not_treated_as_result_sets() {
+        let dialect = MySqlQueryDialect::for_connection(DatabaseType::StarRocks, None);
+        assert!(!is_result_set_query("ADMIN SET FRONTEND CONFIG ('default_replication_num' = '1')", dialect));
     }
 
     #[test]
@@ -1152,6 +1496,16 @@ mod tests {
         assert!(sql.contains("'FUNCTION'"));
         assert!(!sql.contains("LAST_ALTERED"));
         assert!(!sql.contains("CREATED AS created_at"));
+    }
+
+    #[test]
+    fn mysql_completion_triggers_sql_lists_database_triggers() {
+        let sql = list_completion_triggers_sql("app");
+
+        assert!(sql.contains("information_schema.TRIGGERS"));
+        assert!(sql.contains("'TRIGGER' AS object_type"));
+        assert!(sql.contains("EVENT_OBJECT_TABLE AS parent_name"));
+        assert!(sql.contains("TRIGGER_SCHEMA = 'app'"));
     }
 
     #[test]
@@ -1215,10 +1569,7 @@ mod tests {
         let blob_column = mysql_test_column(ColumnType::MYSQL_TYPE_BLOB, 63, ColumnFlags::BLOB_FLAG, 65_535);
 
         assert_eq!(mysql_bytes_to_json(b"hello".to_vec(), &text_column), serde_json::json!("hello"));
-        assert_eq!(
-            mysql_bytes_to_json(vec![0x00, 0x01, 0xab, 0xff], &blob_column),
-            serde_json::json!("(BLOB) 4 bytes")
-        );
+        assert_eq!(mysql_bytes_to_json(vec![0x00, 0x01, 0xab, 0xff], &blob_column), serde_json::json!("0x0001abff"));
     }
 
     #[test]
@@ -1241,14 +1592,14 @@ mod tests {
 
     #[test]
     fn mysql_management_show_queries_use_text_protocol() {
-        assert!(requires_text_protocol_query("SHOW PROCESSLIST"));
-        assert!(requires_text_protocol_query("show full processlist"));
-        assert!(requires_text_protocol_query("SHOW SLAVE STATUS"));
-        assert!(requires_text_protocol_query("show replica status"));
-        assert!(requires_text_protocol_query("SHOW GRANTS"));
-        assert!(requires_text_protocol_query("SHOW GRANTS FOR 'repl'@'%'"));
-        assert!(!requires_text_protocol_query("SHOW TABLES"));
-        assert!(!requires_text_protocol_query("SELECT * FROM users"));
+        assert!(requires_text_protocol_query("SHOW PROCESSLIST", MySqlQueryDialect::default()));
+        assert!(requires_text_protocol_query("show full processlist", MySqlQueryDialect::default()));
+        assert!(requires_text_protocol_query("SHOW SLAVE STATUS", MySqlQueryDialect::default()));
+        assert!(requires_text_protocol_query("show replica status", MySqlQueryDialect::default()));
+        assert!(requires_text_protocol_query("SHOW GRANTS", MySqlQueryDialect::default()));
+        assert!(requires_text_protocol_query("SHOW GRANTS FOR 'repl'@'%'", MySqlQueryDialect::default()));
+        assert!(!requires_text_protocol_query("SHOW TABLES", MySqlQueryDialect::default()));
+        assert!(!requires_text_protocol_query("SELECT * FROM users", MySqlQueryDialect::default()));
     }
 
     #[test]

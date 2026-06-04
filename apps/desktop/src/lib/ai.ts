@@ -10,7 +10,7 @@ import type {
   QueryTab,
 } from "@/types/database";
 import * as api from "@/lib/api";
-import { currentLocale } from "@/i18n";
+import { currentLocale, type Locale } from "@/i18n";
 import { aiTableMentionKey, type AiTableMention } from "@/lib/aiTableMentions";
 import { aiSkillForAction } from "@/lib/aiSkills";
 import { isSchemaAware } from "@/lib/databaseCapabilities";
@@ -18,10 +18,15 @@ import { isSchemaAware } from "@/lib/databaseCapabilities";
 export type AiAction = "generate" | "explain" | "optimize" | "fix" | "convert" | "sampleData";
 export type AiAssistantMode = "ask" | "agent";
 
+function isChineseLocale(locale: Locale): boolean {
+  return locale === "zh-CN" || locale === "zh-TW";
+}
+
 export interface AiSchemaTable {
   schema?: string;
   name: string;
   tableType: string;
+  comment?: string | null;
   columns: ColumnInfo[];
   indexes?: IndexInfo[];
   foreignKeys?: ForeignKeyInfo[];
@@ -47,7 +52,7 @@ export interface AiRequestInput {
 }
 
 export async function runAiAction(input: AiRequestInput, history?: api.AiMessage[]): Promise<string> {
-  const isZh = currentLocale() === "zh-CN";
+  const isZh = isChineseLocale(currentLocale());
   const skill = aiSkillForAction(input.action);
   const systemPrompt = buildSystemPrompt(input.action, input.context, input.mode);
   const instruction = isZh ? skill.userInstruction.zh : skill.userInstruction.en;
@@ -78,7 +83,7 @@ export async function runAiStream(
   sessionId?: string,
   onReasoningDelta?: (delta: string) => void,
 ): Promise<void> {
-  const isZh = currentLocale() === "zh-CN";
+  const isZh = isChineseLocale(currentLocale());
   const skill = aiSkillForAction(input.action);
   const systemPrompt = buildSystemPrompt(input.action, input.context, input.mode);
   const instruction = isZh ? skill.userInstruction.zh : skill.userInstruction.en;
@@ -136,7 +141,7 @@ export function buildSystemPrompt(action: AiAction, context: AiContext, mode: Ai
   const resultPreview = context.lastResultPreview ? `\nLast result preview:\n${context.lastResultPreview}\n` : "";
   const lastError = context.lastError ? `\nLast error:\n${context.lastError}\n` : "";
 
-  const isZh = currentLocale() === "zh-CN";
+  const isZh = isChineseLocale(currentLocale());
 
   const lines: string[] = [
     ...buildBasePromptLines(isZh),
@@ -183,6 +188,9 @@ function buildBasePromptLines(isZh: boolean): string[] {
     isZh
       ? "下面的 Schema 上下文已包含表、列、索引和外键信息，直接使用即可。不要查询 information_schema 或系统表来获取结构信息。"
       : "The schema context below already contains tables, columns, indexes, and foreign keys — use it directly. Do NOT query information_schema or system tables.",
+    isZh
+      ? "表注释和列注释是语义别名；当用户用中文业务名描述表或字段时，优先根据注释匹配真实表名和字段名。"
+      : "Table and column comments are semantic aliases; when the user describes tables or fields by business names, prefer matching those comments to the real table and column names.",
     isZh
       ? "当用户要求分析或查看某个表时，生成 SELECT 查询获取数据，而不是查询元数据。"
       : "When the user asks to 'analyze' or 'look at' a table, generate a SELECT query to retrieve data, not a metadata query.",
@@ -238,6 +246,8 @@ function formatSchema(context: AiContext): string {
     .map((table) => {
       const name = table.schema ? `${table.schema}.${table.name}` : table.name;
       const lines: string[] = [`${name} (${table.tableType})`];
+      const tableComment = table.comment?.trim();
+      if (tableComment) lines.push(`  Comment: ${tableComment}`);
 
       for (const column of table.columns) {
         const flags = [
@@ -248,7 +258,10 @@ function formatSchema(context: AiContext): string {
         ]
           .filter(Boolean)
           .join(", ");
-        lines.push(`  - ${column.name}: ${column.data_type}${flags ? ` (${flags})` : ""}`);
+        const columnComment = column.comment?.trim();
+        lines.push(
+          `  - ${column.name}: ${column.data_type}${flags ? ` (${flags})` : ""}${columnComment ? ` -- ${columnComment}` : ""}`,
+        );
       }
 
       if (table.indexes?.length) {
@@ -288,10 +301,12 @@ export async function buildAiContext(
       api.listIndexes(tab.connectionId, tab.database, s, tName).catch(() => [] as IndexInfo[]),
       api.listForeignKeys(tab.connectionId, tab.database, s, tName).catch(() => [] as ForeignKeyInfo[]),
     ]);
+    const tableComment = await loadTableComment(tab.connectionId, tab.database, s, tName).catch(() => undefined);
     tables.push({
       schema: tab.tableMeta.schema,
       name: tName,
       tableType: "TABLE",
+      comment: tableComment,
       columns: tab.tableMeta.columns.slice(0, maxColumnsPerTable),
       indexes,
       foreignKeys,
@@ -329,6 +344,7 @@ export async function buildAiContext(
               schema: schema === tab.database && !isSchemaAware(connection.db_type) ? undefined : schema,
               name: table.name,
               tableType: table.table_type,
+              comment: table.comment,
               columns: columns.slice(0, maxColumnsPerTable),
               indexes,
               foreignKeys,
@@ -371,19 +387,31 @@ async function loadMentionedTableContext(
   maxColumnsPerTable: number,
 ): Promise<AiSchemaTable | undefined> {
   const schema = await resolveMentionedTableSchema(tab, connection, mention);
-  const [columns, indexes, foreignKeys] = await Promise.all([
+  const [columns, indexes, foreignKeys, tableComment] = await Promise.all([
     api.getColumns(tab.connectionId, tab.database, schema, mention.table),
     api.listIndexes(tab.connectionId, tab.database, schema, mention.table).catch(() => [] as IndexInfo[]),
     api.listForeignKeys(tab.connectionId, tab.database, schema, mention.table).catch(() => [] as ForeignKeyInfo[]),
+    loadTableComment(tab.connectionId, tab.database, schema, mention.table).catch(() => undefined),
   ]);
   return {
     schema: schema === tab.database && !isSchemaAware(connection.db_type) ? undefined : schema,
     name: mention.table,
     tableType: "TABLE",
+    comment: tableComment,
     columns: columns.slice(0, maxColumnsPerTable),
     indexes,
     foreignKeys,
   };
+}
+
+async function loadTableComment(
+  connectionId: string,
+  database: string,
+  schema: string,
+  tableName: string,
+): Promise<string | undefined> {
+  const tables = await api.listTables(connectionId, database, schema, tableName, 10);
+  return tables.find((table) => table.name.toLowerCase() === tableName.toLowerCase())?.comment?.trim() || undefined;
 }
 
 async function resolveMentionedTableSchema(

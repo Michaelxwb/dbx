@@ -166,6 +166,7 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup};
 
@@ -362,6 +363,7 @@ pub fn run() {
             commands::cloud_sync::webdav_sync_download,
             commands::connection::test_connection,
             commands::connection::connect_db,
+            commands::connection::connection_final_proxy_port,
             commands::connection::disconnect_db,
             commands::connection::close_database_connection,
             commands::connection::refresh_connections,
@@ -393,6 +395,9 @@ pub fn run() {
             commands::schema_cache::save_schema_cache,
             commands::schema_cache::load_schema_cache,
             commands::schema_cache::delete_schema_cache_prefix,
+            commands::tab_runtime_cache::save_tab_runtime_cache,
+            commands::tab_runtime_cache::load_tab_runtime_cache,
+            commands::tab_runtime_cache::delete_tab_runtime_cache,
             commands::query::execute_query,
             commands::query::execute_multi,
             commands::query::cancel_query,
@@ -406,6 +411,8 @@ pub fn run() {
             commands::query::prepare_query_pagination_execution_plan,
             commands::query::build_sorted_query_sql,
             commands::query::build_explain_sql,
+            commands::query::get_explain_info,
+            commands::query::build_create_user_sql,
             commands::query::build_dropped_file_preview_sql,
             commands::query::build_table_select_sql,
             commands::query::build_database_search_sql,
@@ -474,6 +481,10 @@ pub fn run() {
             commands::redis_cmd::redis_flush_db,
             commands::redis_cmd::redis_execute_command,
             commands::redis_cmd::redis_load_more,
+            commands::etcd_cmd::etcd_list_prefix,
+            commands::etcd_cmd::etcd_get,
+            commands::etcd_cmd::etcd_put,
+            commands::etcd_cmd::etcd_delete,
             commands::saved_sql::load_saved_sql_library,
             commands::saved_sql::save_saved_sql_folder,
             commands::saved_sql::delete_saved_sql_folder,
@@ -510,6 +521,9 @@ pub fn run() {
             commands::agents::list_installed_agents,
             commands::agents::list_installed_agents_local,
             commands::agents::get_driver_store_usage,
+            commands::agents::get_driver_runtime_summary,
+            commands::agents::stop_driver_runtime,
+            commands::agents::restart_driver_runtime,
             commands::agents::install_agent,
             commands::agents::upgrade_all_agents,
             commands::agents::check_agent_update_blockers,

@@ -21,6 +21,8 @@ pub fn agent_connect_params(config: &ConnectionConfig, host: &str, port: u16, da
     } else {
         config.connection_string.as_deref().unwrap_or("").to_string()
     };
+    let etcd_endpoints =
+        if config.db_type == DatabaseType::Etcd { normalize_etcd_endpoints(config, host, port) } else { String::new() };
 
     serde_json::json!({
         "host": host,
@@ -31,6 +33,11 @@ pub fn agent_connect_params(config: &ConnectionConfig, host: &str, port: u16, da
         "sysdba": oracle_uses_sysdba(config),
         "url_params": config.url_params.as_deref().unwrap_or(""),
         "connection_string": connection_string,
+        "ssl": config.ssl,
+        "ca_cert_path": config.ca_cert_path,
+        "client_cert_path": config.client_cert_path,
+        "client_key_path": config.client_key_path,
+        "etcd_endpoints": etcd_endpoints,
     })
 }
 
@@ -190,6 +197,15 @@ fn sap_hana_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: 
     }
 }
 
+fn normalize_etcd_endpoints(config: &ConnectionConfig, host: &str, port: u16) -> String {
+    let endpoints = config.etcd_endpoints.trim();
+    if !endpoints.is_empty() {
+        return endpoints.to_string();
+    }
+    let scheme = if config.ssl { "https" } else { "http" };
+    format!("{scheme}://{host}:{port}")
+}
+
 fn append_agent_url_params(base: String, params: Option<&str>) -> String {
     let params = params.unwrap_or("").trim().trim_start_matches(['?', '&']);
     if params.is_empty() {
@@ -202,9 +218,7 @@ fn append_agent_url_params(base: String, params: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::connection::{
-        default_connect_timeout_secs, default_query_timeout_secs, default_ssh_connect_timeout_secs, ProxyType,
-    };
+    use crate::models::connection::{default_connect_timeout_secs, default_query_timeout_secs};
 
     fn config(db_type: DatabaseType, database: Option<&str>) -> ConnectionConfig {
         ConnectionConfig {
@@ -222,26 +236,13 @@ mod tests {
             visible_databases: None,
             attached_databases: Vec::new(),
             color: None,
-            ssh_enabled: false,
-            ssh_host: String::new(),
-            ssh_port: 22,
-            ssh_user: String::new(),
-            ssh_password: String::new(),
-            ssh_key_path: String::new(),
-            ssh_key_passphrase: String::new(),
-            ssh_expose_lan: false,
-            ssh_connect_timeout_secs: default_ssh_connect_timeout_secs(),
-            ssh_tunnels: Vec::new(),
+            transport_layers: Vec::new(),
             connect_timeout_secs: default_connect_timeout_secs(),
             query_timeout_secs: default_query_timeout_secs(),
-            proxy_enabled: false,
-            proxy_type: ProxyType::Socks5,
-            proxy_host: String::new(),
-            proxy_port: 1080,
-            proxy_username: String::new(),
-            proxy_password: String::new(),
             ssl: false,
             ca_cert_path: String::new(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
             sysdba: false,
             oracle_connection_type: None,
             connection_string: None,
@@ -252,6 +253,7 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),

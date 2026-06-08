@@ -234,6 +234,7 @@ pub fn duckdb_execute_with_max_rows(
         }
         Ok(db::QueryResult {
             columns,
+            column_types: Vec::new(),
             rows: result_rows,
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
@@ -245,6 +246,7 @@ pub fn duckdb_execute_with_max_rows(
         let affected = con.execute(sql, []).map_err(|e| e.to_string())?;
         Ok(db::QueryResult {
             columns: vec![],
+            column_types: Vec::new(),
             rows: vec![],
             affected_rows: affected as u64,
             execution_time_ms: start.elapsed().as_millis(),
@@ -479,6 +481,7 @@ fn resolve_query_timeout(timeout_secs: Option<u64>) -> Option<Duration> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn do_execute(
     state: &AppState,
     pool_key: &str,
@@ -563,6 +566,17 @@ pub async fn do_execute(
             drop(connections);
             wait_for_query_opt(cancel_token, query_timeout, db::sqlite::execute_query_with_max_rows(&p, sql, max_rows))
                 .await
+        }
+        PoolKind::Rqlite(client) => {
+            let client = client.clone();
+            let max_rows = options.max_rows;
+            drop(connections);
+            wait_for_query_opt(
+                cancel_token,
+                query_timeout,
+                db::rqlite_driver::execute_query_with_max_rows(&client, sql, max_rows),
+            )
+            .await
         }
         PoolKind::ClickHouse(client) => {
             let client = client.clone();
@@ -660,7 +674,7 @@ pub async fn do_execute(
             let session = session.clone();
             let sql = sql.to_string();
             let schema = schema.map(str::to_string);
-            let database = config.effective_database().unwrap_or("").to_string();
+            let database = database.unwrap_or_else(|| config.effective_database().unwrap_or("")).to_string();
             let max_rows = options.max_rows;
             let plugin_timeout = query_timeout;
             drop(connections);
@@ -936,6 +950,7 @@ async fn execute_multi_mysql(
 fn error_query_result(message: String) -> db::QueryResult {
     db::QueryResult {
         columns: vec!["Error".to_string()],
+        column_types: Vec::new(),
         rows: vec![vec![serde_json::Value::String(message)]],
         affected_rows: 0,
         execution_time_ms: 0,
@@ -960,6 +975,7 @@ async fn execute_multi_sqlserver(
         if is_canceled(&cancel_token) {
             all_results.push(db::QueryResult {
                 columns: vec!["Error".to_string()],
+                column_types: Vec::new(),
                 rows: vec![vec![serde_json::Value::String(canceled_error())]],
                 affected_rows: 0,
                 execution_time_ms: 0,
@@ -992,6 +1008,7 @@ async fn execute_multi_sqlserver(
             Err(e) => {
                 all_results.push(db::QueryResult {
                     columns: vec!["Error".to_string()],
+                    column_types: Vec::new(),
                     rows: vec![vec![serde_json::Value::String(e)]],
                     affected_rows: 0,
                     execution_time_ms: 0,
@@ -1006,6 +1023,7 @@ async fn execute_multi_sqlserver(
     if all_results.is_empty() {
         all_results.push(db::QueryResult {
             columns: vec![],
+            column_types: Vec::new(),
             rows: vec![],
             affected_rows: 0,
             execution_time_ms: 0,
@@ -1069,6 +1087,7 @@ pub async fn execute_statements(
 
     Ok(db::QueryResult {
         columns: vec![],
+        column_types: Vec::new(),
         rows: vec![],
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
@@ -1107,7 +1126,9 @@ pub async fn execute_statements_in_transaction(
             PoolKind::Postgres(pg) => TxPath::Pg(pg.clone()),
             PoolKind::Mysql(mp, _mode) => TxPath::Mysql(mp.clone(), false),
             PoolKind::Sqlite(sq) => TxPath::Sqlite(sq.clone()),
-            PoolKind::ClickHouse(_) | PoolKind::SqlServer(_) | PoolKind::Agent(_) => TxPath::Explicit,
+            PoolKind::ClickHouse(_) | PoolKind::Rqlite(_) | PoolKind::SqlServer(_) | PoolKind::Agent(_) => {
+                TxPath::Explicit
+            }
             PoolKind::DuckDb(_)
             | PoolKind::Redis(_)
             | PoolKind::MongoDb(_)
@@ -1169,6 +1190,7 @@ async fn exec_tx_pg_inner(
     match tx_result {
         Ok(total_affected) => Ok(db::QueryResult {
             columns: vec![],
+            column_types: Vec::new(),
             rows: vec![],
             affected_rows: total_affected,
             execution_time_ms: start.elapsed().as_millis(),
@@ -1216,6 +1238,7 @@ async fn exec_tx_mysql_inner(
     conn.query_drop("COMMIT").await.map_err(|e| format!("COMMIT failed: {}", e))?;
     Ok(db::QueryResult {
         columns: vec![],
+        column_types: Vec::new(),
         rows: vec![],
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
@@ -1247,6 +1270,7 @@ async fn exec_tx_sqlite_inner(
             conn.execute_batch("COMMIT").map_err(|e| format!("COMMIT failed: {}", e))?;
             Ok(db::QueryResult {
                 columns: vec![],
+                column_types: Vec::new(),
                 rows: vec![],
                 affected_rows: total_affected,
                 execution_time_ms: start.elapsed().as_millis(),
@@ -1326,6 +1350,7 @@ async fn exec_tx_explicit_inner(
 
     Ok(db::QueryResult {
         columns: vec![],
+        column_types: Vec::new(),
         rows: vec![],
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
@@ -1367,6 +1392,7 @@ async fn exec_tx_none_inner(
 
     Ok(db::QueryResult {
         columns: vec![],
+        column_types: Vec::new(),
         rows: vec![],
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
@@ -1379,7 +1405,7 @@ async fn exec_tx_none_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::connection::{ConnectionConfig, DatabaseType, ProxyType};
+    use crate::models::connection::{ConnectionConfig, DatabaseType};
 
     #[tokio::test]
     async fn wait_for_query_returns_cancelled_when_token_is_cancelled() {
@@ -1390,6 +1416,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(30)).await;
             Ok(db::QueryResult {
                 columns: vec![],
+                column_types: Vec::new(),
                 rows: vec![],
                 affected_rows: 0,
                 execution_time_ms: 0,
@@ -1409,6 +1436,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
             Ok(db::QueryResult {
                 columns: vec![],
+                column_types: Vec::new(),
                 rows: vec![],
                 affected_rows: 0,
                 execution_time_ms: 0,
@@ -1581,26 +1609,13 @@ mod tests {
             visible_databases: None,
             attached_databases: Vec::new(),
             color: None,
-            ssh_enabled: false,
-            ssh_host: String::new(),
-            ssh_port: 22,
-            ssh_user: String::new(),
-            ssh_password: String::new(),
-            ssh_key_path: String::new(),
-            ssh_key_passphrase: String::new(),
-            ssh_expose_lan: false,
-            ssh_connect_timeout_secs: 5,
-            ssh_tunnels: Vec::new(),
+            transport_layers: Vec::new(),
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
-            proxy_enabled: false,
-            proxy_type: ProxyType::Socks5,
-            proxy_host: String::new(),
-            proxy_port: 1080,
-            proxy_username: String::new(),
-            proxy_password: String::new(),
             ssl: false,
             ca_cert_path: String::new(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
             sysdba: false,
             oracle_connection_type: None,
             connection_string: Some("jdbc:h2:mem:test".to_string()),
@@ -1611,6 +1626,7 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
@@ -1722,6 +1738,7 @@ mod tests {
     fn query_results_convert_unsafe_json_integers_to_strings_for_js() {
         let result = db::QueryResult {
             columns: vec!["id".to_string(), "nested".to_string()],
+            column_types: Vec::new(),
             rows: vec![vec![
                 serde_json::json!(2_041_797_190_226_354_178_i64),
                 serde_json::json!([1, 2_041_797_190_226_354_178_i64]),

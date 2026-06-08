@@ -1,5 +1,6 @@
 pub mod agent_catalog;
 pub mod agent_connection;
+pub mod agent_kv;
 pub mod agent_manager;
 pub mod agent_runtime;
 pub mod agent_service;
@@ -15,6 +16,7 @@ pub mod database_export;
 pub mod database_search_sql;
 pub mod db;
 pub mod db_admin_sql;
+pub mod driver_runtime;
 pub mod external;
 pub mod history;
 pub mod jdbc;

@@ -20,6 +20,7 @@ import type {
   SavedSqlFolder,
   SavedSqlLibrary,
 } from "@/types/database";
+import type { SidebarObjectKind } from "@/lib/databaseObjectCapabilities";
 import type { AiConfig } from "@/stores/settingsStore";
 import type {
   AgentDriverInfo,
@@ -28,6 +29,7 @@ import type {
   AiConversation,
   AiModelInfo,
   DriverStoreUsage,
+  DriverRuntimeSummary,
   UpgradeAllAgentDriversResult,
   AgentUpdateBlocker,
   DesktopSettings,
@@ -38,6 +40,11 @@ import type {
   RedisValue,
   RedisScanResult,
   RedisCommandResult,
+  KvValue,
+  KvListPrefixResponse,
+  KvGetResponse,
+  KvPutResponse,
+  KvDeleteResponse,
   MongoDocumentResult,
   HistoryEntry,
   SqlFileRequest,
@@ -150,6 +157,10 @@ export async function connectDb(config: ConnectionConfig): Promise<string> {
   return post("/api/connection/connect", { config });
 }
 
+export async function connectionFinalProxyPort(config: ConnectionConfig): Promise<number> {
+  return post("/api/connection/final-proxy-port", { config });
+}
+
 export async function disconnectDb(connectionId: string): Promise<void> {
   return post("/api/connection/disconnect", { connectionId });
 }
@@ -164,6 +175,10 @@ export async function saveConnections(configs: ConnectionConfig[]): Promise<void
 
 export async function loadConnections(): Promise<ConnectionConfig[]> {
   return get("/api/connection/list");
+}
+
+export async function decryptConfig(payload: unknown, passphrase: string): Promise<string> {
+  return post("/api/app-settings/config/decrypt", { payload, passphrase });
 }
 
 export async function listSystemFonts(): Promise<string[]> {
@@ -238,6 +253,18 @@ export async function listInstalledAgents(): Promise<AgentDriverInfo[]> {
 
 export async function getDriverStoreUsage(): Promise<DriverStoreUsage> {
   return get("/api/agents/storage-usage");
+}
+
+export async function getDriverRuntimeSummary(): Promise<DriverRuntimeSummary> {
+  return get("/api/agents/runtime");
+}
+
+export async function stopDriverRuntime(runtimeId: string): Promise<void> {
+  await post("/api/agents/runtime/stop", { runtimeId });
+}
+
+export async function restartDriverRuntime(runtimeId: string): Promise<void> {
+  await post("/api/agents/runtime/restart", { runtimeId });
 }
 
 export async function installAgent(dbType: string): Promise<void> {
@@ -373,8 +400,20 @@ export async function listTables(
   return get(`/api/schema/tables?${qs({ connection_id: connectionId, database, schema, filter, limit })}`);
 }
 
-export async function listObjects(connectionId: string, database: string, schema: string): Promise<ObjectInfo[]> {
-  return get(`/api/schema/objects?${qs({ connection_id: connectionId, database, schema })}`);
+export async function listObjects(
+  connectionId: string,
+  database: string,
+  schema: string,
+  objectTypes?: SidebarObjectKind[],
+): Promise<ObjectInfo[]> {
+  return get(
+    `/api/schema/objects?${qs({
+      connection_id: connectionId,
+      database,
+      schema,
+      object_types: objectTypes?.join(","),
+    })}`,
+  );
 }
 
 export async function listCompletionObjects(
@@ -566,6 +605,25 @@ export async function buildSortedQuerySql(options: SortedQuerySqlOptions): Promi
 
 export async function buildExplainSql(options: BuildExplainSqlOptions): Promise<ExplainSqlBuildResult> {
   return post("/api/query/build-explain-sql", { options });
+}
+
+export async function buildCreateUserSql(username: string, password: string, tablespace: string): Promise<string> {
+  return post("/api/query/build-create-user-sql", { username, password, tablespace });
+}
+
+export async function getExplainInfo(
+  connectionId: string,
+  database: string | undefined,
+  schema: string | undefined,
+  sql: string,
+  mode: string,
+): Promise<string | undefined> {
+  try {
+    const result = await post<string>("/api/query/get-explain-info", { connectionId, database, schema, sql, mode });
+    return result;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function buildDroppedFilePreviewSql(options: DroppedFilePreviewSqlOptions): Promise<string | undefined> {
@@ -1352,6 +1410,36 @@ export async function redisLoadMore(
   count: number,
 ): Promise<RedisValue> {
   return post("/api/redis/load-more", { connectionId, db, keyRaw, keyType, cursor, count });
+}
+
+// ---------------------------------------------------------------------------
+// etcd
+// ---------------------------------------------------------------------------
+
+export async function etcdListPrefix(
+  connectionId: string,
+  prefix: string,
+  limit: number,
+  continuation?: string | null,
+): Promise<KvListPrefixResponse> {
+  return post("/api/etcd/list-prefix", { connectionId, prefix, limit, continuation });
+}
+
+export async function etcdGet(connectionId: string, key: string): Promise<KvGetResponse> {
+  return post("/api/etcd/get", { connectionId, key });
+}
+
+export async function etcdPut(
+  connectionId: string,
+  key: string,
+  value: KvValue,
+  lease?: number | null,
+): Promise<KvPutResponse> {
+  return post("/api/etcd/put", { connectionId, key, value, lease });
+}
+
+export async function etcdDelete(connectionId: string, key: string): Promise<KvDeleteResponse> {
+  return post("/api/etcd/delete", { connectionId, key });
 }
 
 // ---------------------------------------------------------------------------

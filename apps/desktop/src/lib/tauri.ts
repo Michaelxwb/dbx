@@ -21,6 +21,7 @@ import type {
   SavedSqlFolder,
   SavedSqlLibrary,
 } from "@/types/database";
+import type { SidebarObjectKind } from "@/lib/databaseObjectCapabilities";
 import type { AiConfig } from "@/stores/settingsStore";
 import type { QueryEditability } from "@/lib/sqlAnalysis";
 import type {
@@ -110,6 +111,35 @@ export interface DriverStoreUsage {
   jdbc_driver_bytes: number;
   jres: DriverStoreUsageItem[];
   agent_drivers: DriverStoreUsageItem[];
+}
+
+export type DriverRuntimeHealth = "healthy" | "warning" | "error";
+export type DriverRuntimeStatus = "running" | "stopped" | "error" | "unknown";
+
+export interface DriverRuntimeInfo {
+  id: string;
+  driver_key: string;
+  label: string;
+  kind: string;
+  source: string;
+  status: DriverRuntimeStatus;
+  pid: number | null;
+  memory_bytes: number | null;
+  cpu_percent: number | null;
+  uptime_seconds: number | null;
+  version: string | null;
+  last_error: string | null;
+  can_stop: boolean;
+  can_restart: boolean;
+  control_unavailable_reason: string | null;
+}
+
+export interface DriverRuntimeSummary {
+  running_count: number;
+  total_memory_bytes: number;
+  last_error: string | null;
+  health: DriverRuntimeHealth;
+  runtimes: DriverRuntimeInfo[];
 }
 
 export interface DesktopSettings {
@@ -385,6 +415,10 @@ export async function connectDb(config: ConnectionConfig): Promise<string> {
   return invoke("connect_db", { config });
 }
 
+export async function connectionFinalProxyPort(config: ConnectionConfig): Promise<number> {
+  return invoke("connection_final_proxy_port", { config });
+}
+
 export async function disconnectDb(connectionId: string): Promise<void> {
   return invoke("disconnect_db", { connectionId });
 }
@@ -419,8 +453,13 @@ export async function listTables(
   return invoke("list_tables", { connectionId, database, schema, filter, limit });
 }
 
-export async function listObjects(connectionId: string, database: string, schema: string): Promise<ObjectInfo[]> {
-  return invoke("list_objects", { connectionId, database, schema });
+export async function listObjects(
+  connectionId: string,
+  database: string,
+  schema: string,
+  objectTypes?: SidebarObjectKind[],
+): Promise<ObjectInfo[]> {
+  return invoke("list_objects", { connectionId, database, schema, objectTypes });
 }
 
 export async function listCompletionObjects(
@@ -567,6 +606,26 @@ export async function buildSortedQuerySql(options: SortedQuerySqlOptions): Promi
 
 export async function buildExplainSql(options: BuildExplainSqlOptions): Promise<ExplainSqlBuildResult> {
   return invoke("build_explain_sql", { options });
+}
+
+export async function buildCreateUserSql(username: string, password: string, tablespace: string): Promise<string> {
+  return invoke("build_create_user_sql", { username, password, tablespace });
+}
+
+export async function getExplainInfo(
+  connectionId: string,
+  database: string | undefined,
+  schema: string | undefined,
+  sql: string,
+  mode: string,
+): Promise<string | undefined> {
+  try {
+    const result = await invoke<string>("get_explain_info", { connectionId, database, schema, sql, mode });
+    return result;
+  } catch (e: any) {
+    console.error("[getExplainInfo] invoke failed:", e?.message || e);
+    return undefined;
+  }
 }
 
 export async function buildDroppedFilePreviewSql(options: DroppedFilePreviewSqlOptions): Promise<string | undefined> {
@@ -810,6 +869,11 @@ export async function loadConnections(): Promise<ConnectionConfig[]> {
   return invoke("load_connections");
 }
 
+export async function decryptConfig(payload: unknown, passphrase: string): Promise<string> {
+  const { decryptConfig: decryptConfigPayload } = await import("@/lib/configCrypto");
+  return decryptConfigPayload(payload as any, passphrase);
+}
+
 export async function listPlugins(): Promise<InstalledPlugin[]> {
   return invoke("list_plugins");
 }
@@ -858,6 +922,18 @@ export async function listInstalledAgents(): Promise<AgentDriverInfo[]> {
 
 export async function getDriverStoreUsage(): Promise<DriverStoreUsage> {
   return invoke("get_driver_store_usage");
+}
+
+export async function getDriverRuntimeSummary(): Promise<DriverRuntimeSummary> {
+  return invoke("get_driver_runtime_summary");
+}
+
+export async function stopDriverRuntime(runtimeId: string): Promise<void> {
+  return invoke("stop_driver_runtime", { runtimeId });
+}
+
+export async function restartDriverRuntime(runtimeId: string): Promise<void> {
+  return invoke("restart_driver_runtime", { runtimeId });
 }
 
 export async function installAgent(dbType: string): Promise<void> {
@@ -1151,6 +1227,74 @@ export async function redisLoadMore(
   count: number,
 ): Promise<RedisValue> {
   return invoke("redis_load_more", { connectionId, db, keyRaw, keyType, cursor, count });
+}
+
+// --- etcd ---
+export type KvValueEncoding = "utf8" | "base64";
+
+export interface KvValue {
+  encoding: KvValueEncoding;
+  data: string;
+}
+
+export interface KvKeyMetadata {
+  createRevision?: number | null;
+  modRevision?: number | null;
+  version?: number | null;
+  lease?: number | null;
+  valueSize?: number | null;
+}
+
+export interface KvKeySummary extends KvKeyMetadata {
+  key: string;
+}
+
+export interface KvListPrefixResponse {
+  keys: KvKeySummary[];
+  continuation?: string | null;
+  revision?: number | null;
+}
+
+export interface KvGetResponse {
+  found: boolean;
+  key?: string | null;
+  value?: KvValue | null;
+  metadata?: KvKeyMetadata | null;
+}
+
+export interface KvPutResponse {
+  revision?: number | null;
+}
+
+export interface KvDeleteResponse {
+  deleted: number;
+  revision?: number | null;
+}
+
+export async function etcdListPrefix(
+  connectionId: string,
+  prefix: string,
+  limit: number,
+  continuation?: string | null,
+): Promise<KvListPrefixResponse> {
+  return invoke("etcd_list_prefix", { connectionId, prefix, limit, continuation });
+}
+
+export async function etcdGet(connectionId: string, key: string): Promise<KvGetResponse> {
+  return invoke("etcd_get", { connectionId, key });
+}
+
+export async function etcdPut(
+  connectionId: string,
+  key: string,
+  value: KvValue,
+  lease?: number | null,
+): Promise<KvPutResponse> {
+  return invoke("etcd_put", { connectionId, key, value, lease });
+}
+
+export async function etcdDelete(connectionId: string, key: string): Promise<KvDeleteResponse> {
+  return invoke("etcd_delete", { connectionId, key });
 }
 
 // --- MongoDB ---
@@ -1520,6 +1664,7 @@ export interface TableExportRequest {
   filePath: string;
   format: "csv" | "xlsx" | "json" | "markdown" | "sql";
   columns?: string[];
+  columnTypes?: Array<string | null | undefined>;
   primaryKeys?: string[];
   whereInput?: string;
   orderBy?: string;

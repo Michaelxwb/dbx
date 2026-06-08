@@ -47,6 +47,7 @@ pub enum PoolKind {
     Mysql(db::mysql::MySqlPool, MysqlMode),
     Postgres(deadpool_postgres::Pool),
     Sqlite(db::sqlite::SqliteHandle),
+    Rqlite(db::rqlite_driver::RqliteClient),
     Redis(db::redis_driver::RedisConnection),
     DuckDb(Arc<std::sync::Mutex<duckdb::Connection>>),
     MongoDb(mongodb::Client),
@@ -320,7 +321,7 @@ impl AppState {
                     connect_mysql_metadata_pool(&config, &db_config, &host, port, connect_timeout).await?;
                 PoolKind::Mysql(pool, mode)
             }
-            DatabaseType::Doris | DatabaseType::StarRocks => {
+            DatabaseType::Doris | DatabaseType::StarRocks | DatabaseType::Databend => {
                 let pool = if database.is_none() {
                     connect_bare_metadata_pool(&db_config, &host, port, connect_timeout).await?
                 } else {
@@ -328,9 +329,11 @@ impl AppState {
                 };
                 PoolKind::Mysql(pool, MysqlMode::Bare)
             }
-            DatabaseType::Postgres | DatabaseType::Redshift | DatabaseType::Gaussdb | DatabaseType::OpenGauss => {
-                PoolKind::Postgres(db::postgres::connect(&url, connect_timeout).await?)
-            }
+            DatabaseType::Postgres
+            | DatabaseType::Redshift
+            | DatabaseType::Gaussdb
+            | DatabaseType::Kwdb
+            | DatabaseType::OpenGauss => PoolKind::Postgres(db::postgres::connect(&url, connect_timeout).await?),
             DatabaseType::Sqlite => {
                 let extensions = db::sqlite::sqlite_extension_specs_from_url_params(db_config.url_params.as_deref())
                     .into_iter()
@@ -342,6 +345,18 @@ impl AppState {
                 PoolKind::Sqlite(
                     db::sqlite::connect_path_with_extensions(&expand_tilde(&db_config.host), extensions).await?,
                 )
+            }
+            DatabaseType::Rqlite => {
+                let client = db::rqlite_driver::RqliteClient::new(
+                    &url,
+                    db_config.url_params.as_deref(),
+                    &db_config.username,
+                    &db_config.password,
+                    db_config.ssl,
+                    connect_timeout,
+                )?;
+                db::rqlite_driver::test_connection(&client, connect_timeout).await?;
+                PoolKind::Rqlite(client)
             }
             DatabaseType::Redis => {
                 let con = if db_config.uses_redis_cluster() {
@@ -459,6 +474,8 @@ impl AppState {
             | DatabaseType::Sundb
             | DatabaseType::Tdengine
             | DatabaseType::Xugu
+            | DatabaseType::Iotdb
+            | DatabaseType::Etcd
             | DatabaseType::Iris
             | DatabaseType::Access => {
                 let connect_params =
@@ -550,72 +567,21 @@ impl AppState {
         connection_id: &str,
         config: &ConnectionConfig,
     ) -> Result<(String, u16), String> {
-        let ssh_hops = config.effective_ssh_tunnels();
-        if ssh_hops.is_empty() {
-            if config.proxy_enabled && !config.proxy_host.is_empty() {
-                if let Some(local_port) = self.proxy_tunnels.local_port(connection_id).await {
-                    return Ok(("127.0.0.1".to_string(), local_port));
-                }
-
-                let (remote_host, remote_port) = if config.db_type == DatabaseType::MongoDb {
-                    config
-                        .connection_string
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .and_then(parse_mongo_first_host)
-                        .unwrap_or_else(|| (config.host.clone(), config.port))
-                } else if config.db_type == DatabaseType::Jdbc {
-                    config
-                        .connection_string
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .and_then(parse_jdbc_host_port)
-                        .unwrap_or_else(|| (config.host.clone(), config.port))
-                } else {
-                    (config.host.clone(), config.port)
-                };
-
-                let local_port = self
-                    .proxy_tunnels
-                    .start_tunnel(
-                        connection_id,
-                        config.proxy_type,
-                        &config.proxy_host,
-                        config.proxy_port,
-                        &config.proxy_username,
-                        &config.proxy_password,
-                        &remote_host,
-                        remote_port,
-                    )
-                    .await?;
-                return Ok(("127.0.0.1".to_string(), local_port));
-            }
+        let transport_layers = config.effective_transport_layers();
+        if transport_layers.is_empty() {
             return Ok((config.host.clone(), config.port));
         }
 
-        if let Some(local_port) = self.tunnels.local_port(connection_id).await {
-            return Ok(("127.0.0.1".to_string(), local_port));
-        }
-
-        let (remote_host, remote_port) = if config.db_type == DatabaseType::MongoDb {
-            config
-                .connection_string
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .and_then(parse_mongo_first_host)
-                .unwrap_or_else(|| (config.host.clone(), config.port))
-        } else if config.db_type == DatabaseType::Jdbc {
-            config
-                .connection_string
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .and_then(parse_jdbc_host_port)
-                .unwrap_or_else(|| (config.host.clone(), config.port))
-        } else {
-            (config.host.clone(), config.port)
-        };
-
-        let local_port = self.tunnels.start_chain(connection_id, &ssh_hops, &remote_host, remote_port).await?;
+        let (remote_host, remote_port) = connection_remote_endpoint(config);
+        let local_port = db::transport_layer_tunnel::start_transport_layers(
+            connection_id,
+            &transport_layers,
+            &remote_host,
+            remote_port,
+            &self.tunnels,
+            &self.proxy_tunnels,
+        )
+        .await?;
 
         Ok(("127.0.0.1".to_string(), local_port))
     }
@@ -763,6 +729,30 @@ impl AppState {
     }
 
     pub async fn reset_connection_transport(&self, connection_id: &str) {
+        let layer_count = {
+            let configs = self.configs.read().await;
+            configs.get(connection_id).map(|config| config.effective_transport_layers().len()).unwrap_or(0)
+        };
+        self.reset_connection_transport_layers(connection_id, layer_count).await;
+    }
+
+    pub async fn reset_connection_transport_for_config(&self, connection_id: &str, config: &ConnectionConfig) {
+        let existing_layer_count = {
+            let configs = self.configs.read().await;
+            configs.get(connection_id).map(|config| config.effective_transport_layers().len()).unwrap_or(0)
+        };
+        let layer_count = existing_layer_count.max(config.effective_transport_layers().len());
+        self.reset_connection_transport_layers(connection_id, layer_count).await;
+    }
+
+    async fn reset_connection_transport_layers(&self, connection_id: &str, layer_count: usize) {
+        db::transport_layer_tunnel::stop_transport_layers(
+            connection_id,
+            layer_count,
+            &self.tunnels,
+            &self.proxy_tunnels,
+        )
+        .await;
         self.tunnels.stop_tunnel(connection_id).await;
         self.proxy_tunnels.stop_tunnel(connection_id).await;
     }
@@ -822,24 +812,11 @@ impl AppState {
         // Re-establish SSH tunnels that have died
         let tunnel_connection_ids: Vec<String> = {
             let configs = self.configs.read().await;
-            configs.iter().filter(|(_, c)| c.has_effective_ssh_tunnels()).map(|(id, _)| id.clone()).collect()
+            configs.iter().filter(|(_, c)| c.has_effective_transport_layers()).map(|(id, _)| id.clone()).collect()
         };
         for connection_id in tunnel_connection_ids {
-            self.tunnels.stop_tunnel(&connection_id).await;
+            self.reset_connection_transport(&connection_id).await;
             // Tunnels will be re-created on next pool access via connection_host_port
-        }
-
-        // Re-establish proxy tunnels
-        let proxy_connection_ids: Vec<String> = {
-            let configs = self.configs.read().await;
-            configs
-                .iter()
-                .filter(|(_, c)| c.proxy_enabled && !c.proxy_host.is_empty())
-                .map(|(id, _)| id.clone())
-                .collect()
-        };
-        for connection_id in proxy_connection_ids {
-            self.proxy_tunnels.stop_tunnel(&connection_id).await;
         }
     }
 
@@ -864,9 +841,27 @@ impl AppState {
 
     async fn uses_forwarded_transport(&self, connection_id: &str) -> bool {
         let configs = self.configs.read().await;
-        configs.get(connection_id).is_some_and(|config| {
-            config.has_effective_ssh_tunnels() || (config.proxy_enabled && !config.proxy_host.is_empty())
-        })
+        configs.get(connection_id).is_some_and(|config| config.has_effective_transport_layers())
+    }
+}
+
+fn connection_remote_endpoint(config: &ConnectionConfig) -> (String, u16) {
+    if config.db_type == DatabaseType::MongoDb {
+        config
+            .connection_string
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(parse_mongo_first_host)
+            .unwrap_or_else(|| (config.host.clone(), config.port))
+    } else if config.db_type == DatabaseType::Jdbc {
+        config
+            .connection_string
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .and_then(parse_jdbc_host_port)
+            .unwrap_or_else(|| (config.host.clone(), config.port))
+    } else {
+        (config.host.clone(), config.port)
     }
 }
 
@@ -880,7 +875,7 @@ fn session_scoped_pool_key(base_pool_key: String, client_session_id: Option<&str
         .unwrap_or(base_pool_key)
 }
 
-fn config_for_pool_key<'a>(
+pub(crate) fn config_for_pool_key<'a>(
     pool_key: &str,
     configs: &'a HashMap<String, ConnectionConfig>,
 ) -> Option<&'a ConnectionConfig> {
@@ -919,6 +914,7 @@ pub async fn close_pool_kind(pool: PoolKind) {
         }
         PoolKind::Postgres(p) => p.close(),
         PoolKind::Sqlite(_) => {}
+        PoolKind::Rqlite(_) => {}
         PoolKind::Redis(_) => {}
         PoolKind::DuckDb(con) => {
             crate::db::duckdb_driver::close_connection(con);
@@ -997,9 +993,10 @@ fn external_driver_connect_timeout(config: &ConnectionConfig) -> std::time::Dura
 
 fn native_postgres_url_config(config: &ConnectionConfig) -> Option<ConnectionConfig> {
     match config.db_type {
-        DatabaseType::Gaussdb | DatabaseType::OpenGauss => {
+        DatabaseType::Gaussdb | DatabaseType::Kwdb | DatabaseType::OpenGauss => {
             let mut normalized = config.clone();
-            if config.db_type == DatabaseType::Gaussdb {
+            normalized.database = normalized.effective_database().map(str::to_string);
+            if matches!(config.db_type, DatabaseType::Gaussdb | DatabaseType::Kwdb) {
                 let params = normalized.url_params.as_deref().unwrap_or("").trim().trim_start_matches('?');
                 if !params.to_lowercase().contains("sslmode=") {
                     normalized.url_params = Some(if params.is_empty() {
@@ -1109,7 +1106,11 @@ mod tests {
     };
     use crate::agent_manager::{AgentState, JavaRuntimeConfig, JavaRuntimeMode, DEFAULT_JRE_KEY};
     use crate::db;
-    use crate::models::connection::{default_connect_timeout_secs, ConnectionConfig, DatabaseType, ProxyType};
+    use crate::models::connection::{
+        default_connect_timeout_secs, ConnectionConfig, DatabaseType, ProxyTunnelConfig, ProxyType,
+        TransportLayerConfig,
+    };
+    use crate::query;
     use crate::schema;
     use crate::storage::Storage;
 
@@ -1129,26 +1130,13 @@ mod tests {
             visible_databases: None,
             attached_databases: Vec::new(),
             color: None,
-            ssh_enabled: false,
-            ssh_host: String::new(),
-            ssh_port: 22,
-            ssh_user: String::new(),
-            ssh_password: String::new(),
-            ssh_key_path: String::new(),
-            ssh_key_passphrase: String::new(),
-            ssh_expose_lan: false,
-            ssh_connect_timeout_secs: crate::models::connection::default_ssh_connect_timeout_secs(),
-            ssh_tunnels: Vec::new(),
+            transport_layers: Vec::new(),
             connect_timeout_secs: default_connect_timeout_secs(),
             query_timeout_secs: crate::models::connection::default_query_timeout_secs(),
-            proxy_enabled: false,
-            proxy_type: ProxyType::Socks5,
-            proxy_host: String::new(),
-            proxy_port: 1080,
-            proxy_username: String::new(),
-            proxy_password: String::new(),
             ssl: false,
             ca_cert_path: String::new(),
+            client_cert_path: String::new(),
+            client_key_path: String::new(),
             sysdba: false,
             oracle_connection_type: None,
             connection_string: None,
@@ -1159,6 +1147,7 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
@@ -1600,6 +1589,39 @@ mod tests {
     }
 
     #[test]
+    fn kwdb_endpoint_url_uses_postgres_scheme_for_native_driver() {
+        let mut config = mysql_config(None);
+        config.db_type = DatabaseType::Kwdb;
+        config.username = "root".to_string();
+        config.password = "secret".to_string();
+        config.port = 26257;
+
+        assert_eq!(
+            connection_url_for_endpoint(&config, &config.host, config.port),
+            "postgres://root:secret@127.0.0.1:26257/defaultdb?sslmode=disable"
+        );
+        assert_eq!(
+            redacted_connection_url_for_endpoint(&config, &config.host, config.port),
+            "postgres://127.0.0.1:26257/defaultdb?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn kwdb_endpoint_url_keeps_explicit_sslmode() {
+        let mut config = mysql_config(None);
+        config.db_type = DatabaseType::Kwdb;
+        config.username = "root".to_string();
+        config.password = "secret".to_string();
+        config.port = 26257;
+        config.url_params = Some("sslmode=require&application_name=dbx".to_string());
+
+        assert_eq!(
+            connection_url_for_endpoint(&config, &config.host, config.port),
+            "postgres://root:secret@127.0.0.1:26257/defaultdb?sslmode=require&application_name=dbx"
+        );
+    }
+
+    #[test]
     fn opengauss_endpoint_url_uses_postgres_scheme_for_native_driver() {
         let mut config = mysql_config(Some("postgres"));
         config.db_type = DatabaseType::OpenGauss;
@@ -1725,6 +1747,7 @@ mod tests {
             DatabaseType::ClickHouse,
             DatabaseType::SqlServer,
             DatabaseType::Elasticsearch,
+            DatabaseType::Kwdb,
         ] {
             let mut config = mysql_config(Some("app"));
             config.db_type = db_type;
@@ -1862,15 +1885,22 @@ mod tests {
     async fn proxy_connection_uses_local_forward_endpoint() {
         let (state, dir) = test_app_state().await;
         let mut config = mysql_config(Some("app"));
-        config.proxy_enabled = true;
-        config.proxy_host = "127.0.0.1".to_string();
-        config.proxy_port = 65000;
+        config.transport_layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            id: "proxy".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type: ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: 65000,
+            username: String::new(),
+            password: String::new(),
+        })];
 
         let (host, port) = state.connection_host_port("proxied", &config).await.unwrap();
 
         assert_eq!(host, "127.0.0.1");
         assert_ne!(port, config.port);
-        state.proxy_tunnels.stop_tunnel("proxied").await;
+        state.proxy_tunnels.stop_tunnel("proxied:transport:0").await;
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1918,5 +1948,122 @@ mod tests {
             url_params.as_deref(),
         ))
         .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a reachable KWDB instance via environment variables"]
+    async fn live_kwdb_native_connection_succeeds() {
+        let host = std::env::var("DBX_TEST_KWDB_HOST").expect("DBX_TEST_KWDB_HOST not set");
+        let port = std::env::var("DBX_TEST_KWDB_PORT")
+            .expect("DBX_TEST_KWDB_PORT not set")
+            .parse::<u16>()
+            .expect("DBX_TEST_KWDB_PORT should be a u16");
+        let username = std::env::var("DBX_TEST_KWDB_USER").unwrap_or_else(|_| "root".to_string());
+        let password = std::env::var("DBX_TEST_KWDB_PASSWORD").unwrap_or_default();
+        let database = std::env::var("DBX_TEST_KWDB_DATABASE").unwrap_or_else(|_| "defaultdb".to_string());
+        let url_params = std::env::var("DBX_TEST_KWDB_URL_PARAMS").unwrap_or_else(|_| "sslmode=disable".to_string());
+
+        let mut config = mysql_config(Some(&database));
+        config.id = "kwdb-live".to_string();
+        config.db_type = DatabaseType::Kwdb;
+        config.host = host;
+        config.port = port;
+        config.username = username;
+        config.password = password;
+        config.url_params = Some(url_params);
+
+        let (state, dir) = test_app_state().await;
+        state.configs.write().await.insert(config.id.clone(), config);
+        let pool_key = state.get_or_create_pool("kwdb-live", None).await.unwrap();
+        let pool = {
+            let connections = state.connections.read().await;
+            match connections.get(&pool_key).expect("KWDB pool should be created") {
+                PoolKind::Postgres(pool) => pool.clone(),
+                _ => panic!("KWDB should use the PostgreSQL pool path"),
+            }
+        };
+        let result = query::execute_sql_statement(
+            &state,
+            "kwdb-live",
+            &database,
+            "SELECT current_database(), current_schema()",
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("failed to query live KWDB: {err}"));
+        assert_eq!(result.rows.len(), 1);
+        let database_column_index = result
+            .columns
+            .iter()
+            .position(|column| column == "current_database")
+            .expect("current_database column should be present");
+        assert_eq!(result.rows[0].get(database_column_index).and_then(|value| value.as_str()), Some(database.as_str()));
+        let databases = schema::list_databases_core(&state, "kwdb-live").await.unwrap();
+        assert!(databases.iter().any(|database| database.name == "defaultdb"));
+        let test_schema = "dbx_kwdb_live";
+        db::postgres::execute_query(&pool, &format!("DROP SCHEMA IF EXISTS {test_schema} CASCADE"))
+            .await
+            .unwrap_or_else(|err| panic!("failed to clean KWDB test schema: {err}"));
+        query::execute_sql_statement(
+            &state,
+            "kwdb-live",
+            &database,
+            &format!("CREATE SCHEMA {test_schema}"),
+            None,
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("failed to create KWDB test schema: {err}"));
+        query::execute_sql_statement(
+            &state,
+            "kwdb-live",
+            &database,
+            "CREATE TABLE devices (id INT PRIMARY KEY, name STRING, active BOOL)",
+            Some(test_schema),
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("failed to create KWDB test table: {err}"));
+        query::execute_sql_statement(
+            &state,
+            "kwdb-live",
+            &database,
+            "INSERT INTO devices (id, name, active) VALUES (1, 'meter-a', true)",
+            Some(test_schema),
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("failed to insert KWDB test row: {err}"));
+        let query_result = query::execute_sql_statement(
+            &state,
+            "kwdb-live",
+            &database,
+            "SELECT name, active FROM devices WHERE id = 1",
+            Some(test_schema),
+            None,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("failed to query KWDB test row: {err}"));
+        assert_eq!(query_result.rows.len(), 1);
+        assert_eq!(query_result.rows[0].first().and_then(|value| value.as_str()), Some("meter-a"));
+
+        let schemas = schema::list_schemas_core(&state, "kwdb-live", &database).await.unwrap();
+        assert!(schemas.iter().any(|schema| schema == test_schema));
+        let tables = schema::list_tables_core(&state, "kwdb-live", &database, test_schema, None, None).await.unwrap();
+        assert!(tables.iter().any(|table| table.name == "devices" && table.table_type == "BASE TABLE"));
+        let columns = schema::get_columns_core(&state, "kwdb-live", &database, test_schema, "devices").await.unwrap();
+        let id_column = columns.iter().find(|column| column.name == "id").expect("id column should be listed");
+        assert!(id_column.data_type.to_lowercase().contains("int"));
+        let name_column = columns.iter().find(|column| column.name == "name").expect("name column should be listed");
+        assert!(name_column.data_type.to_lowercase().contains("text"));
+        let active_column =
+            columns.iter().find(|column| column.name == "active").expect("active column should be listed");
+        assert!(active_column.data_type.to_lowercase().contains("bool"));
+        db::postgres::execute_query(&pool, &format!("DROP SCHEMA {test_schema} CASCADE"))
+            .await
+            .unwrap_or_else(|err| panic!("failed to drop KWDB test schema: {err}"));
+        pool.close();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

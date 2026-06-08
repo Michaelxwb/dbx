@@ -51,6 +51,7 @@ import {
   supportsTableStructureEditing,
   supportsTableTruncate,
 } from "@/lib/databaseFeatureSupport";
+import { connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 import { buildTableSelectSql } from "@/lib/tableSelectSql";
 import {
   buildDropObjectSql,
@@ -128,6 +129,9 @@ const sourceContent = ref("");
 const sourceError = ref("");
 const sourceRow = ref<ObjectBrowserRow | null>(null);
 const sourceEditing = ref(false);
+const effectiveDatabaseType = computed(
+  () => effectiveDatabaseTypeForConnection(props.connection) ?? props.connection.db_type,
+);
 const sourceDraft = ref("");
 const sourceSaving = ref(false);
 const sourceSaveError = ref("");
@@ -159,7 +163,9 @@ let loadId = 0;
 // Export via background tracker
 const { addTask: addExportTask } = useExportTracker();
 
-const needsSchema = computed(() => isSchemaAware(props.connection.db_type));
+const needsSchema = computed(
+  () => isSchemaAware(props.connection.db_type) && !connectionUsesDatabaseObjectTreeMode(props.connection),
+);
 const tableCount = computed(() => rows.value.filter((row) => row.type === "TABLE").length);
 const viewCount = computed(() => rows.value.filter((row) => row.type === "VIEW").length);
 const procedureCount = computed(() => rows.value.filter((row) => row.type === "PROCEDURE").length);
@@ -167,28 +173,32 @@ const functionCount = computed(() => rows.value.filter((row) => row.type === "FU
 const packageCount = computed(
   () => rows.value.filter((row) => row.type === "PACKAGE" || row.type === "PACKAGE_BODY").length,
 );
-const canOpenStructureEditor = computed(() => supportsTableStructureEditing(props.connection.db_type));
-const canOpenDiagram = computed(() => !!props.database && supportsSchemaDiagram(props.connection.db_type));
-const canOpenTableImport = computed(() => !!props.database && supportsTableImport(props.connection.db_type));
-const supportsTruncateTable = computed(() => supportsTableTruncate(props.connection.db_type));
+const canOpenStructureEditor = computed(() => supportsTableStructureEditing(effectiveDatabaseType.value));
+const canOpenDiagram = computed(() => !!props.database && supportsSchemaDiagram(effectiveDatabaseType.value));
+const canOpenTableImport = computed(() => !!props.database && supportsTableImport(effectiveDatabaseType.value));
+const supportsTruncateTable = computed(() => supportsTableTruncate(effectiveDatabaseType.value));
 const sourceDialect = computed<"mysql" | "postgres" | "sqlserver">(() => {
   if (
-    props.connection.db_type === "postgres" ||
-    props.connection.db_type === "gaussdb" ||
-    props.connection.db_type === "opengauss"
+    effectiveDatabaseType.value === "postgres" ||
+    effectiveDatabaseType.value === "gaussdb" ||
+    effectiveDatabaseType.value === "kwdb" ||
+    effectiveDatabaseType.value === "opengauss"
   )
     return "postgres";
-  if (props.connection.db_type === "sqlserver") return "sqlserver";
+  if (effectiveDatabaseType.value === "sqlserver") return "sqlserver";
   return "mysql";
 });
 const sourceFormatDialect = computed<SqlFormatDialect>(() => {
-  switch (props.connection.db_type) {
+  switch (effectiveDatabaseType.value) {
     case "mysql":
     case "postgres":
     case "sqlite":
     case "sqlserver":
-      return props.connection.db_type;
+      return effectiveDatabaseType.value;
+    case "rqlite":
+      return "sqlite";
     case "gaussdb":
+    case "kwdb":
     case "opengauss":
       return "postgres";
     default:
@@ -348,8 +358,8 @@ function canOpenSource(row: ObjectBrowserRow) {
 
 function canRename(row: ObjectBrowserRow) {
   return (
-    supportsObjectRename(props.connection.db_type, row.type) ||
-    supportsSourceBackedRoutineRename(props.connection.db_type, row.type as ObjectSourceKind)
+    supportsObjectRename(effectiveDatabaseType.value, row.type) ||
+    supportsSourceBackedRoutineRename(effectiveDatabaseType.value, row.type as ObjectSourceKind)
   );
 }
 
@@ -414,7 +424,7 @@ async function openViewDdl(row: ObjectBrowserRow) {
       "VIEW",
     );
     const ddl = await buildViewDdl({
-      databaseType: props.connection.db_type,
+      databaseType: effectiveDatabaseType.value,
       schema: row.schema || selectedSchema.value || props.database,
       name: row.name,
       source: result.source,
@@ -431,7 +441,7 @@ async function openNewQuery(row: ObjectBrowserRow) {
   queryStore.updateSql(
     tabId,
     await buildTableSelectSql({
-      databaseType: props.connection.db_type,
+      databaseType: effectiveDatabaseType.value,
       schema: row.schema || selectedSchema.value,
       tableName: row.name,
       limit: 100,
@@ -485,13 +495,13 @@ async function refreshRenamePreviewSql() {
     renamePreviewSqlText.value = "";
     return;
   }
-  if (supportsSourceBackedRoutineRename(props.connection.db_type, row.type as ObjectSourceKind)) {
+  if (supportsSourceBackedRoutineRename(effectiveDatabaseType.value, row.type as ObjectSourceKind)) {
     renamePreviewSqlText.value = `-- Recreate ${row.type} from source, then drop the original object.`;
     return;
   }
   try {
     const sql = await buildRenameObjectSql({
-      databaseType: props.connection.db_type,
+      databaseType: effectiveDatabaseType.value,
       objectType: row.type,
       schema: row.schema || selectedSchema.value,
       oldName: row.name,
@@ -514,7 +524,7 @@ async function confirmRename() {
   renameError.value = "";
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    if (supportsSourceBackedRoutineRename(props.connection.db_type, row.type as ObjectSourceKind)) {
+    if (supportsSourceBackedRoutineRename(effectiveDatabaseType.value, row.type as ObjectSourceKind)) {
       const source = await api.getObjectSource(
         props.connection.id,
         props.database,
@@ -523,7 +533,7 @@ async function confirmRename() {
         row.type as ObjectSourceKind,
       );
       const statements = await buildRoutineRenameObjectSourceStatements({
-        databaseType: props.connection.db_type,
+        databaseType: effectiveDatabaseType.value,
         objectType: row.type as ObjectSourceKind,
         schema,
         name: row.name,
@@ -535,7 +545,7 @@ async function confirmRename() {
       }
     } else {
       const sql = await buildRenameObjectSql({
-        databaseType: props.connection.db_type,
+        databaseType: effectiveDatabaseType.value,
         objectType: row.type,
         schema,
         oldName: row.name,
@@ -562,7 +572,7 @@ async function confirmDrop() {
   const row = dropTarget.value;
   try {
     const sql = await buildDropObjectSql({
-      databaseType: props.connection.db_type,
+      databaseType: effectiveDatabaseType.value,
       objectType: row.type,
       schema: row.schema || selectedSchema.value,
       name: row.name,
@@ -727,7 +737,7 @@ async function refreshBatchDropPreviewSql() {
   const statements: string[] = [];
   for (const row of selectedTableRows.value) {
     const sql = await buildDropObjectSql({
-      databaseType: props.connection.db_type,
+      databaseType: effectiveDatabaseType.value,
       objectType: "TABLE",
       schema: row.schema || selectedSchema.value,
       name: row.name,
@@ -750,7 +760,7 @@ async function confirmBatchDropTables() {
   try {
     for (const row of targets) {
       const sql = await buildDropObjectSql({
-        databaseType: props.connection.db_type,
+        databaseType: effectiveDatabaseType.value,
         objectType: "TABLE",
         schema: row.schema || selectedSchema.value,
         name: row.name,
@@ -779,14 +789,19 @@ async function exportStructure(row: ObjectBrowserRow) {
 async function exportDataLegacy(row: ObjectBrowserRow, format: "json" | "sql") {
   try {
     const schema = row.schema || selectedSchema.value;
+    const tableColumns =
+      format === "sql"
+        ? await api.getColumns(props.connection.id, props.database, schema || props.database, row.name)
+        : undefined;
     const queryColumns =
       props.connection.db_type === "neo4j"
-        ? (await api.getColumns(props.connection.id, props.database, schema || props.database, row.name)).map(
-            (column) => column.name,
-          )
+        ? (
+            tableColumns ??
+            (await api.getColumns(props.connection.id, props.database, schema || props.database, row.name))
+          ).map((column) => column.name)
         : undefined;
     const result = await fetchTableDataForExport({
-      databaseType: props.connection.db_type,
+      databaseType: effectiveDatabaseType.value,
       schema,
       tableName: row.name,
       columns: queryColumns,
@@ -810,10 +825,11 @@ async function exportDataLegacy(row: ObjectBrowserRow, format: "json" | "sql") {
     }
 
     const content = await formatSqlInsert({
-      databaseType: props.connection.db_type,
+      databaseType: effectiveDatabaseType.value,
       schema,
       tableName: row.name,
       columns: result.columns,
+      columnTypes: tableColumns ? columnTypesForResultColumns(result.columns, tableColumns) : undefined,
       rows: result.rows,
     });
     await saveFileContent(content, `${row.name}.sql`, "SQL", "sql");
@@ -821,6 +837,14 @@ async function exportDataLegacy(row: ObjectBrowserRow, format: "json" | "sql") {
   } catch (e: any) {
     toast(t("grid.exportFailed", { message: e?.message || String(e) }), 5000);
   }
+}
+
+function columnTypesForResultColumns(
+  columns: string[],
+  tableColumns: Array<{ name: string; data_type: string }>,
+): Array<string | undefined> {
+  const typesByName = new Map(tableColumns.map((column) => [column.name.toLocaleLowerCase(), column.data_type]));
+  return columns.map((column) => typesByName.get(column.toLocaleLowerCase()));
 }
 
 async function exportData(row: ObjectBrowserRow, format: "csv" | "json" | "sql") {
@@ -916,7 +940,7 @@ async function confirmDuplicateStructure() {
   try {
     const schema = row.schema || selectedSchema.value;
     const sql = await buildDuplicateTableStructureSql({
-      databaseType: props.connection.db_type,
+      databaseType: effectiveDatabaseType.value,
       schema,
       sourceName: row.name,
       targetName: newName,
@@ -932,7 +956,7 @@ async function confirmDuplicateStructure() {
 
 function tableAdminSqlOptions(row: ObjectBrowserRow): TableAdminSqlOptions {
   return {
-    databaseType: props.connection.db_type,
+    databaseType: effectiveDatabaseType.value,
     schema: row.schema || selectedSchema.value,
     tableName: row.name,
   };
@@ -1026,14 +1050,14 @@ async function saveSource() {
   sourceSaveError.value = "";
   try {
     const statements = await buildExecutableObjectSourceStatements({
-      databaseType: props.connection.db_type,
+      databaseType: effectiveDatabaseType.value,
       objectType: row.type as ObjectSourceKind,
       schema,
       name: row.name,
       source: sourceDraft.value,
     });
     for (const sql of statements) {
-      if (objectSourceSaveExecutionMode(props.connection.db_type) === "single") {
+      if (objectSourceSaveExecutionMode(effectiveDatabaseType.value) === "single") {
         await api.executeQuery(props.connection.id, props.database, sql, schema);
       } else {
         await api.executeScript(props.connection.id, props.database, sql, schema);

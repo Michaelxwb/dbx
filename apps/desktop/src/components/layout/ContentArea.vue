@@ -14,6 +14,7 @@ import {
   TableProperties,
   ChevronDown,
   ChevronUp,
+  Inbox,
   RefreshCcw,
   Wrench,
 } from "@lucide/vue";
@@ -44,6 +45,7 @@ function preloadDataGridComponent() {
 
 const DataGrid = defineAsyncComponent(loadDataGridComponent);
 const RedisKeyBrowser = defineAsyncComponent(() => import("@/components/redis/RedisKeyBrowser.vue"));
+const EtcdKeyBrowser = defineAsyncComponent(() => import("@/components/etcd/EtcdKeyBrowser.vue"));
 const MongoDocBrowser = defineAsyncComponent(() => import("@/components/mongo/MongoDocBrowser.vue"));
 const ObjectBrowser = defineAsyncComponent(() => import("@/components/objects/ObjectBrowser.vue"));
 const TableStructureEditor = defineAsyncComponent(() => import("@/components/structure/TableStructureEditor.vue"));
@@ -54,6 +56,8 @@ import { canCancelQueryExecution, queryExecutionLabelKey } from "@/lib/queryExec
 import { databaseDisplayNameForTab } from "@/lib/tabPresentation";
 import { isTableDataEditable } from "@/lib/tableEditing";
 import { tableMetaForDataTab } from "@/lib/tableDataTabMeta";
+import { formatShortcut } from "@/lib/shortcutRegistry";
+import { effectiveDatabaseTypeForConnection } from "@/lib/jdbcDialect";
 import type { QueryTab, ConnectionConfig } from "@/types/database";
 import type { SqlFormatDialect } from "@/lib/sqlFormatter";
 
@@ -145,17 +149,21 @@ const columnVisibilityOptions = computed(
   () => dataGridRef.value?.filteredColumnVisibilityOptions(columnVisibilitySearch.value) ?? [],
 );
 const redisKeyBrowserRef = ref<SearchableBrowserHandle>();
+const etcdKeyBrowserRef = ref<SearchableBrowserHandle>();
 const objectBrowserRef = ref<SearchableBrowserHandle>();
 const activeTableMeta = computed(() => props.activeTab.tableMeta);
 const activeDataTabTableMeta = computed(() => tableMetaForDataTab(props.activeTab));
+const activeEffectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(props.activeConnection));
 
 const activeSqlFormatDialect = computed<SqlFormatDialect>(() => {
-  switch (props.activeConnection?.db_type) {
+  switch (activeEffectiveDatabaseType.value) {
     case "mysql":
       return "mysql";
     case "postgres":
+    case "kwdb":
       return "postgres";
     case "sqlite":
+    case "rqlite":
       return "sqlite";
     case "sqlserver":
       return "sqlserver";
@@ -165,12 +173,19 @@ const activeSqlFormatDialect = computed<SqlFormatDialect>(() => {
 });
 
 const editorDialect = computed<"mysql" | "postgres" | "sqlserver">(() => {
-  if (props.activeConnection?.db_type === "postgres") return "postgres";
-  if (props.activeConnection?.db_type === "sqlserver") return "sqlserver";
+  if (activeEffectiveDatabaseType.value === "postgres" || activeEffectiveDatabaseType.value === "kwdb")
+    return "postgres";
+  if (activeEffectiveDatabaseType.value === "sqlserver") return "sqlserver";
   return "mysql";
 });
 
 const shortcutModifier = computed(() => (navigator.platform.toLowerCase().includes("mac") ? "Cmd" : "Ctrl"));
+
+const modRKeys = computed(() =>
+  formatShortcut("Mod+R")
+    .split("+")
+    .map((key) => (key === "Cmd" ? "⌘" : key)),
+);
 
 const hasNumericData = computed(() => {
   const r = props.activeTab.result;
@@ -332,6 +347,7 @@ function onHandleCloseColumnPanel() {
 
 function focusSearch(): boolean {
   if (props.activeTab.mode === "redis") return redisKeyBrowserRef.value?.focusSearch() ?? false;
+  if (props.activeTab.mode === "etcd") return etcdKeyBrowserRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "objects") return objectBrowserRef.value?.focusSearch() ?? false;
   if (props.activeTab.mode === "query") return queryEditorRef.value?.openSearch() ?? false;
   return dataGridRef.value?.focusSearch() ?? false;
@@ -347,6 +363,10 @@ function handleModRTarget(target: Element): boolean {
   if (target.closest("[data-query-editor-root]")) return queryEditorRef.value?.openReplace() ?? false;
   if (target.closest("[data-cell-detail-editor-root]")) return dataGridRef.value?.openCellDetailSearch() ?? false;
   if (target.closest("[data-grid-root]")) return refreshData();
+  if (props.activeTab.mode === "data" && !props.activeTab.result && !props.activeTab.isExecuting) {
+    emit("reload");
+    return true;
+  }
   return false;
 }
 
@@ -367,7 +387,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
               :connection-id="activeTab.connectionId"
               :database="activeTab.database"
               :schema="activeTab.schema"
-              :database-type="activeConnection?.db_type"
+              :database-type="activeEffectiveDatabaseType"
               :dialect="editorDialect"
               :format-dialect="activeSqlFormatDialect"
               :format-request-id="formatSqlRequestId"
@@ -552,7 +572,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
                 :editable="!!activeTab.queryAnalysis"
                 :source-columns="activeTab.querySourceColumns"
                 context="results"
-                :database-type="activeConnection?.db_type"
+                :database-type="activeEffectiveDatabaseType"
                 :connection-id="activeTab.connectionId"
                 :database="activeTab.database"
                 :schema="activeTab.schema"
@@ -561,6 +581,7 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
                 :page-limit="activeTab.resultPageLimit"
                 :count-sql="activeTab.resultCountSql"
                 :total-row-count="activeTab.resultTotalRowCount"
+                :total-row-count-loading="activeTab.resultTotalRowCountLoading"
                 :on-execute-sql="async (sql: string) => emit('executeSql', sql)"
                 :full-export-result="() => queryStore.fetchTabResultForExport(activeTab.id)"
                 @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
@@ -799,10 +820,10 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
           :initial-order-by-input="activeTab.orderByInput"
           :sql="activeTab.sql"
           :loading="activeTab.isExecuting"
-          :editable="isTableDataEditable(activeConnection?.db_type, activeTableMeta?.primaryKeys ?? [])"
+          :editable="isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [])"
           context="table-data"
           :initial-where-input="activeTab.whereInput"
-          :database-type="activeConnection?.db_type"
+          :database-type="activeEffectiveDatabaseType"
           :connection-id="activeTab.connectionId"
           :database="activeTab.database"
           :table-meta="activeDataTabTableMeta"
@@ -854,6 +875,16 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
         <div v-else class="h-full flex flex-col items-center justify-center gap-3 text-muted-foreground text-sm">
           <Inbox class="h-8 w-8 opacity-60" />
           <div>{{ t("grid.dataUnavailable") }}</div>
+          <div class="text-xs text-muted-foreground/70 inline-flex items-center gap-1">
+            <span>{{ t("grid.dataUnavailableHintPrefix") }}</span>
+            <kbd
+              v-for="key in modRKeys"
+              :key="key"
+              class="min-w-5 rounded border border-border/60 bg-muted/50 px-1.5 py-0.5 text-center font-mono text-[12px] leading-none text-muted-foreground shadow-xs"
+              >{{ key }}</kbd
+            >
+            <span>{{ t("grid.dataUnavailableHintSuffix") }}</span>
+          </div>
           <Button variant="outline" size="sm" class="h-7 gap-1.5" @click="emit('reload')">
             <RefreshCcw class="h-3.5 w-3.5" />
             {{ t("grid.refresh") }}
@@ -871,6 +902,13 @@ defineExpose({ focusSearch, refreshData, handleModRTarget });
           :connection-id="activeTab.connectionId"
           :db="Number(activeTab.database)"
         />
+      </div>
+    </template>
+
+    <!-- etcd mode: key browser -->
+    <template v-else-if="activeTab.mode === 'etcd'">
+      <div class="flex-1 min-h-0">
+        <EtcdKeyBrowser ref="etcdKeyBrowserRef" :key="activeTab.id" :connection-id="activeTab.connectionId" />
       </div>
     </template>
 

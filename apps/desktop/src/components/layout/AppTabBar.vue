@@ -12,6 +12,7 @@ import {
   Code2,
   TableProperties,
   PencilRuler,
+  KeyRound,
   Pencil,
   Package,
   Check,
@@ -224,20 +225,23 @@ const openTabMenuItems = computed(() =>
 
 function tabMenuIcon(tab: QueryTab) {
   if (tab.mode === "data") return Table2;
+  if (tab.mode === "etcd") return KeyRound;
   if (tab.mode === "objects") return TableProperties;
   if (tab.mode === "structure") return PencilRuler;
   return Code2;
 }
 
-function activateTab(tabId: string) {
-  tabScrollBehavior.value = "auto";
-  queryStore.activeTabId = tabId;
-  emit("close-driver-store");
-}
-
 function handleTabClick(tab: QueryTab) {
   if (tabDrag.state.wasDragged) return;
   activateTab(tab.id);
+}
+
+function handleTabMouseDown(event: MouseEvent, tabId: string) {
+  if (event.button === 0) {
+    dispatchBeforeTabSwitch(tabId);
+    event.preventDefault();
+  }
+  tabDrag.startDrag(event, tabId);
 }
 
 function tabDropStyle(tabId: string) {
@@ -266,6 +270,20 @@ const tabOverflowControlClass = computed(() =>
     ? "h-full w-8 border-r border-border/80 dark:border-border/45 bg-background/80 text-foreground/75 hover:bg-accent hover:text-foreground disabled:cursor-default disabled:opacity-40"
     : "h-7 w-7 rounded-md border border-border/60 bg-background text-foreground/70 hover:border-border hover:text-foreground",
 );
+
+function dispatchBeforeTabSwitch(tabId: string) {
+  if (tabId === queryStore.activeTabId) return;
+  window.dispatchEvent(
+    new CustomEvent("dbx:before-tab-switch", { detail: { tabId, fromTabId: queryStore.activeTabId } }),
+  );
+}
+
+function activateTab(tabId: string) {
+  dispatchBeforeTabSwitch(tabId);
+  tabScrollBehavior.value = "auto";
+  queryStore.activeTabId = tabId;
+  emit("close-driver-store");
+}
 </script>
 
 <template>
@@ -331,13 +349,14 @@ const tabOverflowControlClass = computed(() =>
                 @click="handleTabClick(tab)"
                 @dblclick.stop="startRenameTab(tab)"
                 @mousedown.middle.prevent="queryStore.closeTab(tab.id)"
-                @mousedown="tabDrag.startDrag($event, tab.id)"
+                @mousedown="handleTabMouseDown($event, tab.id)"
                 @mouseenter="tabDrag.updateTarget($event, tab.id)"
                 @mousemove="tabDrag.updateTarget($event, tab.id)"
                 @mouseleave="tabDrag.clearTarget(tab.id)"
               >
                 <span class="shrink-0" :class="tabIconClass(tab)">
                   <Table2 v-if="tab.mode === 'data'" class="h-3.5 w-3.5" />
+                  <KeyRound v-else-if="tab.mode === 'etcd'" class="h-3.5 w-3.5" />
                   <TableProperties v-else-if="tab.mode === 'objects'" class="h-3.5 w-3.5" />
                   <PencilRuler v-else-if="tab.mode === 'structure'" class="h-3.5 w-3.5" />
                   <Code2 v-else class="h-3.5 w-3.5" />

@@ -1,5 +1,15 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, shallowRef, computed } from "vue";
+import {
+  ref,
+  onMounted,
+  onBeforeUnmount,
+  onActivated,
+  onDeactivated,
+  watch,
+  shallowRef,
+  computed,
+  nextTick,
+} from "vue";
 import { Play, Copy, TextSelect } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import type { CompletionContext } from "@codemirror/autocomplete";
@@ -56,6 +66,8 @@ import {
   fontSizeFromWheelDelta,
 } from "@/lib/editorZoom";
 import { shortcutToCodeMirrorKey } from "@/lib/shortcutRegistry";
+import { trimmedSelectionLayer } from "@/lib/codemirrorTrimmedSelectionLayer";
+import { selectionMatchOccurrences } from "@/lib/codemirrorSelectionMatches";
 import * as api from "@/lib/api";
 import {
   areSqlSemanticDiagnosticsEqual,
@@ -77,7 +89,6 @@ import type {
   SqlTableReference,
   SqlTextSpan,
 } from "@/types/database";
-import { vscodeSelectionLayer } from "@/lib/codemirrorVscodeSelectionLayer";
 
 const props = defineProps<{
   modelValue: string;
@@ -1405,17 +1416,28 @@ onMounted(async () => {
       ],
     });
 
-  const ss = settingsStore.editorSettings;
-
   const baseDialect = props.dialect === "postgres" ? PostgreSQL : props.dialect === "sqlserver" ? MSSQL : MySQL;
   const extraKeywords =
     "PIVOT UNPIVOT EXCLUDE REPLACE QUALIFY ASOF POSITIONAL ANTI SEMI SAMPLE TABLESAMPLE STRUCT MAP LIST ARRAY LAMBDA UNNEST LATERAL FILTER RECURSIVE SUMMARIZE PRAGMA READ_CSV READ_PARQUET READ_JSON DESCRIBE SHOW COPY EXPORT IMPORT";
+
+  // PL/pgSQL extension: add procedural language keywords and built-in variables for PostgreSQL function/procedure bodies
+  const isPostgres = props.dialect === "postgres";
+  const plpgsqlKeywords = isPostgres ? "PERFORM" : "";
+  const plpgsqlTypes = isPostgres ? " RECORD JSON JSONB" : "";
+  const plpgsqlBuiltin = isPostgres
+    ? "SQLERRM TG_NAME TG_WHEN TG_LEVEL TG_OP TG_RELID TG_RELNAME TG_TABLE_NAME TG_TABLE_SCHEMA TG_NARGS TG_ARGV"
+    : "";
+
   const dialect = SQLDialect.define({
     ...baseDialect.spec,
-    keywords: (baseDialect.spec.keywords || "") + " " + extraKeywords,
+    keywords: [baseDialect.spec.keywords || "", extraKeywords, plpgsqlKeywords].filter(Boolean).join(" "),
+    types: [baseDialect.spec.types || "", plpgsqlTypes].filter(Boolean).join(" ") || undefined,
+    builtin: [baseDialect.spec.builtin || "", plpgsqlBuiltin].filter(Boolean).join(" ") || undefined,
+    doubleDollarQuotedStrings: false,
   });
 
-  const theme = await loadEditorTheme(ss.theme, editorThemeAppearance());
+  const initialSettings = settingsStore.editorSettings;
+  const theme = await loadEditorTheme(initialSettings.theme, editorThemeAppearance(), getCurrentCustomThemeColors());
 
   const activeLineHighlighter = ViewPlugin.fromClass(
     class {
@@ -1465,7 +1487,8 @@ onMounted(async () => {
       history(),
       foldGutter(),
       drawSelection(),
-      vscodeSelectionLayer(),
+      trimmedSelectionLayer(),
+      selectionMatchOccurrences(),
       dropCursor(),
       EditorState.allowMultipleSelections.of(true),
       indentOnInput(),
@@ -1496,7 +1519,7 @@ onMounted(async () => {
         ]),
       ),
       runKeymapComp.of(runKeymapExtension(keymap)),
-      wordWrapComp.of(props.forceWordWrap || ss.wordWrap ? EditorView.lineWrapping : []),
+      wordWrapComp.of(props.forceWordWrap || initialSettings.wordWrap ? EditorView.lineWrapping : []),
       readOnlyComp.of([EditorState.readOnly.of(!!props.readOnly), EditorView.editable.of(!props.readOnly)]),
       rectangularSelection({ eventFilter: (e: MouseEvent) => e.altKey || e.button === 1 }),
       EditorView.updateListener.of((update) => {
@@ -1518,7 +1541,7 @@ onMounted(async () => {
         }
       }),
       fontThemeComp.of(
-        editorFontTheme(EditorView, liveFontSize.value, ss.fontFamily, {
+        editorFontTheme(EditorView, liveFontSize.value, initialSettings.fontFamily, {
           fixedHeight: true,
           scrollable: true,
         }),
@@ -1678,12 +1701,23 @@ onMounted(async () => {
 
   view.value = new EditorView({ state, parent: editorRef.value });
   syncContextMenuState(view.value);
-  syncEditorFontCssVars(liveFontSize.value, ss.fontFamily);
+  syncEditorFontCssVars(liveFontSize.value, initialSettings.fontFamily);
   registerTableReferenceDropListener();
 
   cachedTables = [];
   cachedCompletionObjects = [];
   scheduleSemanticDiagnostics();
+
+  // Ensure theme is applied with the latest settings after mount
+  void nextTick(async () => {
+    if (!view.value || !codeMirrorTheme) return;
+    const settings = settingsStore.editorSettings;
+    const themeColors = settings.theme === "custom" ? getCurrentCustomThemeColors() : settings.customThemeColors;
+    const themeExt = await loadEditorTheme(settings.theme, editorThemeAppearance(), themeColors);
+    view.value.dispatch({
+      effects: [codeMirrorTheme.reconfigure(themeExt)],
+    });
+  });
 });
 
 watch(
@@ -1748,6 +1782,16 @@ watch(
   },
 );
 
+// Derive current custom theme colors from settingsStore
+function getCurrentCustomThemeColors() {
+  const settings = settingsStore.editorSettings;
+  if (settings.theme !== "custom") return settings.customThemeColors;
+  const activeTheme =
+    settings.customThemes?.find((t: { id: string }) => t.id === settings.activeCustomThemeId) ||
+    settings.customThemes?.[0];
+  return activeTheme?.colors ?? settings.customThemeColors;
+}
+
 // Reactively apply editor settings changes
 watch(
   [() => settingsStore.editorSettings, () => isDark.value],
@@ -1759,7 +1803,8 @@ watch(
       liveFontSize.value = ss.fontSize;
     }
     syncEditorFontCssVars(liveFontSize.value, ss.fontFamily);
-    const themeExt = await loadEditorTheme(ss.theme, editorThemeAppearance());
+    const themeColors = getCurrentCustomThemeColors();
+    const themeExt = await loadEditorTheme(ss.theme, editorThemeAppearance(), themeColors);
     view.value.dispatch({
       effects: [
         codeMirrorTheme.reconfigure(themeExt),

@@ -33,11 +33,13 @@ function forward<K extends keyof Backend>(name: K): Backend[K] {
 // Connection
 export const testConnection = forward("testConnection");
 export const connectDb = forward("connectDb");
+export const connectionFinalProxyPort = forward("connectionFinalProxyPort");
 export const disconnectDb = forward("disconnectDb");
 export const closeDatabaseConnection = forward("closeDatabaseConnection");
 export const refreshConnections = forward("refreshConnections");
 export const saveConnections = forward("saveConnections");
 export const loadConnections = forward("loadConnections");
+export const decryptConfig = forward("decryptConfig");
 export const listPlugins = forward("listPlugins");
 export const listJdbcDrivers = forward("listJdbcDrivers");
 export const importJdbcDrivers = forward("importJdbcDrivers");
@@ -49,6 +51,9 @@ export const uninstallJdbcPlugin = forward("uninstallJdbcPlugin");
 export const listInstalledAgentsLocal = forward("listInstalledAgentsLocal");
 export const listInstalledAgents = forward("listInstalledAgents");
 export const getDriverStoreUsage = forward("getDriverStoreUsage");
+export const getDriverRuntimeSummary = forward("getDriverRuntimeSummary");
+export const stopDriverRuntime = forward("stopDriverRuntime");
+export const restartDriverRuntime = forward("restartDriverRuntime");
 export const installAgent = forward("installAgent");
 export const upgradeAllAgents = forward("upgradeAllAgents");
 export const checkAgentUpdateBlockers = forward("checkAgentUpdateBlockers");
@@ -99,6 +104,8 @@ export const findStatementAtCursor = forward("findStatementAtCursor");
 export const prepareQueryPaginationExecutionPlan = forward("prepareQueryPaginationExecutionPlan");
 export const buildSortedQuerySql = forward("buildSortedQuerySql");
 export const buildExplainSql = forward("buildExplainSql");
+export const getExplainInfo = forward("getExplainInfo");
+export const buildCreateUserSql = forward("buildCreateUserSql");
 export const buildDroppedFilePreviewSql = forward("buildDroppedFilePreviewSql");
 export const buildTableSelectSql = forward("buildTableSelectSql");
 export const buildDatabaseSearchSql = forward("buildDatabaseSearchSql");
@@ -215,6 +222,12 @@ export const redisFlushDb = forward("redisFlushDb");
 export const redisExecuteCommand = forward("redisExecuteCommand");
 export const redisLoadMore = forward("redisLoadMore");
 
+// etcd
+export const etcdListPrefix = forward("etcdListPrefix");
+export const etcdGet = forward("etcdGet");
+export const etcdPut = forward("etcdPut");
+export const etcdDelete = forward("etcdDelete");
+
 // MongoDB
 export const mongoListDatabases = forward("mongoListDatabases");
 export const mongoListCollections = forward("mongoListCollections");
@@ -257,6 +270,10 @@ export type {
   AgentDriverInfo,
   DriverStoreUsage,
   DriverStoreUsageItem,
+  DriverRuntimeHealth,
+  DriverRuntimeStatus,
+  DriverRuntimeInfo,
+  DriverRuntimeSummary,
   JavaRuntimeMode,
   JavaRuntimeConfig,
   DriverInstallProgress,
@@ -272,6 +289,14 @@ export type {
   RedisScanResult,
   RedisCommandSafety,
   RedisCommandResult,
+  KvValueEncoding,
+  KvValue,
+  KvKeyMetadata,
+  KvKeySummary,
+  KvListPrefixResponse,
+  KvGetResponse,
+  KvPutResponse,
+  KvDeleteResponse,
   MongoDocumentResult,
   HistoryEntry,
   SqlFileStatus,

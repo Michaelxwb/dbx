@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import test from "node:test";
+import { test } from "vitest";
 import { normalizeMongoConnectionString, parseConnectionUrl } from "../../apps/desktop/src/lib/connectionUrl.ts";
 
 test("parses postgres connection URLs", () => {
@@ -12,6 +12,21 @@ test("parses postgres connection URLs", () => {
     username: "alice",
     password: "secret",
     database: "app",
+    urlParams: "sslmode=require",
+    ssl: true,
+  });
+});
+
+test("parses KWDB connection URLs", () => {
+  assert.deepEqual(parseConnectionUrl("kwdb://root:secret@kw.example.com/defaultdb?sslmode=require"), {
+    dbType: "kwdb",
+    driverProfile: "kwdb",
+    driverLabel: "KWDB",
+    host: "kw.example.com",
+    port: 26257,
+    username: "root",
+    password: "secret",
+    database: "defaultdb",
     urlParams: "sslmode=require",
     ssl: true,
   });
@@ -118,6 +133,20 @@ test("parses XuguDB JDBC URLs", () => {
   assert.equal(parsed.password, "secret");
   assert.equal(parsed.database, "demo");
   assert.equal(parsed.urlParams, "charset=utf8");
+});
+
+test("parses Apache IoTDB JDBC URLs", () => {
+  const parsed = parseConnectionUrl("jdbc:iotdb://root:secret@iotdb.example.com:6667?sql_dialect=table");
+
+  assert.equal(parsed.dbType, "iotdb");
+  assert.equal(parsed.driverProfile, "iotdb");
+  assert.equal(parsed.driverLabel, "Apache IoTDB");
+  assert.equal(parsed.host, "iotdb.example.com");
+  assert.equal(parsed.port, 6667);
+  assert.equal(parsed.username, "root");
+  assert.equal(parsed.password, "secret");
+  assert.equal(parsed.database, undefined);
+  assert.equal(parsed.urlParams, "sql_dialect=table");
 });
 
 test("parses GBase 8s JDBC URLs", () => {

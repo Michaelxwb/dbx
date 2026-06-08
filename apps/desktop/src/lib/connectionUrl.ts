@@ -31,6 +31,7 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   redshift: { type: "redshift", profile: "redshift", label: "Redshift", defaultPort: 5439 },
   redis: { type: "redis", profile: "redis", label: "Redis", defaultPort: 6379 },
   rediss: { type: "redis", profile: "redis", label: "Redis", defaultPort: 6379 },
+  etcd: { type: "etcd", profile: "etcd", label: "etcd", defaultPort: 2379 },
   mongodb: { type: "mongodb", profile: "mongodb", label: "MongoDB", defaultPort: 27017 },
   "mongodb+srv": { type: "mongodb", profile: "mongodb", label: "MongoDB", defaultPort: 27017 },
   clickhouse: { type: "clickhouse", profile: "clickhouse", label: "ClickHouse", defaultPort: 8123 },
@@ -41,6 +42,7 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   dm: { type: "dameng", profile: "dm", label: "DM (Dameng)", defaultPort: 5236 },
   dameng: { type: "dameng", profile: "dm", label: "DM (Dameng)", defaultPort: 5236 },
   gaussdb: { type: "gaussdb", profile: "gaussdb", label: "GaussDB", defaultPort: 5432 },
+  kwdb: { type: "kwdb", profile: "kwdb", label: "KWDB", defaultPort: 26257 },
   gbase: { type: "gbase", profile: "gbase", label: "GBase", defaultPort: 5258 },
   "gbasedbt-sqli": { type: "gbase", profile: "gbase8s", label: "GBase 8s", defaultPort: 9088 },
   yashandb: { type: "yashandb", profile: "yashandb", label: "YashanDB", defaultPort: 1688 },
@@ -48,6 +50,7 @@ const SCHEME_PROFILES: Record<string, ConnectionProfile> = {
   tdengine: { type: "tdengine", profile: "tdengine", label: "TDengine", defaultPort: 6041 },
   "taos-ws": { type: "tdengine", profile: "tdengine", label: "TDengine", defaultPort: 6041 },
   xugu: { type: "xugu", profile: "xugu", label: "XuguDB", defaultPort: 5138 },
+  iotdb: { type: "iotdb", profile: "iotdb", label: "Apache IoTDB", defaultPort: 6667 },
   iris: { type: "iris", profile: "iris", label: "IRIS", defaultPort: 1972 },
 };
 
@@ -143,7 +146,7 @@ function urlParamsRequireTls(dbType: DatabaseType, params: string): boolean {
     return sslMode === "required" || sslMode === "require" || sslMode === "verify_ca" || sslMode === "verify_identity";
   }
 
-  if (dbType === "postgres" || dbType === "redshift") {
+  if (dbType === "postgres" || dbType === "redshift" || dbType === "kwdb") {
     const sslMode = (queryParamValue(params, "sslmode") || "").toLowerCase();
     return sslMode === "require" || sslMode === "verify-ca" || sslMode === "verify-full";
   }

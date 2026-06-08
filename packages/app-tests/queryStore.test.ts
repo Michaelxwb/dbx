@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import test from "node:test";
+import { test } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import { isReactive } from "vue";
 import { useConnectionStore } from "../../apps/desktop/src/stores/connectionStore.ts";
@@ -831,7 +831,7 @@ test("data tab execution preserves pagination offset metadata", async () => {
   }
 });
 
-test("reloading an empty data tab fetches table results again", async () => {
+test("activating an empty data tab waits for explicit execution", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
@@ -863,10 +863,8 @@ test("reloading an empty data tab fetches table results again", async () => {
   try {
     await store.reloadEvictedTab(tabId);
 
-    assert.equal(executeBody.sql, 'SELECT * FROM "public"."users" LIMIT 50 OFFSET 50;');
-    assert.equal(executeBody.maxRows, 50);
-    assert.equal(executeBody.fetchSize, 50);
-    assert.deepEqual(tab.result?.rows, [[51]]);
+    assert.equal(executeBody, undefined);
+    assert.equal(tab.result, undefined);
     assert.equal(tab.resultPageLimit, 50);
     assert.equal(tab.resultPageOffset, 50);
   } finally {
@@ -1167,6 +1165,176 @@ test("query execution is scoped to the tab client session", async () => {
   }
 });
 
+test("query execution keeps automatically counting total rows in the background", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+
+  connectionStore.addEphemeralConnection(conn("conn-1"));
+  const tabId = store.createTab("conn-1", "db", "Query", "query", "public");
+  const tab = store.tabs.find((item) => item.id === tabId);
+  assert.ok(tab);
+
+  let resolveCount: ((value: Response) => void) | undefined;
+  let countBody: any;
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/prepare-pagination-plan") {
+      return new Response(
+        JSON.stringify({
+          sqlToExecute: "select id from users limit 100",
+          pageSql: "select id from users limit 100",
+          pageLimit: 100,
+          pageOffset: 0,
+          countSql: "select count(*) from users",
+          useAgentResultSession: false,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/execute-multi") {
+      return new Response(
+        JSON.stringify([
+          {
+            columns: ["id"],
+            rows: Array.from({ length: 100 }, (_, index) => [index + 1]),
+            affected_rows: 0,
+            execution_time_ms: 1,
+          },
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/execute") {
+      countBody = JSON.parse(String(init?.body ?? "{}"));
+      return new Promise<Response>((resolve) => {
+        resolveCount = resolve;
+      });
+    }
+    if (url === "/api/query/analyze-editability") {
+      return new Response(JSON.stringify({ editable: false, reason: "complex-source" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  }) as typeof fetch;
+
+  try {
+    await store.executeTabSql(tabId, "select id from users");
+
+    assert.equal(tab.executionId, undefined);
+    assert.equal(tab.resultTotalRowCount, undefined);
+    assert.equal(tab.resultTotalRowCountLoading, true);
+    assert.equal(countBody.sql, "select count(*) from users");
+    assert.equal(countBody.schema, "public");
+
+    resolveCount?.(
+      new Response(
+        JSON.stringify({
+          columns: ["count"],
+          rows: [[250]],
+          affected_rows: 0,
+          execution_time_ms: 1,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    await waitFor(() => tab.resultTotalRowCount === 250);
+    assert.equal(tab.resultTotalRowCountLoading, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("paginated query execution keeps the previous total while refreshing it in the background", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+
+  connectionStore.addEphemeralConnection(conn("conn-1"));
+  const tabId = store.createTab("conn-1", "db", "Query", "query", "public");
+  const tab = store.tabs.find((item) => item.id === tabId);
+  assert.ok(tab);
+  tab.resultTotalRowCount = 250;
+
+  let resolveCount: ((value: Response) => void) | undefined;
+  globalThis.fetch = (async (input) => {
+    const url = String(input);
+    if (url === "/api/query/prepare-pagination-plan") {
+      return new Response(
+        JSON.stringify({
+          sqlToExecute: "select id from users limit 100 offset 100",
+          pageSql: "select id from users limit 100 offset 100",
+          pageLimit: 100,
+          pageOffset: 100,
+          countSql: "select count(*) from users",
+          useAgentResultSession: false,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/execute-multi") {
+      return new Response(
+        JSON.stringify([
+          {
+            columns: ["id"],
+            rows: Array.from({ length: 100 }, (_, index) => [index + 101]),
+            affected_rows: 0,
+            execution_time_ms: 1,
+          },
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/execute") {
+      return new Promise<Response>((resolve) => {
+        resolveCount = resolve;
+      });
+    }
+    if (url === "/api/query/analyze-editability") {
+      return new Response(JSON.stringify({ editable: false, reason: "complex-source" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  }) as typeof fetch;
+
+  try {
+    await store.executeTabSql(tabId, "select id from users", {
+      pagination: { limit: 100, offset: 100 },
+      preserveResultDuringExecution: true,
+      preserveTotalRowCountDuringExecution: true,
+    });
+
+    assert.equal(tab.resultTotalRowCount, 250);
+    assert.equal(tab.resultTotalRowCountLoading, true);
+
+    resolveCount?.(
+      new Response(
+        JSON.stringify({
+          columns: ["count"],
+          rows: [[275]],
+          affected_rows: 0,
+          execution_time_ms: 1,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    await waitFor(() => tab.resultTotalRowCount === 275);
+    assert.equal(tab.resultTotalRowCountLoading, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
 test("multi statement execution shows the first result set by default", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
@@ -1256,6 +1424,21 @@ test("new table structure tabs can open multiple drafts while existing tables st
   } finally {
     restoreStorage();
   }
+});
+
+test("table structure refresh versions are scoped by table target", () => {
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+
+  assert.equal(store.tableStructureRefreshVersion("conn-1", "db", "public", "users"), 0);
+
+  store.invalidateTableStructure("conn-1", "db", "public", "users");
+  store.invalidateTableStructure("conn-1", "db", "public", "users");
+  store.invalidateTableStructure("conn-1", "db", undefined, "users");
+
+  assert.equal(store.tableStructureRefreshVersion("conn-1", "db", "public", "users"), 2);
+  assert.equal(store.tableStructureRefreshVersion("conn-1", "db", undefined, "users"), 1);
+  assert.equal(store.tableStructureRefreshVersion("conn-1", "db", "public", "orders"), 0);
 });
 
 test("reorderTab keeps pinned tabs before unpinned tabs after reorder", () => {

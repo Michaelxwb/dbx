@@ -225,7 +225,9 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
     }
 
     let aliases = build_derived_column_aliases(&options.result_columns);
-    let use_derived_column_aliases = options.database_type != Some(DatabaseType::Mysql);
+    let use_derived_column_aliases = options.database_type != Some(DatabaseType::Mysql)
+        && options.database_type != Some(DatabaseType::Sqlite)
+        && options.database_type != Some(DatabaseType::DuckDb);
     let sort_alias = if use_derived_column_aliases {
         aliases
             .get(options.column_index)
@@ -627,7 +629,7 @@ mod tests {
             offset: 200,
         });
 
-        assert_eq!(result.ok, true);
+        assert!(result.ok);
         assert_eq!(result.sql.unwrap(), "SELECT id, name FROM users LIMIT 100 OFFSET 200;");
     }
 
@@ -640,7 +642,7 @@ mod tests {
             offset: 0,
         });
 
-        assert_eq!(result.ok, true);
+        assert!(result.ok);
         assert_eq!(result.sql.unwrap(), "SELECT TOP (100) id FROM users ORDER BY id DESC");
     }
 
@@ -653,7 +655,7 @@ mod tests {
             offset: 0,
         });
 
-        assert_eq!(result.ok, true);
+        assert!(result.ok);
         assert_eq!(result.sql.unwrap(), "SELECT TOP (100) COUNT(*) FROM TicketInfo");
     }
 
@@ -666,7 +668,7 @@ mod tests {
             offset: 0,
         });
 
-        assert_eq!(result.ok, true);
+        assert!(result.ok);
         assert_eq!(
             result.sql.unwrap(),
             "SELECT DISTINCT TOP (100) ProjectType FROM JDDR_sys_BasicConfig_ProjectInfo_Data"
@@ -682,7 +684,7 @@ mod tests {
             offset: 0,
         });
 
-        assert_eq!(result.ok, true);
+        assert!(result.ok);
         assert_eq!(result.sql.unwrap(), "SELECT ALL TOP (100) ProjectType FROM JDDR_sys_BasicConfig_ProjectInfo_Data");
     }
 
@@ -695,7 +697,7 @@ mod tests {
             offset: 0,
         });
 
-        assert_eq!(result.ok, true);
+        assert!(result.ok);
         assert_eq!(result.sql.unwrap(), "SELECT TOP (100) AllProjectType FROM JDDR_sys_BasicConfig_ProjectInfo_Data");
     }
 
@@ -708,7 +710,7 @@ mod tests {
             offset: 0,
         });
 
-        assert_eq!(result.ok, true);
+        assert!(result.ok);
         assert_eq!(result.sql.unwrap(), "SELECT TOP 1000 * FROM TicketInfo");
     }
 
@@ -737,7 +739,7 @@ mod tests {
             database_type: Some(DatabaseType::SqlServer),
         });
 
-        assert_eq!(result.ok, false);
+        assert!(!result.ok);
         assert!(result.sql.is_none());
     }
 
@@ -750,7 +752,7 @@ mod tests {
             offset: 0,
         });
 
-        assert_eq!(result.ok, true);
+        assert!(result.ok);
         assert_eq!(result.sql.unwrap(), "SELECT TOP (100) @@version");
     }
 
@@ -771,6 +773,18 @@ mod tests {
         let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
             original_sql: "SELECT id FROM users".to_string(),
             database_type: Some(DatabaseType::Oracle),
+            limit: 100,
+            offset: 0,
+        });
+
+        assert_eq!(result.sql.unwrap(), "SELECT id FROM users FETCH FIRST 100 ROWS ONLY;");
+    }
+
+    #[test]
+    fn uses_fetch_first_pagination_for_db2() {
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: "SELECT id FROM users".to_string(),
+            database_type: Some(DatabaseType::Db2),
             limit: 100,
             offset: 0,
         });

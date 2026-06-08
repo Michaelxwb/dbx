@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, watch, type Component } from "vue";
+import { ref, computed, nextTick, watch, provide, type Component } from "vue";
 import { useI18n } from "vue-i18n";
 import { Search, X, ListFilter, Crosshair, Server, Database, FolderTree, Table2, Eye, RotateCcw } from "@lucide/vue";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -9,6 +9,7 @@ import type { QueryTab, TreeNode, TreeNodeType } from "@/types/database";
 import { filterSidebarSearchRootsByConnectionState, filterSidebarTree } from "@/lib/sidebarSearchTree";
 import { isCancelSearchShortcut } from "@/lib/keyboardShortcuts";
 import { usesTreeSchemaMode } from "@/lib/databaseFeatureSupport";
+import { connectionUsesDatabaseObjectTreeMode } from "@/lib/jdbcDialect";
 import {
   findSidebarNodeForActiveTab,
   findNodePathForActiveTab,
@@ -25,6 +26,7 @@ import {
   shouldVirtualizeFlatTree,
   type FlatTreeNode,
 } from "@/composables/useFlatTree";
+import { sidebarTreeContextKey } from "@/lib/sidebarTreeContext";
 import TreeItem from "./TreeItem.vue";
 import { RecycleScroller } from "vue-virtual-scroller";
 import "vue-virtual-scroller/dist/vue-virtual-scroller.css";
@@ -147,6 +149,11 @@ const filteredNodes = computed(() => {
 
 const flatNodes = computed<FlatTreeNode[]>(() => flattenTree(filteredNodes.value));
 const visibleNodes = computed<TreeNode[]>(() => flatNodes.value.map((item) => item.node));
+const visibleNodeIndexById = computed(() => {
+  const next = new Map<string, number>();
+  visibleNodes.value.forEach((node, index) => next.set(node.id, index));
+  return next;
+});
 const useVirtualTree = computed(() => shouldVirtualizeFlatTree(flatNodes.value.length));
 const activeTab = computed(() => queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId));
 const sidebarTreeOverflowClass = computed(() =>
@@ -154,6 +161,11 @@ const sidebarTreeOverflowClass = computed(() =>
     ? "overflow-x-auto sidebar-tree-horizontal-scroll"
     : "overflow-x-hidden",
 );
+
+provide(sidebarTreeContextKey, {
+  getVisibleNodes: () => visibleNodes.value,
+  getVisibleNodeIndex: (id: string) => visibleNodeIndexById.value.get(id) ?? -1,
+});
 
 const pendingRenameGroupId = ref<string | null>(null);
 const highlightedNodeId = ref<string | null>(null);
@@ -174,6 +186,15 @@ async function scrollToSidebarNode(nodeId: string) {
   if (nextScrollTop !== scroller.scrollTop) {
     scroller.scrollTop = nextScrollTop;
   }
+}
+
+function clearSidebarSelection() {
+  // Clicking the blank area of the tree clears the current selection. Row
+  // clicks call event.stopPropagation(), so this only fires for blank clicks
+  // (issue #681 — selection wasn't cleared in double-click activation mode).
+  store.selectedTreeNodeId = null;
+  store.selectedTreeNodeIds = [];
+  store.treeSelectionAnchorId = null;
 }
 
 async function createNewGroup() {
@@ -218,7 +239,15 @@ async function locateActiveTabInSidebar() {
     clearSearchScopeFilter();
   }
 
-  const nodePath = findNodePathForActiveTab(tab, store.treeNodes);
+  let nodePath = findNodePathForActiveTab(tab, store.treeNodes);
+  if (!nodePath) {
+    // The first load may have served a stale schema cache whose async refresh
+    // replaced the database node before its tables finished loading, so the
+    // table isn't in the tree yet. Force a synchronous reload and retry once so
+    // locate reaches the table, not just the database (issue #715).
+    await ensureTreeLoadedForTab(tab, { force: true });
+    nodePath = findNodePathForActiveTab(tab, store.treeNodes);
+  }
   if (!nodePath) return;
 
   for (const ancestor of nodePath) {
@@ -244,23 +273,30 @@ async function locateActiveTabInSidebar() {
   await scrollToSidebarNode(match.id);
 }
 
-async function ensureTreeLoadedForTab(tab: QueryTab) {
+async function ensureTreeLoadedForTab(tab: QueryTab, opts?: { force?: boolean }) {
   const connId = tab.connectionId;
   if (!connId) return;
 
   const config = store.getConfig(connId);
   if (!config) return;
 
+  // When forcing, bypass the cached children check so we reload from the
+  // source. A stale schema cache otherwise serves children and triggers an
+  // async background refresh that can replace nodes mid-flight, leaving the
+  // tree without the target table by the time we search for it (issue #715).
+  const force = opts?.force ?? false;
+  const loadOptions = force ? { force: true } : undefined;
+
   // Ensure databases are loaded under the connection
   const connNode = store.treeNodes.find((n) => n.id === connId);
-  if (connNode && (!connNode.children || connNode.children.length === 0)) {
+  if (connNode && (force || !connNode.children || connNode.children.length === 0)) {
     try {
       if (config.db_type === "redis") {
         await store.loadRedisDatabases(connId);
       } else if (config.db_type === "mongodb" || config.db_type === "elasticsearch") {
         await store.loadMongoDatabases(connId);
       } else {
-        await store.loadDatabases(connId);
+        await store.loadDatabases(connId, loadOptions);
       }
     } catch {
       return;
@@ -271,23 +307,24 @@ async function ensureTreeLoadedForTab(tab: QueryTab) {
 
   // Find the database node
   const dbNode = findDatabaseNode(store.treeNodes, connId, tab.database);
-  if (!dbNode || (dbNode.children && dbNode.children.length > 0)) return;
+  if (!dbNode) return;
+  if (!force && dbNode.children && dbNode.children.length > 0) return;
 
   // Load database contents
   try {
     if (config.db_type === "sqlserver") {
-      await store.loadSqlServerDatabaseObjects(connId, tab.database);
-    } else if (usesTreeSchemaMode(config.db_type)) {
-      await store.loadSchemas(connId, tab.database);
+      await store.loadSqlServerDatabaseObjects(connId, tab.database, loadOptions);
+    } else if (usesTreeSchemaMode(config.db_type) && !connectionUsesDatabaseObjectTreeMode(config)) {
+      await store.loadSchemas(connId, tab.database, loadOptions);
       // If we have a schema, also load tables under that schema
       if (tab.schema) {
         const schemaNode = findSchemaNode(store.treeNodes, connId, tab.database, tab.schema);
-        if (schemaNode && (!schemaNode.children || schemaNode.children.length === 0)) {
-          await store.loadTables(connId, tab.database, tab.schema);
+        if (schemaNode && (force || !schemaNode.children || schemaNode.children.length === 0)) {
+          await store.loadTables(connId, tab.database, tab.schema, loadOptions);
         }
       }
     } else {
-      await store.loadTables(connId, tab.database);
+      await store.loadTables(connId, tab.database, undefined, loadOptions);
     }
   } catch {
     // Node just won't have children loaded
@@ -478,6 +515,7 @@ defineExpose({ focusSearch, createNewGroup });
       ref="treeScrollerRef"
       class="sidebar-tree connection-tree-scroller min-h-0 flex-1 overflow-y-auto"
       :class="sidebarTreeOverflowClass"
+      @click="clearSidebarSelection"
       :items="flatNodes"
       :item-size="SIDEBAR_TREE_ROW_HEIGHT"
       :buffer="SIDEBAR_TREE_SCROLL_BUFFER"
@@ -494,7 +532,6 @@ defineExpose({ focusSearch, createNewGroup });
           :drag-disabled="isFiltering"
           :pending-rename="pendingRenameGroupId === item.node.id"
           :highlighted="highlightedNodeId === item.node.id"
-          :visible-nodes="visibleNodes"
           @node-toggled="onNodeToggled"
           @search-toggle="onSearchToggle"
           @rename-started="pendingRenameGroupId = null"
@@ -506,6 +543,7 @@ defineExpose({ focusSearch, createNewGroup });
       ref="plainTreeScrollerRef"
       class="sidebar-tree min-h-0 flex-1 overflow-y-auto"
       :class="sidebarTreeOverflowClass"
+      @click="clearSidebarSelection"
     >
       <TreeItem
         v-for="item in flatNodes"
@@ -515,7 +553,6 @@ defineExpose({ focusSearch, createNewGroup });
         :drag-disabled="isFiltering"
         :pending-rename="pendingRenameGroupId === item.node.id"
         :highlighted="highlightedNodeId === item.id"
-        :visible-nodes="visibleNodes"
         @node-toggled="onNodeToggled"
         @search-toggle="onSearchToggle"
         @rename-started="pendingRenameGroupId = null"

@@ -9,9 +9,11 @@ pub mod ob_oracle;
 pub mod postgres;
 pub mod proxy_tunnel;
 pub mod redis_driver;
+pub mod rqlite_driver;
 pub mod sqlite;
 pub mod sqlserver;
 pub mod ssh_tunnel;
+pub mod transport_layer_tunnel;
 
 use std::future::Future;
 use std::time::Duration;

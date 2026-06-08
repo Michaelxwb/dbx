@@ -451,6 +451,7 @@ const DATABASE_SQL_KEYWORDS: Partial<Record<DatabaseType, string[]>> = {
   mysql: MYSQL_SQL_KEYWORDS,
   postgres: POSTGRES_SQL_KEYWORDS,
   sqlite: SQLITE_SQL_KEYWORDS,
+  rqlite: SQLITE_SQL_KEYWORDS,
   sqlserver: SQLSERVER_SQL_KEYWORDS,
 };
 
@@ -848,6 +849,7 @@ const DATABASE_FUNCTION_SIGNATURES: Partial<Record<DatabaseType, Map<string, str
   mysql: MYSQL_FUNCTION_SIGNATURES,
   postgres: POSTGRES_FUNCTION_SIGNATURES,
   sqlite: SQLITE_FUNCTION_SIGNATURES,
+  rqlite: SQLITE_FUNCTION_SIGNATURES,
   sqlserver: SQLSERVER_FUNCTION_SIGNATURES,
 };
 
@@ -2263,6 +2265,12 @@ function buildColumnItems(
     }
   }
 
+  // When the query already references concrete tables (or we are after a
+  // "table." qualifier / in an INSERT column list), the columns of those
+  // tables are what the user is most likely picking — boost them above plain
+  // keywords so they rank at the top instead of being interleaved.
+  const relevanceBoost = context.referencedTables.length > 0 || !!context.qualifier || !!context.insertTable ? 2000 : 0;
+
   return uniqueColumns
     .filter((column) => matchesPrefix(column.displayLabel, context.prefix))
     .map((column) => {
@@ -2273,7 +2281,7 @@ function buildColumnItems(
         detail: buildColumnDetail(column),
         info: buildColumnInfo(column),
         apply: buildColumnApply(column, context, dialect),
-        boost: computeBoost(column.displayLabel, context.prefix) + keyBoost,
+        boost: computeBoost(column.displayLabel, context.prefix) + keyBoost + relevanceBoost,
       };
     })
     .sort(compareCompletionItems);

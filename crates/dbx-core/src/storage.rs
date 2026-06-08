@@ -8,13 +8,24 @@ use uuid::Uuid;
 use crate::ai::{AiChatMessage, AiConfig, AiConversation};
 use crate::db::sqlite::{connect_path_create_if_missing, SqliteHandle};
 use crate::history::{HistoryEntry, MAX_HISTORY};
-use crate::models::connection::ConnectionConfig;
+use crate::models::connection::{ConnectionConfig, TransportLayerConfig};
 use crate::saved_sql::{SavedSqlFile, SavedSqlFolder, SavedSqlLibrary};
 
 const SSH_TUNNEL_SECRET_PREFIX: &str = "ssh_tunnels.";
+const TRANSPORT_LAYER_SECRET_PREFIX: &str = "transport_layers.";
 
 pub struct Storage {
     db: SqliteHandle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabRuntimeCacheEntry {
+    pub key: String,
+    pub payload: Vec<u8>,
+    pub row_count: i64,
+    pub column_count: i64,
+    pub byte_size: i64,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +108,14 @@ const SCHEMA_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS schema_cache (
         cache_key TEXT PRIMARY KEY,
         payload_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )",
+    "CREATE TABLE IF NOT EXISTS tab_runtime_cache (
+        cache_key TEXT PRIMARY KEY,
+        payload BLOB NOT NULL,
+        row_count INTEGER NOT NULL DEFAULT 0,
+        column_count INTEGER NOT NULL DEFAULT 0,
+        byte_size INTEGER NOT NULL DEFAULT 0,
         updated_at TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS saved_sql_folders (
@@ -191,10 +210,38 @@ fn ssh_tunnel_key_passphrase_key(index: usize, hop: &crate::models::connection::
     format!("{}{}.key_passphrase", SSH_TUNNEL_SECRET_PREFIX, ssh_tunnel_secret_segment(index, hop))
 }
 
-fn scrub_ssh_tunnel_secrets(config: &mut ConnectionConfig) {
-    for hop in &mut config.ssh_tunnels {
-        hop.password.clear();
-        hop.key_passphrase.clear();
+fn transport_layer_secret_segment(index: usize, layer: &TransportLayerConfig) -> String {
+    let id = layer.id().trim();
+    if id.is_empty() {
+        index.to_string()
+    } else {
+        id.to_string()
+    }
+}
+
+fn transport_layer_ssh_password_key(index: usize, layer: &TransportLayerConfig) -> String {
+    format!("{}{}.ssh_password", TRANSPORT_LAYER_SECRET_PREFIX, transport_layer_secret_segment(index, layer))
+}
+
+fn transport_layer_ssh_key_passphrase_key(index: usize, layer: &TransportLayerConfig) -> String {
+    format!("{}{}.ssh_key_passphrase", TRANSPORT_LAYER_SECRET_PREFIX, transport_layer_secret_segment(index, layer))
+}
+
+fn transport_layer_proxy_password_key(index: usize, layer: &TransportLayerConfig) -> String {
+    format!("{}{}.proxy_password", TRANSPORT_LAYER_SECRET_PREFIX, transport_layer_secret_segment(index, layer))
+}
+
+fn scrub_transport_layer_secrets(config: &mut ConnectionConfig) {
+    for layer in &mut config.transport_layers {
+        match layer {
+            TransportLayerConfig::Ssh(ssh) => {
+                ssh.password.clear();
+                ssh.key_passphrase.clear();
+            }
+            TransportLayerConfig::Proxy(proxy) => {
+                proxy.password.clear();
+            }
+        }
     }
 }
 
@@ -548,10 +595,7 @@ impl Storage {
                 let config_id = config.id.clone();
                 let mut sanitized = config;
                 sanitized.password = String::new();
-                sanitized.ssh_password = String::new();
-                sanitized.ssh_key_passphrase = String::new();
-                scrub_ssh_tunnel_secrets(&mut sanitized);
-                sanitized.proxy_password = String::new();
+                scrub_transport_layer_secrets(&mut sanitized);
                 sanitized.redis_sentinel_password = String::new();
                 sanitized.connection_string = None;
                 let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
@@ -585,10 +629,7 @@ impl Storage {
                 let config_id = config.id.clone();
                 let mut sanitized = config.clone();
                 sanitized.password = String::new();
-                sanitized.ssh_password = String::new();
-                sanitized.ssh_key_passphrase = String::new();
-                scrub_ssh_tunnel_secrets(&mut sanitized);
-                sanitized.proxy_password = String::new();
+                scrub_transport_layer_secrets(&mut sanitized);
                 sanitized.redis_sentinel_password = String::new();
                 sanitized.connection_string = None;
                 let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
@@ -597,20 +638,38 @@ impl Storage {
                     .map_err(|e| e.to_string())?;
 
                 persist_secret_in_tx(&tx, &config.id, "password", &config.password)?;
-                persist_secret_in_tx(&tx, &config.id, "ssh_password", &config.ssh_password)?;
-                persist_secret_in_tx(&tx, &config.id, "ssh_key_passphrase", &config.ssh_key_passphrase)?;
-                delete_secret_prefix_in_tx(&tx, &config.id, SSH_TUNNEL_SECRET_PREFIX)?;
-                for (index, hop) in config.ssh_tunnels.iter().enumerate() {
-                    persist_secret_in_tx(&tx, &config.id, &ssh_tunnel_password_key(index, hop), &hop.password)?;
-                    persist_secret_in_tx(
-                        &tx,
-                        &config.id,
-                        &ssh_tunnel_key_passphrase_key(index, hop),
-                        &hop.key_passphrase,
-                    )?;
+                delete_secret_prefix_in_tx(&tx, &config.id, TRANSPORT_LAYER_SECRET_PREFIX)?;
+                for (index, layer) in config.transport_layers.iter().enumerate() {
+                    match layer {
+                        TransportLayerConfig::Ssh(ssh) => {
+                            persist_secret_in_tx(
+                                &tx,
+                                &config.id,
+                                &transport_layer_ssh_password_key(index, layer),
+                                &ssh.password,
+                            )?;
+                            persist_secret_in_tx(
+                                &tx,
+                                &config.id,
+                                &transport_layer_ssh_key_passphrase_key(index, layer),
+                                &ssh.key_passphrase,
+                            )?;
+                        }
+                        TransportLayerConfig::Proxy(proxy) => {
+                            persist_secret_in_tx(
+                                &tx,
+                                &config.id,
+                                &transport_layer_proxy_password_key(index, layer),
+                                &proxy.password,
+                            )?;
+                        }
+                    }
                 }
-                persist_secret_in_tx(&tx, &config.id, "proxy_password", &config.proxy_password)?;
                 persist_secret_in_tx(&tx, &config.id, "redis_sentinel_password", &config.redis_sentinel_password)?;
+                persist_secret_in_tx(&tx, &config.id, "ssh_password", "")?;
+                persist_secret_in_tx(&tx, &config.id, "ssh_key_passphrase", "")?;
+                persist_secret_in_tx(&tx, &config.id, "proxy_password", "")?;
+                delete_secret_prefix_in_tx(&tx, &config.id, SSH_TUNNEL_SECRET_PREFIX)?;
                 if let Some(cs) = &config.connection_string {
                     persist_secret_in_tx(&tx, &config.id, "connection_string", cs)?;
                 } else {
@@ -651,14 +710,51 @@ impl Storage {
         for (id, json) in rows {
             let mut config: ConnectionConfig = serde_json::from_str(&json).map_err(|e| e.to_string())?;
             config.password = self.get_secret(&id, "password").await?.unwrap_or_default();
-            config.ssh_password = self.get_secret(&id, "ssh_password").await?.unwrap_or_default();
-            config.ssh_key_passphrase = self.get_secret(&id, "ssh_key_passphrase").await?.unwrap_or_default();
-            for (index, hop) in config.ssh_tunnels.iter_mut().enumerate() {
-                hop.password = self.get_secret(&id, &ssh_tunnel_password_key(index, hop)).await?.unwrap_or_default();
-                hop.key_passphrase =
-                    self.get_secret(&id, &ssh_tunnel_key_passphrase_key(index, hop)).await?.unwrap_or_default();
+            for index in 0..config.transport_layers.len() {
+                let layer_for_key = config.transport_layers[index].clone();
+                match &mut config.transport_layers[index] {
+                    TransportLayerConfig::Ssh(ssh) => {
+                        ssh.password = self
+                            .get_secret(&id, &transport_layer_ssh_password_key(index, &layer_for_key))
+                            .await?
+                            .or(match &layer_for_key {
+                                TransportLayerConfig::Ssh(layer) if layer.id == "legacy" => {
+                                    self.get_secret(&id, "ssh_password").await?
+                                }
+                                TransportLayerConfig::Ssh(layer) => {
+                                    self.get_secret(&id, &ssh_tunnel_password_key(index, layer)).await?
+                                }
+                                TransportLayerConfig::Proxy(_) => None,
+                            })
+                            .unwrap_or_default();
+                        ssh.key_passphrase = self
+                            .get_secret(&id, &transport_layer_ssh_key_passphrase_key(index, &layer_for_key))
+                            .await?
+                            .or(match &layer_for_key {
+                                TransportLayerConfig::Ssh(layer) if layer.id == "legacy" => {
+                                    self.get_secret(&id, "ssh_key_passphrase").await?
+                                }
+                                TransportLayerConfig::Ssh(layer) => {
+                                    self.get_secret(&id, &ssh_tunnel_key_passphrase_key(index, layer)).await?
+                                }
+                                TransportLayerConfig::Proxy(_) => None,
+                            })
+                            .unwrap_or_default();
+                    }
+                    TransportLayerConfig::Proxy(proxy) => {
+                        proxy.password = self
+                            .get_secret(&id, &transport_layer_proxy_password_key(index, &layer_for_key))
+                            .await?
+                            .or(match &layer_for_key {
+                                TransportLayerConfig::Proxy(layer) if layer.id == "legacy-proxy" => {
+                                    self.get_secret(&id, "proxy_password").await?
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                    }
+                }
             }
-            config.proxy_password = self.get_secret(&id, "proxy_password").await?.unwrap_or_default();
             config.redis_sentinel_password = self.get_secret(&id, "redis_sentinel_password").await?.unwrap_or_default();
             config.connection_string = self.get_secret(&id, "connection_string").await?;
             configs.push(config.canonicalized());
@@ -948,6 +1044,69 @@ impl Storage {
             )
             .map(|_| ())
             .map_err(|e| e.to_string())
+        })
+        .await
+    }
+}
+
+// Tab runtime cache
+
+impl Storage {
+    pub async fn save_tab_runtime_cache(
+        &self,
+        key: &str,
+        payload: Vec<u8>,
+        row_count: i64,
+        column_count: i64,
+    ) -> Result<(), String> {
+        let key = key.to_string();
+        let byte_size = payload.len() as i64;
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO tab_runtime_cache \
+                 (cache_key, payload, row_count, column_count, byte_size, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now')) \
+                 ON CONFLICT(cache_key) DO UPDATE SET \
+                 payload = excluded.payload, row_count = excluded.row_count, column_count = excluded.column_count, \
+                 byte_size = excluded.byte_size, updated_at = excluded.updated_at",
+                params![key, payload, row_count, column_count, byte_size],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn load_tab_runtime_cache(&self, key: &str) -> Result<Option<TabRuntimeCacheEntry>, String> {
+        let key = key.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT cache_key, payload, row_count, column_count, byte_size, updated_at \
+                 FROM tab_runtime_cache WHERE cache_key = ?1",
+                [key],
+                |row| {
+                    Ok(TabRuntimeCacheEntry {
+                        key: row.get(0)?,
+                        payload: row.get(1)?,
+                        row_count: row.get(2)?,
+                        column_count: row.get(3)?,
+                        byte_size: row.get(4)?,
+                        updated_at: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn delete_tab_runtime_cache(&self, key: &str) -> Result<(), String> {
+        let key = key.to_string();
+        self.with_conn(move |conn| {
+            conn.execute("DELETE FROM tab_runtime_cache WHERE cache_key = ?1", [key])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         })
         .await
     }
@@ -1247,5 +1406,23 @@ mod tests {
             vec!["conn-1".to_string(), "conn-1:db:main".to_string()]
         );
         assert_eq!(storage.load_password_hash().await.unwrap(), Some("hash-3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn tab_runtime_cache_roundtrips_binary_payloads() {
+        let path = temp_db_path("tab-runtime-cache");
+        let storage = Storage::open(&path).await.unwrap();
+
+        storage.save_tab_runtime_cache("tab:1:result", vec![1, 2, 3, 4], 10, 3).await.unwrap();
+        let entry = storage.load_tab_runtime_cache("tab:1:result").await.unwrap().unwrap();
+
+        assert_eq!(entry.key, "tab:1:result");
+        assert_eq!(entry.payload, vec![1, 2, 3, 4]);
+        assert_eq!(entry.row_count, 10);
+        assert_eq!(entry.column_count, 3);
+        assert_eq!(entry.byte_size, 4);
+
+        storage.delete_tab_runtime_cache("tab:1:result").await.unwrap();
+        assert_eq!(storage.load_tab_runtime_cache("tab:1:result").await.unwrap(), None);
     }
 }

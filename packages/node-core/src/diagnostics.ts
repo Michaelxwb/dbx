@@ -9,7 +9,9 @@ export const DIRECT_QUERY_TYPES = [
   "doris",
   "starrocks",
   "sqlite",
+  "rqlite",
   "gaussdb",
+  "kwdb",
   "opengauss",
 ] as const;
 
@@ -34,6 +36,7 @@ export const BRIDGE_REQUIRED_TYPES = [
   "highgo",
   "vastbase",
   "goldendb",
+  "databend",
   "yashandb",
   "databricks",
   "saphana",
@@ -44,6 +47,7 @@ export const BRIDGE_REQUIRED_TYPES = [
   "oceanbase-oracle",
   "gbase",
   "tdengine",
+  "iotdb",
   "h2",
   "snowflake",
   "trino",

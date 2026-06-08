@@ -14,6 +14,7 @@ import {
   PackageSearch,
   Pencil,
   RefreshCw,
+  RotateCcw,
   Settings,
   Terminal,
   Trash2,
@@ -44,8 +45,11 @@ import {
   type EditorTheme,
   type DesktopIconTheme,
   type DisconnectTabHandlingMode,
+  type CustomThemeColors,
+  type CustomTheme,
 } from "@/stores/settingsStore";
 import { loadEditorTheme, editorFontTheme } from "@/lib/editorThemes";
+import ThemeCustomizerDialog from "./ThemeCustomizerDialog.vue";
 import { isTauriRuntime } from "@/lib/tauriRuntime";
 import { useTheme } from "@/composables/useTheme";
 import { copyToClipboard } from "@/lib/clipboard";
@@ -68,7 +72,6 @@ import { eventToShortcut } from "@/lib/keyboardShortcuts";
 import {
   SHORTCUT_DEFINITIONS,
   findShortcutConflict,
-  formatShortcut,
   normalizeShortcutSettings,
   type ShortcutActionId,
 } from "@/lib/shortcutRegistry";
@@ -103,15 +106,21 @@ const editFontFamily = ref(settingsStore.editorSettings.fontFamily);
 const editFontSize = ref(settingsStore.editorSettings.fontSize);
 const editUiScale = ref(settingsStore.editorSettings.uiScale);
 const editTheme = ref(settingsStore.editorSettings.theme);
+const editCustomThemes = ref<CustomTheme[]>([...settingsStore.editorSettings.customThemes]);
+const editActiveCustomThemeId = ref(settingsStore.editorSettings.activeCustomThemeId);
+const showThemeCustomizer = ref(false);
 const editExecuteMode = ref(settingsStore.editorSettings.executeMode);
 const editWordWrap = ref(settingsStore.editorSettings.wordWrap);
+const editConfirmDangerousSqlExecution = ref(settingsStore.editorSettings.confirmDangerousSqlExecution);
 const editAppLayout = ref(settingsStore.editorSettings.appLayout);
 const editShowTrayIcon = ref(settingsStore.desktopSettings.show_tray_icon);
 const editIconTheme = ref<DesktopIconTheme>(settingsStore.desktopSettings.icon_theme);
 const editShowColumnCommentsInHeader = ref(settingsStore.editorSettings.showColumnCommentsInHeader);
+const editShowColumnTypesInHeader = ref(settingsStore.editorSettings.showColumnTypesInHeader);
 const editCompactColumnHeaderActions = ref(settingsStore.editorSettings.compactColumnHeaderActions);
 const editRedisScanPageSize = ref(settingsStore.editorSettings.redisScanPageSize);
 const editShortcuts = ref(normalizeShortcutSettings(settingsStore.editorSettings.shortcuts));
+const editingShortcutId = ref<ShortcutActionId | null>(null);
 const editSidebarActivation = ref(settingsStore.editorSettings.sidebarActivation);
 const editSidebarObjectDisplay = ref(settingsStore.editorSettings.sidebarObjectDisplay);
 const sidebarObjectDisplayHelp = ref<"grouped" | "simple" | null>(null);
@@ -120,6 +129,7 @@ const editDisconnectTabHandlingMode = ref<DisconnectTabHandlingMode>(
   settingsStore.editorSettings.disconnectTabHandlingMode,
 );
 const editReuseDataTab = ref(settingsStore.editorSettings.reuseDataTab);
+const editUpdateNotificationsEnabled = ref(settingsStore.editorSettings.updateNotificationsEnabled);
 const editSidebarHiddenTablePrefixes = ref(settingsStore.editorSettings.sidebarHiddenTablePrefixes.join("\n"));
 const editSidebarHideTableComments = ref(settingsStore.editorSettings.sidebarHideTableComments);
 const editSidebarAllowHorizontalScroll = ref(settingsStore.editorSettings.sidebarAllowHorizontalScroll);
@@ -255,12 +265,16 @@ watch(
       editFontSize.value = settingsStore.editorSettings.fontSize;
       editUiScale.value = settingsStore.editorSettings.uiScale;
       editTheme.value = settingsStore.editorSettings.theme;
+      editCustomThemes.value = [...settingsStore.editorSettings.customThemes];
+      editActiveCustomThemeId.value = settingsStore.editorSettings.activeCustomThemeId;
       editExecuteMode.value = settingsStore.editorSettings.executeMode;
       editWordWrap.value = settingsStore.editorSettings.wordWrap;
+      editConfirmDangerousSqlExecution.value = settingsStore.editorSettings.confirmDangerousSqlExecution;
       editAppLayout.value = settingsStore.editorSettings.appLayout;
       editShowTrayIcon.value = settingsStore.desktopSettings.show_tray_icon;
       editIconTheme.value = settingsStore.desktopSettings.icon_theme;
       editShowColumnCommentsInHeader.value = settingsStore.editorSettings.showColumnCommentsInHeader;
+      editShowColumnTypesInHeader.value = settingsStore.editorSettings.showColumnTypesInHeader;
       editCompactColumnHeaderActions.value = settingsStore.editorSettings.compactColumnHeaderActions;
       editRedisScanPageSize.value = settingsStore.editorSettings.redisScanPageSize;
       editShortcuts.value = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
@@ -269,6 +283,7 @@ watch(
       editAutoSelectActiveSidebarNode.value = settingsStore.editorSettings.autoSelectActiveSidebarNode;
       editDisconnectTabHandlingMode.value = settingsStore.editorSettings.disconnectTabHandlingMode;
       editReuseDataTab.value = settingsStore.editorSettings.reuseDataTab;
+      editUpdateNotificationsEnabled.value = settingsStore.editorSettings.updateNotificationsEnabled;
       editSidebarHiddenTablePrefixes.value = settingsStore.editorSettings.sidebarHiddenTablePrefixes.join("\n");
       editSidebarHideTableComments.value = settingsStore.editorSettings.sidebarHideTableComments;
       editSidebarAllowHorizontalScroll.value = settingsStore.editorSettings.sidebarAllowHorizontalScroll;
@@ -298,12 +313,16 @@ function hasChanges(): boolean {
     editFontSize.value !== settingsStore.editorSettings.fontSize ||
     editUiScale.value !== settingsStore.editorSettings.uiScale ||
     editTheme.value !== settingsStore.editorSettings.theme ||
+    JSON.stringify(editCustomThemes.value) !== JSON.stringify(settingsStore.editorSettings.customThemes) ||
+    editActiveCustomThemeId.value !== settingsStore.editorSettings.activeCustomThemeId ||
     editExecuteMode.value !== settingsStore.editorSettings.executeMode ||
     editWordWrap.value !== settingsStore.editorSettings.wordWrap ||
+    editConfirmDangerousSqlExecution.value !== settingsStore.editorSettings.confirmDangerousSqlExecution ||
     editAppLayout.value !== settingsStore.editorSettings.appLayout ||
     editShowTrayIcon.value !== settingsStore.desktopSettings.show_tray_icon ||
     editIconTheme.value !== settingsStore.desktopSettings.icon_theme ||
     editShowColumnCommentsInHeader.value !== settingsStore.editorSettings.showColumnCommentsInHeader ||
+    editShowColumnTypesInHeader.value !== settingsStore.editorSettings.showColumnTypesInHeader ||
     editCompactColumnHeaderActions.value !== settingsStore.editorSettings.compactColumnHeaderActions ||
     editRedisScanPageSize.value !== settingsStore.editorSettings.redisScanPageSize ||
     JSON.stringify(editShortcuts.value) !== JSON.stringify(settingsStore.editorSettings.shortcuts) ||
@@ -312,6 +331,7 @@ function hasChanges(): boolean {
     editAutoSelectActiveSidebarNode.value !== settingsStore.editorSettings.autoSelectActiveSidebarNode ||
     editDisconnectTabHandlingMode.value !== settingsStore.editorSettings.disconnectTabHandlingMode ||
     editReuseDataTab.value !== settingsStore.editorSettings.reuseDataTab ||
+    editUpdateNotificationsEnabled.value !== settingsStore.editorSettings.updateNotificationsEnabled ||
     editSidebarHideTableComments.value !== settingsStore.editorSettings.sidebarHideTableComments ||
     editSidebarAllowHorizontalScroll.value !== settingsStore.editorSettings.sidebarAllowHorizontalScroll ||
     editExportBatchSize.value !== settingsStore.editorSettings.exportBatchSize ||
@@ -330,10 +350,14 @@ async function persistSettings() {
     fontSize: editFontSize.value,
     uiScale: editUiScale.value,
     theme: editTheme.value,
+    customThemes: editCustomThemes.value,
+    activeCustomThemeId: editActiveCustomThemeId.value,
     executeMode: editExecuteMode.value,
     wordWrap: editWordWrap.value,
+    confirmDangerousSqlExecution: editConfirmDangerousSqlExecution.value,
     appLayout: editAppLayout.value,
     showColumnCommentsInHeader: editShowColumnCommentsInHeader.value,
+    showColumnTypesInHeader: editShowColumnTypesInHeader.value,
     compactColumnHeaderActions: editCompactColumnHeaderActions.value,
     redisScanPageSize: editRedisScanPageSize.value,
     shortcuts: editShortcuts.value,
@@ -342,6 +366,7 @@ async function persistSettings() {
     autoSelectActiveSidebarNode: editAutoSelectActiveSidebarNode.value,
     disconnectTabHandlingMode: editDisconnectTabHandlingMode.value,
     reuseDataTab: editReuseDataTab.value,
+    updateNotificationsEnabled: editUpdateNotificationsEnabled.value,
     sidebarHideTableComments: editSidebarHideTableComments.value,
     sidebarAllowHorizontalScroll: editSidebarAllowHorizontalScroll.value,
     sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(editSidebarHiddenTablePrefixes.value),
@@ -371,12 +396,16 @@ function resetDefaults() {
   editFontSize.value = DEFAULT_EDITOR_SETTINGS.fontSize;
   editUiScale.value = DEFAULT_EDITOR_SETTINGS.uiScale;
   editTheme.value = DEFAULT_EDITOR_SETTINGS.theme;
+  editCustomThemes.value = [...DEFAULT_EDITOR_SETTINGS.customThemes];
+  editActiveCustomThemeId.value = DEFAULT_EDITOR_SETTINGS.activeCustomThemeId;
   editExecuteMode.value = DEFAULT_EDITOR_SETTINGS.executeMode;
   editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
+  editConfirmDangerousSqlExecution.value = DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution;
   editAppLayout.value = DEFAULT_EDITOR_SETTINGS.appLayout;
   editShowTrayIcon.value = DEFAULT_DESKTOP_SETTINGS.show_tray_icon;
   editIconTheme.value = DEFAULT_DESKTOP_SETTINGS.icon_theme;
   editShowColumnCommentsInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader;
+  editShowColumnTypesInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader;
   editCompactColumnHeaderActions.value = DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions;
   editRedisScanPageSize.value = DEFAULT_EDITOR_SETTINGS.redisScanPageSize;
   editShortcuts.value = normalizeShortcutSettings(DEFAULT_EDITOR_SETTINGS.shortcuts);
@@ -385,6 +414,7 @@ function resetDefaults() {
   editAutoSelectActiveSidebarNode.value = DEFAULT_EDITOR_SETTINGS.autoSelectActiveSidebarNode;
   editDisconnectTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
   editReuseDataTab.value = DEFAULT_EDITOR_SETTINGS.reuseDataTab;
+  editUpdateNotificationsEnabled.value = DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled;
   editSidebarHideTableComments.value = DEFAULT_EDITOR_SETTINGS.sidebarHideTableComments;
   editSidebarAllowHorizontalScroll.value = DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll;
   editSidebarHiddenTablePrefixes.value = DEFAULT_EDITOR_SETTINGS.sidebarHiddenTablePrefixes.join("\n");
@@ -400,8 +430,43 @@ function onFontFamilyChange(v: any) {
   if (typeof v === "string") editFontFamily.value = v;
 }
 
+const themeSelectValue = computed(() => {
+  if (editTheme.value === "custom") {
+    return `custom:${editActiveCustomThemeId.value}`;
+  }
+  return editTheme.value;
+});
+
+const themeSelectOptions = computed(() => [
+  ...EDITOR_THEMES.filter((theme) => theme.value !== "custom").map((theme) => ({
+    value: theme.value,
+    label: theme.value === "app" ? t("settings.followAppTheme") : theme.label,
+    dark: theme.dark,
+    isCustom: false,
+  })),
+  ...editCustomThemes.value.map((theme) => ({
+    value: `custom:${theme.id}`,
+    label: theme.name,
+    dark: true,
+    isCustom: true,
+  })),
+]);
+
 function onThemeChange(v: any) {
-  if (typeof v === "string") editTheme.value = v as typeof DEFAULT_EDITOR_SETTINGS.theme;
+  if (typeof v !== "string") return;
+  if (v.startsWith("custom:")) {
+    editTheme.value = "custom";
+    editActiveCustomThemeId.value = v.slice(7);
+  } else {
+    editTheme.value = v as typeof DEFAULT_EDITOR_SETTINGS.theme;
+  }
+}
+
+function handleThemeSave(updatedThemes: CustomTheme[], activeId: string) {
+  editCustomThemes.value = updatedThemes;
+  editActiveCustomThemeId.value = activeId;
+  editTheme.value = "custom";
+  showThemeCustomizer.value = false;
 }
 
 function onDisconnectTabHandlingModeChange(v: any) {
@@ -437,9 +502,56 @@ function onShortcutChange(actionId: ShortcutActionId, value: any) {
 function onShortcutKeydown(actionId: ShortcutActionId, event: KeyboardEvent) {
   event.preventDefault();
   event.stopPropagation();
+  if (editingShortcutId.value !== actionId) return;
+  if (event.key === "Escape") {
+    editingShortcutId.value = null;
+    return;
+  }
   const shortcut = eventToShortcut(event);
   if (!shortcut) return;
   onShortcutChange(actionId, shortcut);
+  editingShortcutId.value = null;
+}
+
+function formatShortcutPill(shortcut: string): string {
+  const isMac = globalThis.navigator?.platform?.toLowerCase().includes("mac") ?? false;
+  return shortcut
+    .split("+")
+    .filter(Boolean)
+    .map((part) => {
+      if (part === "Mod") return isMac ? "⌘" : "Ctrl";
+      if (part === "Meta") return isMac ? "⌘" : "Meta";
+      if (part === "Shift") return isMac ? "⇧" : "Shift";
+      if (part === "Alt") return isMac ? "⌥" : "Alt";
+      if (part === "Control" || part === "Ctrl") return isMac ? "⌃" : "Ctrl";
+      if (part === "Enter") return "↵";
+      if (part === "Backspace") return "⌫";
+      if (part === "Delete") return isMac ? "⌦" : "Del";
+      if (part === "Escape") return "Esc";
+      if (part === "ArrowUp") return "↑";
+      if (part === "ArrowDown") return "↓";
+      if (part === "ArrowLeft") return "←";
+      if (part === "ArrowRight") return "→";
+      if (part === " ") return "Space";
+      return part.length === 1 ? part.toUpperCase() : part;
+    })
+    .join(isMac ? " " : " + ");
+}
+
+const shortcutPressShortcutLabel = computed(() => t("settings.shortcutPressShortcut"));
+const shortcutPressShortcutInputWidth = computed(() => `${shortcutPressShortcutLabel.value.length + 2}em`);
+
+function focusShortcutInput(actionId: ShortcutActionId) {
+  editingShortcutId.value = actionId;
+  const input = document.querySelector<HTMLInputElement>(`[data-shortcut-input="${actionId}"]`);
+  requestAnimationFrame(() => {
+    input?.focus();
+    input?.select();
+  });
+}
+
+function cancelShortcutEdit() {
+  editingShortcutId.value = null;
 }
 
 function resetShortcut(actionId: ShortcutActionId) {
@@ -1031,16 +1143,24 @@ async function aiTestConn() {
 const previewRef = ref<HTMLDivElement>();
 const previewView = shallowRef<EditorViewType | null>(null);
 
+function getPreviewCustomThemeColors(): CustomThemeColors | undefined {
+  if (editTheme.value !== "custom") return undefined;
+  const activeTheme = editCustomThemes.value.find((t) => t.id === editActiveCustomThemeId.value);
+  return activeTheme?.colors;
+}
+
 const previewSettings = computed<{
   fontFamily: string;
   fontSize: number;
   theme: EditorTheme;
   appAppearance: AppThemeAppearance;
+  customColors?: CustomThemeColors;
 }>(() => ({
   fontFamily: editFontFamily.value,
   fontSize: editFontSize.value,
   theme: editTheme.value,
   appAppearance: isDark.value ? "dark" : "light",
+  customColors: getPreviewCustomThemeColors(),
 }));
 
 const previewSql = `SELECT u.id, u.name
@@ -1052,11 +1172,11 @@ let themeComp: import("@codemirror/state").Compartment | null = null;
 let editorViewModule: typeof import("@codemirror/view") | null = null;
 
 watch(
-  previewSettings,
-  async (ss) => {
+  [previewSettings, editCustomThemes, editActiveCustomThemeId],
+  async ([ss]) => {
     if (!previewView.value || !fontThemeComp || !themeComp || !editorViewModule) return;
 
-    const themeExt = await loadEditorTheme(ss.theme, ss.appAppearance);
+    const themeExt = await loadEditorTheme(ss.theme, ss.appAppearance, ss.customColors);
     previewView.value.dispatch({
       effects: [
         themeComp.reconfigure(themeExt),
@@ -1097,7 +1217,7 @@ watch(previewRef, async (el) => {
   themeComp = new Compartment();
 
   const ss = previewSettings.value;
-  const themeExt = await loadEditorTheme(ss.theme, ss.appAppearance);
+  const themeExt = await loadEditorTheme(ss.theme, ss.appAppearance, ss.customColors);
 
   const state = EditorState.create({
     doc: previewSql,
@@ -1155,9 +1275,9 @@ watch(
         <div class="min-w-0 flex-1 overflow-hidden px-1 flex flex-col">
           <div class="min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-1 pr-2">
             <section v-if="activeSettingsTab === 'editor'" class="flex flex-col gap-5 py-2">
-              <div class="grid gap-4 md:grid-cols-[minmax(0,1fr)_220px]">
+              <div class="grid gap-4 md:grid-cols-[1fr_auto]">
                 <!-- Font Family -->
-                <div class="space-y-2">
+                <div class="space-y-2 min-w-0">
                   <Label>{{ t("settings.fontFamily") }}</Label>
                   <SearchableSelect
                     :model-value="editFontFamily"
@@ -1191,29 +1311,40 @@ watch(
                   </SearchableSelect>
                 </div>
 
-                <!-- Theme -->
-                <div class="space-y-2">
-                  <Label>{{ t("settings.theme") }}</Label>
-                  <Select :model-value="editTheme" @update:model-value="onThemeChange">
-                    <SelectTrigger>
-                      <SelectValue :placeholder="t('settings.selectTheme')" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem v-for="theme in EDITOR_THEMES" :key="theme.value" :value="theme.value">
-                        <div class="flex items-center gap-2">
-                          <span
-                            class="h-3 w-3 rounded-full border"
-                            :class="
-                              theme.dark
-                                ? 'bg-foreground border-foreground/20'
-                                : 'bg-muted-foreground/30 border-muted-foreground/40'
-                            "
-                          />
-                          {{ theme.value === "app" ? t("settings.followAppTheme") : theme.label }}
-                        </div>
-                      </SelectItem>
-                    </SelectContent>
-                  </Select>
+                <!-- Theme + Custom Theme Button -->
+                <div class="flex gap-2 items-end">
+                  <div class="space-y-2">
+                    <Label>{{ t("settings.theme") }}</Label>
+                    <Select :model-value="themeSelectValue" @update:model-value="onThemeChange">
+                      <SelectTrigger class="min-w-[80px] max-w-[200px]">
+                        <SelectValue :placeholder="t('settings.selectTheme')" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem v-for="theme in themeSelectOptions" :key="theme.value" :value="theme.value">
+                          <div class="flex items-center gap-2">
+                            <span
+                              class="h-3 w-3 rounded-full border"
+                              :class="
+                                theme.dark
+                                  ? 'bg-foreground border-foreground/20'
+                                  : 'bg-muted-foreground/30 border-muted-foreground/40'
+                              "
+                            />
+                            {{ theme.label }}
+                          </div>
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <Button
+                    v-if="editTheme === 'custom'"
+                    variant="outline"
+                    class="h-9 w-auto px-4"
+                    @click="showThemeCustomizer = true"
+                  >
+                    <Settings class="mr-2 h-4 w-4" />
+                    {{ t("settings.customThemeConfigure") }}
+                  </Button>
                 </div>
               </div>
 
@@ -1262,6 +1393,16 @@ watch(
                   </div>
                   <Switch id="editor-word-wrap" v-model="editWordWrap" class="mt-0.5" />
                 </div>
+              </div>
+
+              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="space-y-1">
+                  <Label for="editor-confirm-dangerous-sql">{{ t("settings.confirmDangerousSqlExecution") }}</Label>
+                  <p class="text-xs text-muted-foreground">
+                    {{ t("settings.confirmDangerousSqlExecutionDescription") }}
+                  </p>
+                </div>
+                <Switch id="editor-confirm-dangerous-sql" v-model="editConfirmDangerousSqlExecution" class="mt-0.5" />
               </div>
 
               <Separator />
@@ -1408,6 +1549,16 @@ watch(
                 <Switch id="show-tray-icon" v-model="editShowTrayIcon" />
               </div>
 
+              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="space-y-1">
+                  <Label for="update-notifications-enabled">{{ t("settings.updateNotificationsEnabled") }}</Label>
+                  <p class="text-xs text-muted-foreground">
+                    {{ t("settings.updateNotificationsEnabledDescription") }}
+                  </p>
+                </div>
+                <Switch id="update-notifications-enabled" v-model="editUpdateNotificationsEnabled" />
+              </div>
+
               <Separator />
 
               <div class="space-y-3">
@@ -1422,6 +1573,17 @@ watch(
                     </p>
                   </div>
                   <Switch id="show-column-comments-in-header" v-model="editShowColumnCommentsInHeader" />
+                </div>
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="show-column-types-in-header">
+                      {{ t("settings.showColumnTypesInHeader") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.showColumnTypesInHeaderDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="show-column-types-in-header" v-model="editShowColumnTypesInHeader" />
                 </div>
                 <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
@@ -1696,40 +1858,80 @@ watch(
             </section>
 
             <section v-else-if="activeSettingsTab === 'shortcuts'" class="flex flex-col gap-2 py-2">
-              <div class="overflow-hidden rounded-md border bg-background">
+              <div class="overflow-hidden rounded-md border border-border/70 bg-background">
                 <div
                   v-for="definition in SHORTCUT_DEFINITIONS"
                   :key="definition.id"
-                  class="-mt-px grid gap-2 border-t border-border px-3 py-2 sm:first:mt-0 sm:first:border-t-0 sm:grid-cols-[minmax(0,1fr)_208px] sm:items-center"
+                  class="group -mt-px grid gap-2 border-t border-border/70 px-3 py-2 transition-colors first:mt-0 first:border-t-0 hover:bg-muted/40 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
                 >
                   <div class="min-w-0">
                     <div class="flex min-w-0 items-center gap-2">
                       <Label class="min-w-0 truncate leading-none">{{ t(definition.labelKey) }}</Label>
-                      <Badge variant="outline" class="h-5 shrink-0 rounded-md px-1.5 text-[11px] text-muted-foreground">
+                      <Badge
+                        variant="outline"
+                        class="h-5 shrink-0 rounded-md border-border/60 px-1.5 text-[11px] font-normal text-muted-foreground"
+                      >
                         {{
                           t(`settings.shortcutScope${definition.scope[0].toUpperCase()}${definition.scope.slice(1)}`)
                         }}
                       </Badge>
                     </div>
                   </div>
-                  <div class="space-y-1">
-                    <div class="flex gap-2">
-                      <Input
-                        :model-value="formatShortcut(editShortcuts[definition.id])"
+                  <div class="min-w-0 space-y-1">
+                    <div class="flex items-center justify-end gap-1.5">
+                      <input
+                        :data-shortcut-input="definition.id"
+                        :value="
+                          editingShortcutId === definition.id ? '' : formatShortcutPill(editShortcuts[definition.id])
+                        "
+                        :style="{
+                          width:
+                            editingShortcutId === definition.id
+                              ? shortcutPressShortcutInputWidth
+                              : `${Math.max(4, formatShortcutPill(editShortcuts[definition.id]).length + 2)}ch`,
+                        }"
                         readonly
                         :aria-invalid="shortcutConflicts.includes(definition.id)"
                         :placeholder="t('settings.shortcutPressShortcut')"
-                        class="h-9 font-mono"
+                        class="h-7 w-auto min-w-12 max-w-32 shrink-0 cursor-default rounded-full border border-transparent bg-muted px-2.5 text-center font-mono text-[13px] font-semibold text-foreground/75 shadow-inner outline-none selection:bg-transparent placeholder:text-muted-foreground aria-invalid:border-destructive/70 aria-invalid:text-destructive aria-invalid:ring-destructive/20"
+                        :class="
+                          editingShortcutId === definition.id
+                            ? 'max-w-44 cursor-text border-border/80 bg-background text-left text-foreground shadow-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/35'
+                            : ''
+                        "
                         @keydown="(event: KeyboardEvent) => onShortcutKeydown(definition.id, event)"
                       />
                       <Button
+                        v-if="editingShortcutId !== definition.id"
                         type="button"
-                        variant="outline"
+                        variant="ghost"
+                        size="icon"
+                        class="h-7 w-7 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+                        :aria-label="t('settings.shortcutPressShortcut')"
+                        @click="focusShortcutInput(definition.id)"
+                      >
+                        <Pencil class="h-4 w-4" />
+                      </Button>
+                      <Button
+                        v-else
+                        type="button"
+                        variant="ghost"
                         size="sm"
-                        class="h-9 shrink-0 px-3"
+                        class="h-7 shrink-0 px-2 text-sm font-medium text-muted-foreground hover:text-foreground"
+                        @click="cancelShortcutEdit"
+                      >
+                        {{ t("settings.cancel") }}
+                      </Button>
+                      <Button
+                        v-if="editingShortcutId !== definition.id"
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        class="h-7 w-7 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+                        :aria-label="t('settings.reset')"
                         @click="resetShortcut(definition.id)"
                       >
-                        {{ t("settings.reset") }}
+                        <RotateCcw class="h-4 w-4" />
                       </Button>
                     </div>
                     <p v-if="shortcutConflicts.includes(definition.id)" class="text-xs text-destructive">
@@ -2532,6 +2734,14 @@ watch(
         </div>
       </div>
     </DialogContent>
+
+    <!-- Theme Customizer Dialog -->
+    <ThemeCustomizerDialog
+      v-model:open="showThemeCustomizer"
+      :themes="editCustomThemes"
+      :active-theme-id="editActiveCustomThemeId"
+      @save="handleThemeSave"
+    />
 
     <!-- Snippet Add/Edit Dialog -->
     <Dialog :open="snippetDialogOpen" @update:open="snippetDialogOpen = $event">

@@ -92,6 +92,7 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
 
     case "postgres":
     case "gaussdb":
+    case "kwdb":
     case "yashandb":
     case "redshift":
       return "postgresql://user:password@host:port/database";
@@ -99,8 +100,14 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
     case "redis":
       return "redis://:password@host:port/0";
 
+    case "etcd":
+      return "etcd://host:2379";
+
     case "sqlite":
       return "sqlite:///absolute/path/to/database.db";
+
+    case "rqlite":
+      return "http://user:password@host:4001";
 
     case "duckdb":
       return "duckdb:///absolute/path/to/database.duckdb";
@@ -131,6 +138,9 @@ export function connectionUrlPlaceholder(dbType: DatabaseType): string {
 
     case "xugu":
       return "xugu://user:password@host:5138/database";
+
+    case "iotdb":
+      return "iotdb://user:password@host:6667/root.test";
 
     case "bigquery":
       return "bigquery://https://www.googleapis.com/bigquery/v2:443/project-id";

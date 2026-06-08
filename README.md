@@ -33,6 +33,7 @@
     <img src="https://img.shields.io/badge/OceanBase-006AFF?logoColor=white" />
     <img src="https://img.shields.io/badge/openGauss-2B7BD9?logoColor=white" />
     <img src="https://img.shields.io/badge/GaussDB-E60012?logoColor=white" />
+    <img src="https://img.shields.io/badge/KWDB-1c60e0?logoColor=white" />
     <img src="https://img.shields.io/badge/KingBase-003B8E?logoColor=white" />
     <img src="https://img.shields.io/badge/TDengine-2F6FFF?logoColor=white" />
     <img src="https://img.shields.io/badge/CockroachDB-6933FF?logoColor=white" />
@@ -85,7 +86,7 @@
 
 ### 40+ Databases, One Tool
 
-MySQL, PostgreSQL, SQLite, Redis, MongoDB, DuckDB, ClickHouse, SQL Server, Oracle, Elasticsearch, MariaDB, TiDB, OceanBase, openGauss, GaussDB, KingBase, Vastbase, GoldenDB, Doris, SelectDB, StarRocks, Redshift, DM, TDengine, XuguDB, CockroachDB, Access, HighGo, and more. Agent/JDBC-oriented profiles extend DBX to H2, Snowflake, Trino, Hive, DB2, Informix, Neo4j, Cassandra, BigQuery, Kylin, SunDB, and custom JDBC connections. All in a single ~15 MB app. No bundled Chromium.
+MySQL, PostgreSQL, SQLite, Redis, MongoDB, DuckDB, ClickHouse, SQL Server, Oracle, Elasticsearch, MariaDB, TiDB, OceanBase, openGauss, GaussDB, KWDB, KingBase, Vastbase, GoldenDB, Doris, SelectDB, StarRocks, Redshift, DM, TDengine, XuguDB, CockroachDB, Access, HighGo, and more. Agent/JDBC-oriented profiles extend DBX to H2, Snowflake, Trino, Hive, DB2, Informix, Neo4j, Cassandra, BigQuery, Kylin, SunDB, and custom JDBC connections. All in a single ~15 MB app. No bundled Chromium.
 
 ### Query Editor
 
@@ -273,7 +274,7 @@ The installer will be in `src-tauri/target/release/bundle/`.
 
 <details>
 <summary><strong>Is DBX free?</strong></summary>
-Yes. DBX is open source under AGPL-3.0. All features are free.
+Yes. DBX is open source under Apache-2.0. All features are free.
 </details>
 
 <details>
@@ -293,7 +294,7 @@ DBX is 15 MB with no runtime dependencies (no Java, no Python). It includes AI a
 
 <details>
 <summary><strong>What databases are supported?</strong></summary>
-MySQL, PostgreSQL, SQLite, Redis, MongoDB, DuckDB, ClickHouse, SQL Server, Oracle, Elasticsearch, MariaDB, TiDB, OceanBase, openGauss, GaussDB, KingBase, Vastbase, GoldenDB, Doris, SelectDB, StarRocks, Redshift, DM, TDengine, XuguDB, CockroachDB, Access, HighGo, and more. JDBC-oriented profiles extend support to H2, Snowflake, Trino, Hive, DB2, Informix, Neo4j, Cassandra, BigQuery, Kylin, SunDB, and custom JDBC connections.
+MySQL, PostgreSQL, SQLite, Redis, MongoDB, DuckDB, ClickHouse, SQL Server, Oracle, Elasticsearch, MariaDB, TiDB, OceanBase, openGauss, GaussDB, KWDB, KingBase, Vastbase, GoldenDB, Doris, SelectDB, StarRocks, Redshift, DM, TDengine, XuguDB, CockroachDB, Access, HighGo, and more. JDBC-oriented profiles extend support to H2, Snowflake, Trino, Hive, DB2, Informix, Neo4j, Cassandra, BigQuery, Kylin, SunDB, and custom JDBC connections.
 </details>
 
 <details>
@@ -319,4 +320,4 @@ Open an issue on <a href="https://github.com/t8y2/dbx/issues">GitHub Issues</a>.
 
 ## License
 
-[AGPL-3.0](LICENSE)
+[Apache-2.0](LICENSE)

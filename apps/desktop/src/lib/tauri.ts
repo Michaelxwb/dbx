@@ -145,6 +145,7 @@ export interface DriverRuntimeSummary {
 export interface DesktopSettings {
   show_tray_icon: boolean;
   icon_theme: "default" | "black";
+  debug_logging_enabled: boolean;
 }
 
 export interface WebDavConfig {
@@ -867,6 +868,14 @@ export async function saveConnections(configs: ConnectionConfig[]): Promise<void
 
 export async function loadConnections(): Promise<ConnectionConfig[]> {
   return invoke("load_connections");
+}
+
+export async function readKeychainPassword(service: string): Promise<string> {
+  return invoke("read_keychain_password", { service, account: null });
+}
+
+export async function readKeychainPasswords(services: string[]): Promise<[string, string][]> {
+  return invoke("read_keychain_passwords", { services });
 }
 
 export async function decryptConfig(payload: unknown, passphrase: string): Promise<string> {

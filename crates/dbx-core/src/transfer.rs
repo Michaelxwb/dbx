@@ -1713,6 +1713,7 @@ pub async fn execute_on_pool_with_max_rows(
                     Ok(db::QueryResult {
                         columns,
                         column_types: Vec::new(),
+                        column_sortables: vec![],
                         rows: result_rows,
                         affected_rows: 0,
                         execution_time_ms: start.elapsed().as_millis(),
@@ -1725,6 +1726,7 @@ pub async fn execute_on_pool_with_max_rows(
                     Ok(db::QueryResult {
                         columns: vec![],
                         column_types: Vec::new(),
+                        column_sortables: vec![],
                         rows: vec![],
                         affected_rows: affected as u64,
                         execution_time_ms: start.elapsed().as_millis(),
@@ -2960,7 +2962,9 @@ where
                 rewrite_postgres_routine_schema(&object.source, &request.target_schema)
                     .unwrap_or_else(|| object.source.clone())
             }
-            db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => object.source.clone(),
+            db::ObjectSourceKind::Sequence | db::ObjectSourceKind::Package | db::ObjectSourceKind::PackageBody => {
+                object.source.clone()
+            }
         };
         let statements = build_executable_object_source_statements(EditableObjectSourceSqlInput {
             database_type: DatabaseType::Postgres,
@@ -3133,6 +3137,7 @@ mod tests {
             transport_layers: Vec::new(),
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
+            idle_timeout_secs: 60,
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),

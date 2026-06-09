@@ -47,6 +47,7 @@ import {
   ListFilter,
   Package,
   Clipboard,
+  UsersRound,
 } from "@lucide/vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
@@ -132,6 +133,7 @@ import {
   treeSelectionRangeIds,
 } from "@/lib/sidebarTreeSelection";
 import { selectedConnectionDeleteTargets } from "@/lib/sidebarConnectionSelection";
+import { supportsDatabaseUserAdmin } from "@/lib/databaseUserAdmin";
 import { sidebarTreeContextKey } from "@/lib/sidebarTreeContext";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ProcedureExecutionDialog from "@/components/objects/ProcedureExecutionDialog.vue";
@@ -242,6 +244,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Zap, colorClass: "text-orange-400" };
     case "object-browser":
       return { icon: TableProperties, colorClass: "text-primary" };
+    case "user-admin":
+      return { icon: UsersRound, colorClass: "text-primary" };
     case "saved-sql-root":
       return { icon: FolderOpen, colorClass: "text-blue-500" };
     case "saved-sql-folder":
@@ -266,6 +270,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: ScrollText, colorClass: "text-blue-500" };
     case "function":
       return { icon: Braces, colorClass: "text-amber-500" };
+    case "sequence":
+      return { icon: ListTree, colorClass: "text-emerald-500" };
     case "package":
       return { icon: Package, colorClass: "text-cyan-500" };
     case "package-body":
@@ -278,6 +284,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: ScrollText, colorClass: "text-blue-500" };
     case "group-functions":
       return { icon: Braces, colorClass: "text-amber-500" };
+    case "group-sequences":
+      return { icon: ListTree, colorClass: "text-emerald-500" };
     case "group-packages":
       return { icon: Package, colorClass: "text-cyan-500" };
     case "group-partitions":
@@ -296,6 +304,7 @@ const groupTypes: Set<TreeNodeType> = new Set([
   "group-views",
   "group-procedures",
   "group-functions",
+  "group-sequences",
   "group-packages",
   "group-partitions",
   "saved-sql-root",
@@ -318,6 +327,7 @@ function isGroupLabel(node: TreeNode): boolean {
 
 function displayLabel(node: TreeNode): string {
   if (node.type === "object-browser") return t(node.label, { count: node.objectCount ?? 0 });
+  if (node.type === "user-admin") return t(node.label);
   if (node.label === "tree.defaultDatabase") return t(node.label);
   return isGroupLabel(node) ? t(node.label) : node.label;
 }
@@ -330,7 +340,7 @@ function visibleLabel(node: TreeNode): string {
 }
 
 function isTooltipDisabled(): boolean {
-  return !isLabelTruncated();
+  return isRenamingGroup.value || !isLabelTruncated();
 }
 
 async function toggle() {
@@ -363,6 +373,7 @@ async function toggle() {
     node.type === "group-views" ||
     node.type === "group-procedures" ||
     node.type === "group-functions" ||
+    node.type === "group-sequences" ||
     node.type === "group-packages";
   if (databaseObjectGroup && connectionStore.isTreeNodeChildrenLoaded(node.id)) {
     node.isExpanded = !node.isExpanded;
@@ -394,6 +405,8 @@ async function toggle() {
     } else if (node.type === "etcd-root" && node.connectionId) {
       const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "etcd"}:keys`;
       queryStore.createTab(node.connectionId, "", tabTitle, "etcd");
+    } else if (node.type === "user-admin" && node.connectionId) {
+      queryStore.openUserAdmin(node.connectionId);
     } else if (node.type === "mongo-db" && node.connectionId && node.database) {
       await connectionStore.loadMongoCollections(node.connectionId, node.database);
     } else if (node.type === "mongo-collection" && node.connectionId && node.database) {
@@ -466,6 +479,7 @@ function runRowClickAction() {
   } else if (
     node.type === "procedure" ||
     node.type === "function" ||
+    node.type === "sequence" ||
     node.type === "package" ||
     node.type === "package-body"
   ) {
@@ -744,6 +758,18 @@ async function openObjectBrowser() {
     ) {
       window.dispatchEvent(new Event("dbx-open-driver-store"));
     }
+  }
+}
+
+async function openUserAdmin() {
+  const node = props.node;
+  if (!node.connectionId) return;
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    connectionStore.activeConnectionId = node.connectionId;
+    queryStore.openUserAdmin(node.connectionId);
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
   }
 }
 
@@ -1206,11 +1232,13 @@ function viewObjectSource() {
     .then(async (result) => {
       const tabId = queryStore.createTab(node.connectionId!, node.database!, `Source - ${node.label}`);
       queryStore.updateSql(tabId, result.source);
-      queryStore.setObjectSource(tabId, {
-        schema,
-        name: node.label,
-        objectType,
-      });
+      if (objectType !== "SEQUENCE") {
+        queryStore.setObjectSource(tabId, {
+          schema,
+          name: node.label,
+          objectType,
+        });
+      }
     })
     .catch((e: any) => {
       toast(e?.message || String(e), 5000);
@@ -2913,6 +2941,9 @@ function treeItemMenuItems(): ContextMenuItem[] {
       items.push({ label: t("contextMenu.closeConnection"), action: disconnectConnection, icon: Unplug });
     }
     items.push({ label: t("contextMenu.newQuery"), action: newQuery, icon: TerminalSquare });
+    if (supportsDatabaseUserAdmin(currentDatabaseType())) {
+      items.push({ label: t("contextMenu.userAdmin"), action: openUserAdmin, icon: UsersRound });
+    }
     if (canCopyFinalProxyPort.value) {
       items.push({ label: t("contextMenu.copyFinalProxyPort"), action: copyFinalProxyPort, icon: Network });
     }
@@ -3061,6 +3092,11 @@ function treeItemMenuItems(): ContextMenuItem[] {
   // 5. Redis DB / Mongo DB
   if (node.type === "etcd-root") {
     items.push({ label: t("contextMenu.openConnection"), action: toggle, icon: Database });
+    return items;
+  }
+
+  if (node.type === "user-admin") {
+    items.push({ label: t("contextMenu.openUserAdmin"), action: openUserAdmin, icon: UsersRound });
     return items;
   }
 
@@ -3221,6 +3257,13 @@ function treeItemMenuItems(): ContextMenuItem[] {
     return items;
   }
 
+  if (node.type === "sequence") {
+    items.push({ label: t("contextMenu.viewSource"), action: viewObjectSource, icon: Code2 });
+    items.push({ label: "", separator: true });
+    items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
+    return items;
+  }
+
   if (node.type === "package" || node.type === "package-body") {
     items.push({ label: t("contextMenu.viewSource"), action: viewObjectSource, icon: Code2 });
     items.push({ label: "", separator: true });
@@ -3305,122 +3348,125 @@ function treeItemMenuItems(): ContextMenuItem[] {
 <template>
   <CustomContextMenu :items="treeItemMenuItems()" v-slot="{ onContextMenu }">
     <div @contextmenu="onTreeItemContextMenu($event, onContextMenu)">
-      <div
-        ref="rowRef"
-        class="group flex items-center gap-1.5 py-1 px-2 cursor-pointer hover:bg-accent transition-colors relative outline-none"
-        style="contain: layout style"
-        :class="[
-          rowWidthClass,
-          {
-            'ring-1 ring-primary/50 bg-primary/5': showDropInside,
-            'opacity-50': isDragging,
-            'tree-item-connection-tint': connectionColor,
-            'rounded-none': connectionColor && !isSelected && !isMultiSelected,
-            'rounded-sm': !connectionColor && !isSelected && !isMultiSelected,
-            'tree-item-active rounded-none': connectionColor && (isSelected || isMultiSelected),
-            'tree-item-active rounded-md': !connectionColor && (isSelected || isMultiSelected),
-            'tree-item-highlight': highlighted,
-          },
-        ]"
-        :tabindex="isSelected || isMultiSelected ? 0 : -1"
-        :style="rowStyle"
-        @click="onClick"
-        @dblclick="onDoubleClick"
-        @keydown="onKeydown"
-        @mousedown="onRowMouseDown"
-        @mousemove="isDropTarget ? updateTarget($event, node.id, node.type) : undefined"
-        @mouseleave="clearTarget(node.id)"
-      >
+      <LightTooltip :text="displayLabel(node)" :disabled="isTooltipDisabled" side="right" :side-offset="8" :delay="0">
         <div
-          v-if="showDropBefore"
-          class="absolute right-2 top-0 h-0.5 bg-primary rounded-full pointer-events-none"
-          :style="{ left: paddingLeft }"
-        />
-        <div
-          v-if="showDropAfter"
-          class="absolute right-2 bottom-0 h-0.5 bg-primary rounded-full pointer-events-none"
-          :style="{ left: paddingLeft }"
-        />
-        <template v-if="canExpand">
-          <button
-            type="button"
-            class="-m-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted hover:text-foreground"
-            @click.stop="toggle"
+          ref="rowRef"
+          class="group flex items-center gap-1.5 py-1 px-2 cursor-pointer hover:bg-accent transition-colors relative outline-none"
+          style="contain: layout style"
+          :class="[
+            rowWidthClass,
+            {
+              'ring-1 ring-primary/50 bg-primary/5': showDropInside,
+              'opacity-50': isDragging,
+              'tree-item-connection-tint': connectionColor,
+              'rounded-none': connectionColor && !isSelected && !isMultiSelected,
+              'rounded-sm': !connectionColor && !isSelected && !isMultiSelected,
+              'tree-item-active rounded-none': connectionColor && (isSelected || isMultiSelected),
+              'tree-item-active rounded-md': !connectionColor && (isSelected || isMultiSelected),
+              'tree-item-highlight': highlighted,
+            },
+          ]"
+          :tabindex="isSelected || isMultiSelected ? 0 : -1"
+          :style="rowStyle"
+          @click="onClick"
+          @dblclick="onDoubleClick"
+          @keydown="onKeydown"
+          @mousedown="onRowMouseDown"
+          @mousemove="isDropTarget ? updateTarget($event, node.id, node.type) : undefined"
+          @mouseleave="clearTarget(node.id)"
+        >
+          <div
+            v-if="showDropBefore"
+            class="absolute right-2 top-0 h-0.5 bg-primary rounded-full pointer-events-none"
+            :style="{ left: paddingLeft }"
+          />
+          <div
+            v-if="showDropAfter"
+            class="absolute right-2 bottom-0 h-0.5 bg-primary rounded-full pointer-events-none"
+            :style="{ left: paddingLeft }"
+          />
+          <template v-if="canExpand">
+            <button
+              type="button"
+              class="-m-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted hover:text-foreground"
+              @click.stop="toggle"
+            >
+              <Loader2 v-if="node.isLoading" class="w-3.5 h-3.5 animate-spin" />
+              <ChevronDown v-else-if="node.isExpanded" class="w-3.5 h-3.5" />
+              <ChevronRight v-else class="w-3.5 h-3.5" />
+            </button>
+          </template>
+          <span v-else class="w-3.5 h-3.5 shrink-0" />
+          <DatabaseIcon
+            v-if="node.type === 'connection'"
+            :db-type="connectionIconType(node.connectionId)"
+            class="w-3.5 h-3.5 shrink-0"
+          />
+          <component
+            v-else
+            :is="getIconInfo(node)?.icon || Database"
+            class="w-3.5 h-3.5 shrink-0 transition-colors"
+            :class="nodeIconClass"
+          />
+          <input
+            v-if="isRenamingGroup"
+            ref="renameInputRef"
+            v-model="renameInput"
+            class="min-w-0 flex-1 truncate bg-transparent border border-primary/50 rounded px-1 outline-none"
+            @blur="finishRenameGroup"
+            @keydown.enter.prevent="finishRenameGroup"
+            @keydown.escape.prevent="isRenamingGroup = false"
+            @click.stop
+          />
+          <span v-else ref="labelRef" :class="labelWidthClass">{{ visibleLabel(node) }}</span>
+          <span
+            v-if="
+              (node.type === 'group-tables' ||
+                node.type === 'group-views' ||
+                node.type === 'group-procedures' ||
+                node.type === 'group-functions' ||
+                node.type === 'group-sequences' ||
+                node.type === 'group-packages' ||
+                node.type === 'group-partitions') &&
+              node.objectCount != null
+            "
+            class="text-muted-foreground text-[10px] shrink-0"
+            >{{ node.objectCount }}</span
           >
-            <Loader2 v-if="node.isLoading" class="w-3.5 h-3.5 animate-spin" />
-            <ChevronDown v-else-if="node.isExpanded" class="w-3.5 h-3.5" />
-            <ChevronRight v-else class="w-3.5 h-3.5" />
+          <Badge v-if="isNodeDefaultDatabase" variant="secondary" class="h-4 px-1.5 text-[10px]">
+            {{ t("editor.defaultDatabase") }}
+          </Badge>
+          <span v-if="columnComment" class="truncate text-muted-foreground/60 text-[10px] max-w-[40%]">{{
+            columnComment
+          }}</span>
+          <span
+            v-if="tableComment && !settingsStore.editorSettings.sidebarHideTableComments"
+            class="truncate text-muted-foreground/60 text-[10px] max-w-[25%] group-hover:hidden"
+            :title="tableComment"
+            >{{ tableComment }}</span
+          >
+          <span
+            v-if="
+              node.type === 'connection' && node.connectionId && connectionStore.connectedIds.has(node.connectionId)
+            "
+            class="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0"
+          />
+          <ConnectionErrorIndicator
+            v-if="node.type === 'connection'"
+            :connection-id="node.connectionId"
+            trigger-class="h-4 w-4"
+          />
+          <button
+            v-if="canPin"
+            class="rounded p-0.5 text-muted-foreground hover:bg-muted-foreground/15 hover:text-foreground focus:opacity-100"
+            :class="isPinned ? 'opacity-100 text-primary' : 'opacity-0 group-hover:opacity-100'"
+            :title="isPinned ? t('contextMenu.unpin') : t('contextMenu.pin')"
+            @click.stop="togglePin"
+          >
+            <Pin class="w-3 h-3" :class="{ 'fill-current': isPinned }" />
           </button>
-        </template>
-        <span v-else class="w-3.5 h-3.5 shrink-0" />
-        <DatabaseIcon
-          v-if="node.type === 'connection'"
-          :db-type="connectionIconType(node.connectionId)"
-          class="w-3.5 h-3.5 shrink-0"
-        />
-        <component
-          v-else
-          :is="getIconInfo(node)?.icon || Database"
-          class="w-3.5 h-3.5 shrink-0 transition-colors"
-          :class="nodeIconClass"
-        />
-        <input
-          v-if="isRenamingGroup"
-          ref="renameInputRef"
-          v-model="renameInput"
-          class="min-w-0 flex-1 truncate bg-transparent border border-primary/50 rounded px-1 outline-none"
-          @blur="finishRenameGroup"
-          @keydown.enter.prevent="finishRenameGroup"
-          @keydown.escape.prevent="isRenamingGroup = false"
-          @click.stop
-        />
-        <LightTooltip v-else :text="displayLabel(node)" :disabled="isTooltipDisabled" side="right" :side-offset="8">
-          <span ref="labelRef" :class="labelWidthClass">{{ visibleLabel(node) }}</span>
-        </LightTooltip>
-        <span
-          v-if="
-            (node.type === 'group-tables' ||
-              node.type === 'group-views' ||
-              node.type === 'group-procedures' ||
-              node.type === 'group-functions' ||
-              node.type === 'group-packages' ||
-              node.type === 'group-partitions') &&
-            node.objectCount != null
-          "
-          class="text-muted-foreground text-[10px] shrink-0"
-          >{{ node.objectCount }}</span
-        >
-        <Badge v-if="isNodeDefaultDatabase" variant="secondary" class="h-4 px-1.5 text-[10px]">
-          {{ t("editor.defaultDatabase") }}
-        </Badge>
-        <span v-if="columnComment" class="truncate text-muted-foreground/60 text-[10px] max-w-[40%]">{{
-          columnComment
-        }}</span>
-        <span
-          v-if="tableComment && !settingsStore.editorSettings.sidebarHideTableComments"
-          class="truncate text-muted-foreground/60 text-[10px] max-w-[25%] group-hover:hidden"
-          :title="tableComment"
-          >{{ tableComment }}</span
-        >
-        <span
-          v-if="node.type === 'connection' && node.connectionId && connectionStore.connectedIds.has(node.connectionId)"
-          class="w-1.5 h-1.5 rounded-full bg-green-500 shrink-0"
-        />
-        <ConnectionErrorIndicator
-          v-if="node.type === 'connection'"
-          :connection-id="node.connectionId"
-          trigger-class="h-4 w-4"
-        />
-        <button
-          v-if="canPin"
-          class="rounded p-0.5 text-muted-foreground hover:bg-muted-foreground/15 hover:text-foreground focus:opacity-100"
-          :class="isPinned ? 'opacity-100 text-primary' : 'opacity-0 group-hover:opacity-100'"
-          :title="isPinned ? t('contextMenu.unpin') : t('contextMenu.pin')"
-          @click.stop="togglePin"
-        >
-          <Pin class="w-3 h-3" :class="{ 'fill-current': isPinned }" />
-        </button>
-      </div>
+        </div>
+      </LightTooltip>
     </div>
   </CustomContextMenu>
   <VisibleDatabasesDialog

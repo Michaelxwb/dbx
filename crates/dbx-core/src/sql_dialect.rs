@@ -110,6 +110,10 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
         );
     }
 
+    if database_type == Some(DatabaseType::Oracle) {
+        return format!("SELECT {select_columns} FROM {table_alias}{where_clause}{order}");
+    }
+
     if database_type.is_some_and(uses_fetch_first) {
         let offset = options
             .offset
@@ -212,6 +216,7 @@ pub fn quote_table_identifier(database_type: Option<DatabaseType>, name: &str) -
         Some(DatabaseType::Jdbc) => format!("`{}`", name.replace('`', "``")),
         Some(
             DatabaseType::Mysql
+            | DatabaseType::Goldendb
             | DatabaseType::StarRocks
             | DatabaseType::Hive
             | DatabaseType::Databend
@@ -462,6 +467,7 @@ mod tests {
     #[test]
     fn quotes_identifiers_by_database_type() {
         assert_eq!(quote_table_identifier(Some(DatabaseType::Mysql), "user`name"), "`user``name`");
+        assert_eq!(quote_table_identifier(Some(DatabaseType::Goldendb), "user`name"), "`user``name`");
         assert_eq!(quote_table_identifier(Some(DatabaseType::StarRocks), "user`name"), "`user``name`");
         assert_eq!(quote_table_identifier(Some(DatabaseType::SqlServer), "user]name"), "[user]]name]");
         assert_eq!(quote_table_identifier(Some(DatabaseType::Postgres), "user\"name"), "\"user\"\"name\"");
@@ -476,6 +482,7 @@ mod tests {
         assert_eq!(qualified_table_name(Some(DatabaseType::Postgres), Some("public"), "users"), "\"public\".\"users\"");
         assert_eq!(qualified_table_name(Some(DatabaseType::Kwdb), Some("public"), "users"), "\"public\".\"users\"");
         assert_eq!(qualified_table_name(Some(DatabaseType::Mysql), Some("public"), "users"), "`users`");
+        assert_eq!(qualified_table_name(Some(DatabaseType::Goldendb), Some("public"), "users"), "`users`");
         assert_eq!(qualified_table_name(Some(DatabaseType::Databend), Some("dbx_test"), "users"), "`dbx_test`.`users`");
         assert_eq!(qualified_table_name(Some(DatabaseType::Jdbc), Some("cbsdw_dwd"), "dwd_test_df"), "dwd_test_df");
         assert_eq!(qualified_table_name(Some(DatabaseType::Iotdb), Some("root.test"), "device2"), "root.test.device2");
@@ -611,6 +618,22 @@ mod tests {
         );
         assert_eq!(
             build_table_data_select_sql(TableDataSelectSqlOptions {
+                database_type: Some(DatabaseType::Goldendb),
+                schema: None,
+                table_name: "sys_dic".to_string(),
+                primary_keys: Vec::new(),
+                columns: Vec::new(),
+                fallback_order_columns: Vec::new(),
+                order_by: None,
+                limit: Some(100),
+                offset: None,
+                where_input: None,
+                include_row_id: false,
+            }),
+            "SELECT * FROM `sys_dic` LIMIT 100;"
+        );
+        assert_eq!(
+            build_table_data_select_sql(TableDataSelectSqlOptions {
                 database_type: Some(DatabaseType::Postgres),
                 schema: Some("public".to_string()),
                 table_name: "orders".to_string(),
@@ -728,6 +751,31 @@ mod tests {
     }
 
     #[test]
+    fn builds_iris_table_data_sql_with_literal_top_and_quoted_object() {
+        let sql = build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Iris),
+            schema: Some("Ens".to_string()),
+            table_name: "AlarmResponse".to_string(),
+            primary_keys: vec!["ID".to_string()],
+            columns: vec!["ID".to_string(), "Status".to_string()],
+            fallback_order_columns: Vec::new(),
+            order_by: Some("\"Status\" DESC".to_string()),
+            limit: Some(25),
+            offset: None,
+            where_input: Some("WHERE \"Status\" = 'Open'".to_string()),
+            include_row_id: false,
+        });
+
+        assert_eq!(
+            sql,
+            "SELECT TOP 25 * FROM \"Ens\".\"AlarmResponse\" WHERE (\"Status\" = 'Open') ORDER BY \"Status\" DESC"
+        );
+        assert!(!sql.contains("?"));
+        assert!(!sql.contains(":%qpar"));
+        assert!(!sql.contains(" LIMIT "));
+    }
+
+    #[test]
     fn builds_table_data_special_column_queries() {
         assert_eq!(
             build_table_data_select_sql(TableDataSelectSqlOptions {
@@ -821,7 +869,7 @@ mod tests {
                 where_input: None,
                 include_row_id: true,
             }),
-            "SELECT ROWIDTOCHAR(t.ROWID) AS \"__DBX_ROWID\", t.* FROM \"DBXTEST\".\"DBX_LOAD_TABLE_006\" t ORDER BY t.ROWID ASC FETCH FIRST 100 ROWS ONLY"
+            "SELECT ROWIDTOCHAR(t.ROWID) AS \"__DBX_ROWID\", t.* FROM \"DBXTEST\".\"DBX_LOAD_TABLE_006\" t ORDER BY t.ROWID ASC"
         );
         assert_eq!(
             build_table_data_select_sql(TableDataSelectSqlOptions {

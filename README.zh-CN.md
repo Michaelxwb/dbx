@@ -42,8 +42,9 @@
   </p>
   <p>
     <a href="https://hellogithub.com/repository/t8y2/dbx" target="_blank"><img src="https://api.hellogithub.com/v1/widgets/recommend.svg?rid=7f74ffda697241bf996e17e1b0900a21&claim_uid=p0UjnC1TLtyvWSx" alt="Featured｜HelloGitHub" style="width: 250px; height: 54px;" width="250" height="54" /></a>
-  </p>
-  <p>
+	<a href="https://www.producthunt.com/products/dbx/launches/dbx?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-dbx" target="_blank" rel="noopener noreferrer"><img alt="DBX - Lightweight open-source database manager built with Rust | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1136811&amp;theme=light&amp;t=1780979717555"></a>
+	  </p>
+	  <p>
     <a href="README.md">English</a> | 简体中文
   </p>
 
@@ -245,6 +246,8 @@ pnpm dev:web       # 前端
 pnpm dev:backend   # 后端
 ```
 
+[dbx-agents](https://github.com/t8y2/dbx-agents) 存放了驱动开发的工程。
+
 ### 构建
 
 ```bash
@@ -284,7 +287,7 @@ pnpm tauri build
 
 <details>
 <summary><strong>可以离线使用吗？</strong></summary>
-可以。桌面端完全支持离线使用。AI 功能需要网络访问模型端点（或通过 Ollama 使用本地模型）。
+可以。桌面端完全支持离线使用。内网环境安装驱动时，可在有网机器打开[离线驱动下载页](https://dbxio.com/cn/drivers)下载离线驱动包，传输到内网机器后，在 DBX 的「设置 > 驱动管理」中导入。AI 功能需要网络访问模型端点（或通过 Ollama 使用本地模型）。
 </details>
 
 <details>

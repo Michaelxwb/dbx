@@ -68,11 +68,15 @@ import { decodeSchemaTreeCache, encodeSchemaTreeCache } from "@/lib/schemaTreeCa
 import { sortSidebarTreeChildrenForParent } from "@/lib/sidebarNodeOrdering";
 import { prunePinnedTreeNodeIdsForConnection } from "@/lib/pinnedTreeNodeIds";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
+import { supportsDatabaseUserAdmin } from "@/lib/databaseUserAdmin";
 import { useSettingsStore } from "@/stores/settingsStore";
 
 const PINNED_TREE_NODES_STORAGE_KEY = "dbx-pinned-tree-nodes";
 const ACTIVE_CONNECTION_STORAGE_KEY = "dbx-active-connection";
-type ImportSource = "dbx" | "navicat" | "dbeaver";
+type ImportSource = "dbx" | "navicat" | "dbeaver" | "datagrip";
+
+// Temporary storage for DataGrip import payload (used to read Keychain passwords after import)
+let pendingDataGripPayload: { format: "datagrip-import"; dataSources: string; dataSourcesLocal?: string } | null = null;
 
 interface TreeClipboardTableStructure {
   kind: "table-structure";
@@ -124,6 +128,10 @@ export const useConnectionStore = defineStore("connection", () => {
   const completionColumnsCache = ref<Record<string, ColumnInfo[]>>({});
   const elasticsearchCompletionIndicesCache = ref<Record<string, string[]>>({});
   const schemaListCache = ref<Record<string, string[]>>({});
+  const completionTableIndex = new Map<string, { touched: number; tables: SqlCompletionTable[] }>();
+  const completionObjectIndex = new Map<string, { touched: number; objects: SqlCompletionObject[] }>();
+  const completionColumnIndex = new Map<string, { touched: number; columns: SqlCompletionColumn[] }>();
+  const completionInFlight = new Map<string, Promise<unknown>>();
   const transferSource = ref<{ connectionId: string; database: string } | null>(null);
   const schemaDiffSource = ref<{ connectionId: string; database: string; schema?: string } | null>(null);
   const dataCompareSource = ref<{
@@ -304,6 +312,7 @@ export const useConnectionStore = defineStore("connection", () => {
       transport_layers: Array.isArray(config.transport_layers) ? config.transport_layers : [],
       connect_timeout_secs: config.connect_timeout_secs || 5,
       query_timeout_secs: config.query_timeout_secs ?? 30,
+      idle_timeout_secs: config.idle_timeout_secs ?? 60,
     };
   }
 
@@ -423,11 +432,36 @@ export const useConnectionStore = defineStore("connection", () => {
     };
   }
 
-  function withSavedSqlRoot(connectionId: string, children: TreeNode[], existingConnectionNode?: TreeNode): TreeNode[] {
+  function buildUserAdminNode(connectionId: string, existingConnectionNode?: TreeNode): TreeNode | undefined {
+    const config = getConfig(connectionId);
+    if (!supportsDatabaseUserAdmin(effectiveDatabaseTypeForConnection(config))) return undefined;
+    const existing = existingConnectionNode?.children?.find((child) => child.type === "user-admin");
+    return {
+      id: `${connectionId}:__user_admin`,
+      label: "tree.userAdmin",
+      type: "user-admin",
+      connectionId,
+      database: "",
+      isExpanded: existing?.isExpanded ?? false,
+    };
+  }
+
+  function withConnectionUtilityNodes(
+    connectionId: string,
+    children: TreeNode[],
+    existingConnectionNode?: TreeNode,
+  ): TreeNode[] {
     const existingRoot = existingConnectionNode?.children?.find((child) => child.type === "saved-sql-root");
-    const nonSavedChildren = children.filter((child) => child.type !== "saved-sql-root");
+    const nonUtilityChildren = children.filter(
+      (child) => child.type !== "saved-sql-root" && child.type !== "user-admin",
+    );
+    const userAdminNode = buildUserAdminNode(connectionId, existingConnectionNode);
     const savedSqlRoot = buildSavedSqlRootNode(connectionId, existingRoot);
-    return savedSqlRoot ? [savedSqlRoot, ...nonSavedChildren] : nonSavedChildren;
+    return [savedSqlRoot, ...nonUtilityChildren, userAdminNode].filter(Boolean) as TreeNode[];
+  }
+
+  function withSavedSqlRoot(connectionId: string, children: TreeNode[], existingConnectionNode?: TreeNode): TreeNode[] {
+    return withConnectionUtilityNodes(connectionId, children, existingConnectionNode);
   }
 
   function refreshSavedSqlTree(connectionId?: string) {
@@ -436,7 +470,7 @@ export const useConnectionStore = defineStore("connection", () => {
         if (node.type === "connection" && node.connectionId && (!connectionId || node.connectionId === connectionId)) {
           node.children = withSavedSqlRoot(
             node.connectionId,
-            (node.children || []).filter((child) => child.type !== "saved-sql-root"),
+            (node.children || []).filter((child) => child.type !== "saved-sql-root" && child.type !== "user-admin"),
             node,
           );
         }
@@ -490,6 +524,14 @@ export const useConnectionStore = defineStore("connection", () => {
 
   function useCachedChildren(node: TreeNode, options?: LoadTreeOptions): boolean {
     if (options?.force || !loadedTreeNodeChildrenIds.value.has(node.id)) return false;
+    if (node.type === "connection" && node.connectionId) {
+      const normalizedChildren = sortSidebarTreeChildrenForParent(
+        node,
+        withSavedSqlRoot(node.connectionId, node.children || [], node),
+        getConfig(node.connectionId)?.db_type,
+      );
+      setChildren(node, normalizedChildren);
+    }
     node.isExpanded = true;
     return true;
   }
@@ -597,6 +639,18 @@ export const useConnectionStore = defineStore("connection", () => {
     }
     for (const key of Object.keys(elasticsearchCompletionIndicesCache.value)) {
       if (key === exactCacheKey || key.startsWith(cachePrefix)) delete elasticsearchCompletionIndicesCache.value[key];
+    }
+    for (const key of [...completionTableIndex.keys()]) {
+      if (key.startsWith(cachePrefix)) completionTableIndex.delete(key);
+    }
+    for (const key of [...completionObjectIndex.keys()]) {
+      if (key.startsWith(cachePrefix)) completionObjectIndex.delete(key);
+    }
+    for (const key of [...completionColumnIndex.keys()]) {
+      if (key.startsWith(cachePrefix)) completionColumnIndex.delete(key);
+    }
+    for (const key of [...completionInFlight.keys()]) {
+      if (key.startsWith(cachePrefix)) completionInFlight.delete(key);
     }
   }
 
@@ -725,19 +779,21 @@ export const useConnectionStore = defineStore("connection", () => {
       clearConnectionError(config.id);
       if (id !== config.id) clearConnectionError(id);
 
-      const node: TreeNode = {
-        id,
-        label: config.name,
-        type: "connection",
-        connectionId: id,
-        isExpanded: false,
-        children: [],
-      };
-      const existing = treeNodes.value.findIndex((n) => n.id === id);
-      if (existing >= 0) {
-        treeNodes.value[existing] = node;
+      const existing = findNode(treeNodes.value, id);
+      if (existing) {
+        existing.label = config.name;
+        existing.type = "connection";
+        existing.connectionId = id;
+        existing.children = existing.children || [];
       } else {
-        treeNodes.value.push(node);
+        treeNodes.value.push({
+          id,
+          label: config.name,
+          type: "connection",
+          connectionId: id,
+          isExpanded: false,
+          children: [],
+        });
       }
       return id;
     } catch (e) {
@@ -752,6 +808,7 @@ export const useConnectionStore = defineStore("connection", () => {
   async function disconnect(connectionId: string) {
     const shouldRemoveOneTimeConnection = getConfig(connectionId)?.one_time === true;
     await api.disconnectDb(connectionId);
+    clearConnectionError(connectionId);
     const { useQueryStore } = await import("@/stores/queryStore");
     const queryStore = useQueryStore();
     switch (settingsStore.editorSettings.disconnectTabHandlingMode) {
@@ -1557,6 +1614,7 @@ export const useConnectionStore = defineStore("connection", () => {
       node.type === "group-views" ||
       node.type === "group-procedures" ||
       node.type === "group-functions" ||
+      node.type === "group-sequences" ||
       node.type === "group-packages"
     ) {
       await loadObjectGroupChildren(node, options);
@@ -1639,14 +1697,185 @@ export const useConnectionStore = defineStore("connection", () => {
     }
   }
 
+  function completionScopeKey(connectionId: string, database: string, schema?: string): string {
+    return `${connectionId}:${database}:${schema ?? ""}`;
+  }
+
+  function completionColumnsKey(connectionId: string, database: string, table: string, schema?: string): string {
+    return `${completionScopeKey(connectionId, database, schema)}:${table.toLowerCase()}`;
+  }
+
+  function touchCompletionIndex<T>(
+    index: Map<string, { touched: number } & T>,
+    key: string,
+    value: T,
+    max = COMPLETION_CACHE_MAX,
+  ) {
+    index.set(key, { ...value, touched: Date.now() });
+    if (index.size <= max) return;
+    const oldest = [...index.entries()].sort(([, a], [, b]) => a.touched - b.touched).slice(0, index.size - max);
+    for (const [oldKey] of oldest) index.delete(oldKey);
+  }
+
+  function withCompletionInFlight<T>(key: string, load: () => Promise<T>): Promise<T> {
+    const existing = completionInFlight.get(key) as Promise<T> | undefined;
+    if (existing) return existing;
+    const promise = load().finally(() => {
+      if (completionInFlight.get(key) === promise) completionInFlight.delete(key);
+    });
+    completionInFlight.set(key, promise);
+    return promise;
+  }
+
+  function tableMatchScore(table: SqlCompletionTable, filter: string, preferredSchema?: string): number {
+    const text = table.name.toLowerCase();
+    const schema = table.schema?.toLowerCase();
+    const normalized = filter.trim().toLowerCase();
+    let score = schema && preferredSchema && schema === preferredSchema.toLowerCase() ? 10_000 : 0;
+    if (!normalized) return score;
+    if (text === normalized) return score + 9_000 - text.length;
+    if (text.startsWith(normalized)) return score + 7_000 - text.length;
+    if (text.includes(normalized)) return score + 4_000 - text.length;
+    let index = 0;
+    for (const ch of normalized) {
+      index = text.indexOf(ch, index);
+      if (index < 0) return -1;
+      index++;
+    }
+    return score + 1_000 - text.length;
+  }
+
+  function objectMatchScore(object: SqlCompletionObject, filter: string, preferredSchema?: string): number {
+    const tableLike: SqlCompletionTable = { name: object.name, schema: object.schema };
+    return tableMatchScore(tableLike, filter, preferredSchema);
+  }
+
+  function indexCompletionTables(
+    connectionId: string,
+    database: string,
+    schema: string | undefined,
+    tables: SqlCompletionTable[],
+  ) {
+    const groups = new Map<string, SqlCompletionTable[]>();
+    for (const table of tables) {
+      const tableSchema = table.schema ?? schema;
+      const key = completionScopeKey(connectionId, database, tableSchema);
+      const list = groups.get(key) ?? [];
+      list.push({ ...table, schema: tableSchema });
+      groups.set(key, list);
+    }
+    for (const [key, group] of groups) {
+      const previous = completionTableIndex.get(key)?.tables ?? [];
+      touchCompletionIndex(completionTableIndex, key, {
+        tables: dedupeCompletionTables([...previous, ...group]),
+      });
+    }
+  }
+
+  function indexCompletionObjects(
+    connectionId: string,
+    database: string,
+    schema: string | undefined,
+    objects: SqlCompletionObject[],
+  ) {
+    const groups = new Map<string, SqlCompletionObject[]>();
+    for (const object of objects) {
+      const objectSchema = object.schema ?? schema;
+      const key = completionScopeKey(connectionId, database, objectSchema);
+      const list = groups.get(key) ?? [];
+      list.push({ ...object, schema: objectSchema });
+      groups.set(key, list);
+    }
+    for (const [key, group] of groups) {
+      const previous = completionObjectIndex.get(key)?.objects ?? [];
+      touchCompletionIndex(completionObjectIndex, key, {
+        objects: dedupeCompletionObjects([...previous, ...group]),
+      });
+    }
+  }
+
+  function indexCompletionColumns(
+    connectionId: string,
+    database: string,
+    table: string,
+    schema: string | undefined,
+    columns: SqlCompletionColumn[],
+  ) {
+    touchCompletionIndex(completionColumnIndex, completionColumnsKey(connectionId, database, table, schema), {
+      columns,
+    });
+  }
+
+  function lookupLocalCompletionTables(
+    connectionId: string,
+    database: string,
+    filter = "",
+    limit?: number,
+    schema?: string,
+  ): SqlCompletionTable[] {
+    const allScopes = [...completionTableIndex.entries()]
+      .filter(([key]) => key.startsWith(`${connectionId}:${database}:`))
+      .map(([, entry]) => entry);
+    const preferred = schema ? completionTableIndex.get(completionScopeKey(connectionId, database, schema)) : undefined;
+    const scopes = preferred ? [preferred, ...allScopes.filter((entry) => entry !== preferred)] : allScopes;
+    const ranked = scopes
+      .flatMap((entry) => entry?.tables ?? [])
+      .map((table) => ({ table, score: tableMatchScore(table, filter, schema) }))
+      .filter((entry) => entry.score >= 0)
+      .sort((a, b) => b.score - a.score || a.table.name.localeCompare(b.table.name));
+    return dedupeCompletionTables(ranked.map((entry) => entry.table)).slice(0, limit ?? 200);
+  }
+
+  function lookupLocalCompletionObjects(
+    connectionId: string,
+    database: string,
+    filter = "",
+    limit?: number,
+    schema?: string,
+  ): SqlCompletionObject[] {
+    const allScopes = [...completionObjectIndex.entries()]
+      .filter(([key]) => key.startsWith(`${connectionId}:${database}:`))
+      .map(([, entry]) => entry);
+    const preferred = schema
+      ? completionObjectIndex.get(completionScopeKey(connectionId, database, schema))
+      : undefined;
+    const scopes = preferred ? [preferred, ...allScopes.filter((entry) => entry !== preferred)] : allScopes;
+    const ranked = scopes
+      .flatMap((entry) => entry?.objects ?? [])
+      .map((object) => ({ object, score: objectMatchScore(object, filter, schema) }))
+      .filter((entry) => entry.score >= 0)
+      .sort((a, b) => b.score - a.score || a.object.name.localeCompare(b.object.name));
+    return dedupeCompletionObjects(ranked.map((entry) => entry.object)).slice(0, limit ?? 200);
+  }
+
+  function lookupLocalCompletionSchemas(connectionId: string, database: string, filter = "", limit = 50): string[] {
+    const schemas = schemaListCache.value[`${connectionId}:${database}`] ?? [];
+    const normalized = filter.trim().toLowerCase();
+    return schemas
+      .filter((schema) => fuzzyTextMatch(schema, normalized))
+      .sort((a, b) => tableMatchScore({ name: b }, normalized) - tableMatchScore({ name: a }, normalized))
+      .slice(0, limit);
+  }
+
+  function lookupLocalCompletionColumns(
+    connectionId: string,
+    database: string,
+    table: string,
+    schema?: string,
+  ): SqlCompletionColumn[] {
+    return completionColumnIndex.get(completionColumnsKey(connectionId, database, table, schema))?.columns ?? [];
+  }
+
   async function listCompletionSchemas(connectionId: string, database: string): Promise<string[]> {
     const cacheKey = `${connectionId}:${database}`;
     if (schemaListCache.value[cacheKey]) {
       return schemaListCache.value[cacheKey];
     }
-    const schemas = await api.listSchemas(connectionId, database);
-    schemaListCache.value[cacheKey] = schemas;
-    return schemas;
+    return withCompletionInFlight(`${cacheKey}:schemas`, async () => {
+      const schemas = await api.listSchemas(connectionId, database);
+      schemaListCache.value[cacheKey] = schemas;
+      return schemas;
+    });
   }
 
   async function listElasticsearchCompletionIndices(connectionId: string, database: string): Promise<string[]> {
@@ -1675,46 +1904,21 @@ export const useConnectionStore = defineStore("connection", () => {
       return completionTablesCache.value[cacheKey];
     }
 
-    await ensureConnected(connectionId);
+    return withCompletionInFlight(`${cacheKey}:tables`, async () => {
+      await ensureConnected(connectionId);
 
-    if (isSchemaAwareDatabase(connectionId)) {
-      const schemas = schema ? [schema] : await listCompletionSchemas(connectionId, database);
-      if (normalizedFilter || limit) {
-        const batchSize = 5;
-        const results: SqlCompletionTable[] = [];
-        for (let i = 0; i < schemas.length && results.length < (limit ?? Infinity); i += batchSize) {
-          const batch = schemas.slice(i, i + batchSize);
-          const batchResults = await Promise.all(
-            batch.map(async (s) => {
-              try {
-                const tables = await api.listTables(connectionId, database, s, normalizedFilter, limit);
-                return tables.map((table) => ({
-                  name: table.name,
-                  schema: s,
-                  type: table.table_type === "VIEW" ? ("view" as const) : ("table" as const),
-                })) as SqlCompletionTable[];
-              } catch {
-                return [] as SqlCompletionTable[];
-              }
-            }),
-          );
-          for (const group of batchResults) {
-            results.push(...group);
-          }
-        }
-        if (results.length === 0 && relaxedFilter) {
-          for (let i = 0; i < schemas.length && results.length < (limit ?? Infinity); i += batchSize) {
+      if (isSchemaAwareDatabase(connectionId)) {
+        const schemas = schema ? [schema] : await listCompletionSchemas(connectionId, database);
+        if (normalizedFilter || limit) {
+          const batchSize = 5;
+          const results: SqlCompletionTable[] = [];
+          const maxResults = limit ?? Infinity;
+          for (let i = 0; i < schemas.length && results.length < maxResults; i += batchSize) {
             const batch = schemas.slice(i, i + batchSize);
             const batchResults = await Promise.all(
               batch.map(async (s) => {
                 try {
-                  const tables = await api.listTables(
-                    connectionId,
-                    database,
-                    s,
-                    relaxedFilter,
-                    expandedCompletionLimit(limit),
-                  );
+                  const tables = await api.listTables(connectionId, database, s, normalizedFilter, limit);
                   return tables.map((table) => ({
                     name: table.name,
                     schema: s,
@@ -1727,46 +1931,80 @@ export const useConnectionStore = defineStore("connection", () => {
             );
             for (const group of batchResults) {
               results.push(...group);
+              indexCompletionTables(connectionId, database, undefined, group);
             }
           }
+          if (results.length === 0 && relaxedFilter) {
+            for (let i = 0; i < schemas.length && results.length < maxResults; i += batchSize) {
+              const batch = schemas.slice(i, i + batchSize);
+              const batchResults = await Promise.all(
+                batch.map(async (s) => {
+                  try {
+                    const tables = await api.listTables(
+                      connectionId,
+                      database,
+                      s,
+                      relaxedFilter,
+                      expandedCompletionLimit(limit),
+                    );
+                    return tables.map((table) => ({
+                      name: table.name,
+                      schema: s,
+                      type: table.table_type === "VIEW" ? ("view" as const) : ("table" as const),
+                    })) as SqlCompletionTable[];
+                  } catch {
+                    return [] as SqlCompletionTable[];
+                  }
+                }),
+              );
+              for (const group of batchResults) {
+                results.push(...group);
+                indexCompletionTables(connectionId, database, undefined, group);
+              }
+            }
+          }
+          const limitedTables = limit ? dedupeCompletionTables(results).slice(0, limit) : results;
+          completionTablesCache.value[cacheKey] = limitedTables;
+          indexCompletionTables(connectionId, database, schema, limitedTables);
+          evictOldestCacheEntries(completionTablesCache.value, COMPLETION_CACHE_MAX);
+          return completionTablesCache.value[cacheKey];
         }
-        const limitedTables = limit
-          ? dedupeCompletionTables(results).slice(0, expandedCompletionLimit(limit))
-          : results;
-        completionTablesCache.value[cacheKey] = limitedTables;
+
+        const tableGroups = await Promise.all(
+          schemas.map(async (schema) => {
+            try {
+              const tables = await api.listTables(connectionId, database, schema);
+              return tables.map((table) => ({
+                name: table.name,
+                schema,
+                type: table.table_type === "VIEW" ? ("view" as const) : ("table" as const),
+              }));
+            } catch {
+              return [];
+            }
+          }),
+        );
+        completionTablesCache.value[cacheKey] = tableGroups.flat();
+        indexCompletionTables(connectionId, database, schema, completionTablesCache.value[cacheKey]);
         evictOldestCacheEntries(completionTablesCache.value, COMPLETION_CACHE_MAX);
         return completionTablesCache.value[cacheKey];
       }
 
-      const tableGroups = await Promise.all(
-        schemas.map(async (schema) => {
-          try {
-            const tables = await api.listTables(connectionId, database, schema);
-            return tables.map((table) => ({
-              name: table.name,
-              schema,
-              type: table.table_type === "VIEW" ? ("view" as const) : ("table" as const),
-            }));
-          } catch {
-            return [];
-          }
-        }),
-      );
-      completionTablesCache.value[cacheKey] = tableGroups.flat();
+      let tables = await api.listTables(connectionId, database, database, normalizedFilter, limit);
+      if (tables.length === 0 && relaxedFilter) {
+        tables = await api.listTables(connectionId, database, database, relaxedFilter, expandedCompletionLimit(limit));
+      }
+      completionTablesCache.value[cacheKey] = tables.map((table) => ({
+        name: table.name,
+        type: table.table_type === "VIEW" ? ("view" as const) : ("table" as const),
+      }));
+      completionTablesCache.value[cacheKey] = limit
+        ? completionTablesCache.value[cacheKey].slice(0, limit)
+        : completionTablesCache.value[cacheKey];
+      indexCompletionTables(connectionId, database, schema, completionTablesCache.value[cacheKey]);
       evictOldestCacheEntries(completionTablesCache.value, COMPLETION_CACHE_MAX);
       return completionTablesCache.value[cacheKey];
-    }
-
-    let tables = await api.listTables(connectionId, database, database, normalizedFilter, limit);
-    if (tables.length === 0 && relaxedFilter) {
-      tables = await api.listTables(connectionId, database, database, relaxedFilter, expandedCompletionLimit(limit));
-    }
-    completionTablesCache.value[cacheKey] = tables.map((table) => ({
-      name: table.name,
-      type: table.table_type === "VIEW" ? ("view" as const) : ("table" as const),
-    }));
-    evictOldestCacheEntries(completionTablesCache.value, COMPLETION_CACHE_MAX);
-    return completionTablesCache.value[cacheKey];
+    });
   }
 
   function relaxedCompletionTableFilter(filter: string): string | undefined {
@@ -1801,21 +2039,24 @@ export const useConnectionStore = defineStore("connection", () => {
     const normalizedFilter = filter.trim().toLowerCase();
     const cacheKey = `${connectionId}:${database}:${schema ?? ""}`;
     if (!completionObjectsCache.value[cacheKey]) {
-      await ensureConnected(connectionId);
-      const objects = isSchemaAwareDatabase(connectionId)
-        ? await listSchemaAwareCompletionObjects(connectionId, database, schema)
-        : await api.listCompletionObjects(connectionId, database, schema || database);
-      completionObjectsCache.value[cacheKey] = dedupeCompletionObjects(
-        objects.map(toSqlCompletionObject).filter((object): object is SqlCompletionObject => object != null),
-      );
-      evictOldestCacheEntries(completionObjectsCache.value, COMPLETION_CACHE_MAX);
+      await withCompletionInFlight(`${cacheKey}:objects`, async () => {
+        await ensureConnected(connectionId);
+        const objects = isSchemaAwareDatabase(connectionId)
+          ? await listSchemaAwareCompletionObjects(connectionId, database, schema)
+          : await api.listCompletionObjects(connectionId, database, schema || database);
+        completionObjectsCache.value[cacheKey] = dedupeCompletionObjects(
+          objects.map(toSqlCompletionObject).filter((object): object is SqlCompletionObject => object != null),
+        );
+        indexCompletionObjects(connectionId, database, schema, completionObjectsCache.value[cacheKey]);
+        evictOldestCacheEntries(completionObjectsCache.value, COMPLETION_CACHE_MAX);
+      });
     }
 
     const objects = completionObjectsCache.value[cacheKey];
     const filtered = normalizedFilter
       ? objects.filter((object) => fuzzyCompletionObjectMatch(object, normalizedFilter))
       : objects;
-    return typeof limit === "number" ? filtered.slice(0, expandedCompletionLimit(limit)) : filtered;
+    return typeof limit === "number" ? filtered.slice(0, limit) : filtered;
   }
 
   async function listSchemaAwareCompletionObjects(
@@ -1905,13 +2146,15 @@ export const useConnectionStore = defineStore("connection", () => {
     }
     const cacheKey = `${connectionId}:${database}:${schema || ""}:${table}`;
     if (!completionColumnsCache.value[cacheKey]) {
-      await ensureConnected(connectionId);
-      const querySchema = metadataQuerySchema(connectionId, database, schema);
-      completionColumnsCache.value[cacheKey] = await api.getColumns(connectionId, database, querySchema, table);
-      evictOldestCacheEntries(completionColumnsCache.value, COMPLETION_CACHE_MAX);
+      await withCompletionInFlight(`${cacheKey}:columns`, async () => {
+        await ensureConnected(connectionId);
+        const querySchema = metadataQuerySchema(connectionId, database, schema);
+        completionColumnsCache.value[cacheKey] = await api.getColumns(connectionId, database, querySchema, table);
+        evictOldestCacheEntries(completionColumnsCache.value, COMPLETION_CACHE_MAX);
+      });
     }
 
-    return completionColumnsCache.value[cacheKey].map((column) => ({
+    const columns = completionColumnsCache.value[cacheKey].map((column) => ({
       name: column.name,
       table,
       schema,
@@ -1919,6 +2162,41 @@ export const useConnectionStore = defineStore("connection", () => {
       isNullable: column.is_nullable,
       comment: column.comment,
     }));
+    indexCompletionColumns(connectionId, database, table, schema, columns);
+    return columns;
+  }
+
+  function refreshCompletionTables(
+    connectionId: string,
+    database: string,
+    filter = "",
+    limit?: number,
+    schema?: string,
+  ): Promise<SqlCompletionTable[]> {
+    return listCompletionTables(connectionId, database, filter, limit, schema);
+  }
+
+  function refreshCompletionObjects(
+    connectionId: string,
+    database: string,
+    filter = "",
+    limit?: number,
+    schema?: string,
+  ): Promise<SqlCompletionObject[]> {
+    return listCompletionObjects(connectionId, database, filter, limit, schema);
+  }
+
+  function refreshCompletionSchemas(connectionId: string, database: string): Promise<string[]> {
+    return listCompletionSchemas(connectionId, database);
+  }
+
+  function refreshCompletionColumns(
+    connectionId: string,
+    database: string,
+    table: string,
+    schema?: string,
+  ): Promise<SqlCompletionColumn[]> {
+    return listCompletionColumns(connectionId, database, table, schema);
   }
 
   function findNode(nodes: TreeNode[], id: string): TreeNode | null {
@@ -2098,8 +2376,60 @@ export const useConnectionStore = defineStore("connection", () => {
     };
   }
 
+  async function readDataGripImportFile(): Promise<{ content: string; encrypted: boolean } | null> {
+    let dataSources: string;
+    let dataSourcesLocal = "";
+
+    if (isTauriRuntime()) {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const { readTextFile } = await import("@tauri-apps/plugin-fs");
+      const path = await open({
+        filters: [{ name: "DataGrip dataSources.xml", extensions: ["xml"] }],
+        multiple: false,
+      });
+      if (!path) return null;
+      dataSources = await readTextFile(path as string);
+      // Auto-load dataSources.local.xml from the same directory
+      const dir = (path as string).replace(/[^/\\]*$/, "");
+      try {
+        dataSourcesLocal = await readTextFile(dir + "dataSources.local.xml");
+      } catch {
+        dataSourcesLocal = "";
+      }
+    } else {
+      const files = await new Promise<FileList>((resolve, reject) => {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = ".xml";
+        input.multiple = true;
+        input.onchange = () => {
+          if (!input.files?.length) {
+            reject(new Error("No file selected"));
+            return;
+          }
+          resolve(input.files);
+        };
+        input.click();
+      });
+      const fileList = Array.from(files);
+      const dsFile = fileList.find((f) => /^dataSources\.xml$/i.test(f.name)) || fileList[0];
+      const localFile = fileList.find((f) => /^dataSources\.local\.xml$/i.test(f.name));
+      if (!dsFile) throw new Error("Select dataSources.xml");
+      dataSources = await dsFile.text();
+      if (localFile) {
+        dataSourcesLocal = await localFile.text();
+      }
+    }
+
+    return {
+      content: JSON.stringify({ format: "datagrip-import", dataSources, dataSourcesLocal }),
+      encrypted: false,
+    };
+  }
+
   async function readImportFile(source: ImportSource = "dbx"): Promise<{ content: string; encrypted: boolean } | null> {
     if (source === "dbeaver") return readDbeaverImportFile();
+    if (source === "datagrip") return readDataGripImportFile();
 
     let content: string;
 
@@ -2156,7 +2486,16 @@ export const useConnectionStore = defineStore("connection", () => {
       imported = await parseNavicatConnections(content);
     } else if (!passphrase) {
       const { isDbeaverImportPayload, parseDbeaverConnections } = await import("@/lib/dbeaverImport");
-      if (isDbeaverImportPayload(content)) {
+      const { isDataGripImportPayload, parseDataGripConnections } = await import("@/lib/datagripImport");
+      if (isDataGripImportPayload(content)) {
+        const payload = JSON.parse(content) as {
+          format: "datagrip-import";
+          dataSources: string;
+          dataSourcesLocal?: string;
+        };
+        pendingDataGripPayload = payload;
+        imported = parseDataGripConnections(payload);
+      } else if (isDbeaverImportPayload(content)) {
         imported = await parseDbeaverConnections(content);
       } else {
         const parsed = JSON.parse(content);
@@ -2207,6 +2546,61 @@ export const useConnectionStore = defineStore("connection", () => {
       }
     }
     return { count, layout: importedLayout };
+  }
+
+  /** Read macOS Keychain passwords for DataGrip connections and update them. */
+  async function applyDataGripKeychainPasswords(): Promise<number> {
+    const payload = pendingDataGripPayload;
+    pendingDataGripPayload = null;
+    if (!payload) return 0;
+
+    try {
+      const { getDataGripUuidMap, datagripKeychainService } = await import("@/lib/datagripImport");
+      // dedupKey → DataGrip UUID
+      const uuidMap = getDataGripUuidMap(payload);
+      if (uuidMap.size === 0) return 0;
+
+      // Build service names for batch Keychain read
+      const dedupKeyToService = new Map<string, string>();
+      const services: string[] = [];
+      for (const [dedupKey, dgUuid] of uuidMap) {
+        const service = datagripKeychainService(dgUuid);
+        dedupKeyToService.set(dedupKey, service);
+        services.push(service);
+      }
+
+      // Call Tauri command to read Keychain
+      const results: [string, string][] = await api.readKeychainPasswords(services);
+
+      // Build service → password map
+      const passwordByService = new Map<string, string>();
+      for (const [service, password] of results) {
+        if (password) passwordByService.set(service, password);
+      }
+
+      // Update connections that have passwords (match by name/host/port)
+      let filled = 0;
+      const updated = connections.value.map((conn) => {
+        const dedupKey = [conn.name, conn.host, conn.port, conn.database || ""].join("\u0000");
+        const service = dedupKeyToService.get(dedupKey);
+        if (!service) return conn;
+        const password = passwordByService.get(service);
+        if (password) {
+          filled++;
+          return { ...conn, password };
+        }
+        return conn;
+      });
+
+      if (filled > 0) {
+        connections.value = updated;
+        await persistConnections();
+      }
+      return filled;
+    } catch (e) {
+      console.warn("[DataGrip Import] Keychain read failed:", e);
+      return 0;
+    }
   }
 
   function applySidebarLayout(layout: SidebarLayout) {
@@ -2310,10 +2704,19 @@ export const useConnectionStore = defineStore("connection", () => {
     listCompletionObjects,
     listCompletionColumns,
     listCompletionSchemas,
+    lookupLocalCompletionTables,
+    lookupLocalCompletionObjects,
+    lookupLocalCompletionColumns,
+    lookupLocalCompletionSchemas,
+    refreshCompletionTables,
+    refreshCompletionObjects,
+    refreshCompletionColumns,
+    refreshCompletionSchemas,
     listElasticsearchCompletionIndices,
     exportConnectionsToFile,
     readImportFile,
     importConnectionsFromFile,
+    applyDataGripKeychainPasswords,
     applySidebarLayout,
     transferSource,
     schemaDiffSource,

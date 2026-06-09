@@ -15,6 +15,8 @@ import {
   Loader2,
   Pencil,
   WrapText,
+  IndentIncrease,
+  IndentDecrease,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -78,6 +80,9 @@ const isResizingMemberSheet = ref(false);
 const hashTableRef = ref<HTMLElement | null>(null);
 const hashFieldWidth = ref(280);
 const isResizingHashColumns = ref(false);
+const zsetTableRef = ref<HTMLElement | null>(null);
+const zsetScoreWidth = ref(220);
+const isResizingZsetColumns = ref(false);
 type RedisValueView = "json" | "raw";
 const REDIS_JSON_WRAP_STORAGE_KEY = "dbx-redis-json-word-wrap";
 const stringValueView = ref<RedisValueView>("raw");
@@ -96,6 +101,9 @@ const memberRawJsonHtml = computed(() =>
 );
 const hashGridStyle = computed(() => ({
   gridTemplateColumns: `${hashFieldWidth.value}px minmax(12rem, 1fr) 84px`,
+}));
+const zsetGridStyle = computed(() => ({
+  gridTemplateColumns: `${zsetScoreWidth.value}px minmax(0, 1fr) 84px`,
 }));
 const selectedMemberCanEdit = computed(
   () => selectedMemberContext.value != null && canEditRedisMemberDetail(selectedMemberContext.value.kind),
@@ -116,6 +124,8 @@ let memberSheetResizeStartX = 0;
 let memberSheetResizeStartWidth = 0;
 let hashResizeStartX = 0;
 let hashResizeStartWidth = 0;
+let zsetResizeStartX = 0;
+let zsetResizeStartWidth = 0;
 
 type RedisMemberContext =
   | { kind: "list"; index: number }
@@ -278,6 +288,64 @@ async function saveString() {
 function handleStringInput() {
   if (!isBinaryStringValue.value) {
     isEditing.value = true;
+  }
+}
+
+function formatJsonText(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw);
+    return JSON.stringify(parsed, null, 2);
+  } catch {
+    return null;
+  }
+}
+
+function compressJsonText(raw: string): string | null {
+  try {
+    const parsed = JSON.parse(raw);
+    return JSON.stringify(parsed);
+  } catch {
+    return null;
+  }
+}
+
+function handleFormatStringJson() {
+  const result = formatJsonText(editValue.value);
+  if (result != null) {
+    editValue.value = result;
+    isEditing.value = true;
+  } else {
+    toast(t("redis.jsonFormatError"), 3000);
+  }
+}
+
+function handleCompressStringJson() {
+  const result = compressJsonText(editValue.value);
+  if (result != null) {
+    editValue.value = result;
+    isEditing.value = true;
+  } else {
+    toast(t("redis.jsonFormatError"), 3000);
+  }
+}
+
+function handleFormatMemberJson() {
+  const result = formatJsonText(memberEditValue.value);
+  if (result != null) {
+    memberEditValue.value = result;
+    isEditingMember.value = true;
+  } else {
+    toast(t("redis.jsonFormatError"), 3000);
+  }
+}
+
+function handleCompressMemberJson() {
+  const result = compressJsonText(memberEditValue.value);
+  if (result != null) {
+    memberEditValue.value = result;
+    isEditingMember.value = true;
+  } else {
+    toast(t("redis.jsonFormatError"), 3000);
   }
 }
 
@@ -489,6 +557,33 @@ function startResizeHashColumns(event: PointerEvent) {
   hashResizeStartWidth = hashFieldWidth.value;
   window.addEventListener("pointermove", resizeHashColumns);
   window.addEventListener("pointerup", stopResizeHashColumns);
+}
+
+function clampZsetScoreWidth(width: number) {
+  const containerWidth = zsetTableRef.value?.clientWidth ?? 900;
+  const min = 120;
+  const max = Math.max(min, containerWidth - 220);
+  return Math.min(max, Math.max(min, width));
+}
+
+function stopResizeZsetColumns() {
+  isResizingZsetColumns.value = false;
+  window.removeEventListener("pointermove", resizeZsetColumns);
+  window.removeEventListener("pointerup", stopResizeZsetColumns);
+}
+
+function resizeZsetColumns(event: PointerEvent) {
+  if (!isResizingZsetColumns.value) return;
+  const delta = event.clientX - zsetResizeStartX;
+  zsetScoreWidth.value = clampZsetScoreWidth(zsetResizeStartWidth + delta);
+}
+
+function startResizeZsetColumns(event: PointerEvent) {
+  isResizingZsetColumns.value = true;
+  zsetResizeStartX = event.clientX;
+  zsetResizeStartWidth = zsetScoreWidth.value;
+  window.addEventListener("pointermove", resizeZsetColumns);
+  window.addEventListener("pointerup", stopResizeZsetColumns);
 }
 
 function startEditMember() {
@@ -717,6 +812,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   stopResizeMemberSheet();
   stopResizeHashColumns();
+  stopResizeZsetColumns();
 });
 </script>
 
@@ -813,6 +909,26 @@ onBeforeUnmount(() => {
             </Button>
           </div>
           <span class="flex-1" />
+          <Button
+            v-if="stringValueView === 'raw'"
+            variant="ghost"
+            size="sm"
+            class="h-6 rounded-[5px] px-2 text-xs"
+            :title="t('redis.formatJson')"
+            @click="handleFormatStringJson"
+          >
+            <IndentIncrease class="h-3.5 w-3.5" />
+          </Button>
+          <Button
+            v-if="stringValueView === 'raw'"
+            variant="ghost"
+            size="sm"
+            class="h-6 rounded-[5px] px-2 text-xs"
+            :title="t('redis.compressJson')"
+            @click="handleCompressStringJson"
+          >
+            <IndentDecrease class="h-3.5 w-3.5" />
+          </Button>
           <label class="flex items-center gap-1.5 text-muted-foreground">
             <WrapText class="h-3.5 w-3.5" />
             {{ t("redis.wordWrap") }}
@@ -1090,7 +1206,7 @@ onBeforeUnmount(() => {
       </div>
 
       <!-- Sorted Set -->
-      <div v-else-if="data.key_type === 'zset'" class="flex-1 flex flex-col overflow-hidden">
+      <div v-else-if="data.key_type === 'zset'" ref="zsetTableRef" class="flex-1 flex flex-col overflow-hidden">
         <div class="flex items-center gap-2 px-4 py-1.5 border-b shrink-0">
           <span class="text-xs text-muted-foreground">{{
             collectionCountLabel("members", collectionItems.length, data.total)
@@ -1102,9 +1218,15 @@ onBeforeUnmount(() => {
             ><Plus class="w-3 h-3 mr-1" />Add</Button
           >
         </div>
-        <div class="grid grid-cols-[100px_1fr_84px] border-b bg-muted/50 shrink-0">
-          <div class="px-3 py-1 text-xs font-medium text-muted-foreground border-r">Score</div>
-          <div class="px-3 py-1 text-xs font-medium text-muted-foreground">Member</div>
+        <div class="grid border-b bg-muted/50 shrink-0" :style="zsetGridStyle">
+          <div class="relative px-3 py-1 text-xs font-medium text-muted-foreground border-r select-none">
+            Score
+            <div
+              class="absolute -right-1 top-0 h-full w-2 cursor-col-resize touch-none"
+              @pointerdown.prevent="startResizeZsetColumns"
+            />
+          </div>
+          <div class="px-3 py-1 text-xs font-medium text-muted-foreground min-w-0">Member</div>
           <div />
         </div>
         <RecycleScroller
@@ -1118,9 +1240,9 @@ onBeforeUnmount(() => {
           <template #default="{ item: row }">
             <div
               data-redis-value-row
-              class="dbx-editor-font-family grid grid-cols-[100px_1fr_84px] border-b text-sm hover:bg-accent/50 group cursor-pointer"
+              class="dbx-editor-font-family grid border-b text-sm hover:bg-accent/50 group cursor-pointer"
               :class="{ 'bg-accent/60': isSelectedMember(String(row.value.score), row.value.member) }"
-              :style="{ height: `${REDIS_COLLECTION_ROW_HEIGHT}px` }"
+              :style="{ ...zsetGridStyle, height: `${REDIS_COLLECTION_ROW_HEIGHT}px` }"
               @click="
                 viewMember(String(row.value.score), row.value.member, {
                   kind: 'zset',
@@ -1129,8 +1251,15 @@ onBeforeUnmount(() => {
                 })
               "
             >
-              <div class="px-3 py-1.5 text-muted-foreground text-xs border-r">{{ row.value.score }}</div>
-              <div class="px-3 py-1.5 truncate">{{ row.value.member }}</div>
+              <div
+                class="px-3 py-1.5 text-muted-foreground text-xs border-r min-w-0 truncate"
+                :title="String(row.value.score)"
+              >
+                {{ row.value.score }}
+              </div>
+              <div class="px-3 py-1.5 min-w-0 truncate" :title="String(row.value.member)">
+                {{ row.value.member }}
+              </div>
               <div class="flex items-center justify-center gap-1">
                 <Button
                   variant="ghost"
@@ -1264,12 +1393,34 @@ onBeforeUnmount(() => {
             <Badge variant="outline" class="shrink-0 text-xs">{{ selectedMemberDetail.format.toUpperCase() }}</Badge>
           </SheetTitle>
         </SheetHeader>
-        <textarea
-          v-if="isEditingMember"
-          v-model="memberEditValue"
-          class="dbx-editor-font-family min-h-0 flex-1 resize-none bg-background p-5 text-[13px] leading-6 outline-none"
-          spellcheck="false"
-        />
+        <template v-if="isEditingMember">
+          <div v-if="selectedMemberJsonDetail" class="flex h-9 items-center gap-2 border-b px-5 text-xs shrink-0">
+            <span class="flex-1" />
+            <Button
+              variant="ghost"
+              size="sm"
+              class="h-6 rounded-[5px] px-2 text-xs"
+              :title="t('redis.formatJson')"
+              @click="handleFormatMemberJson"
+            >
+              <IndentIncrease class="h-3.5 w-3.5" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              class="h-6 rounded-[5px] px-2 text-xs"
+              :title="t('redis.compressJson')"
+              @click="handleCompressMemberJson"
+            >
+              <IndentDecrease class="h-3.5 w-3.5" />
+            </Button>
+          </div>
+          <textarea
+            v-model="memberEditValue"
+            class="dbx-editor-font-family min-h-0 flex-1 resize-none bg-background p-5 text-[13px] leading-6 outline-none"
+            spellcheck="false"
+          />
+        </template>
         <template v-else-if="selectedMemberJsonDetail">
           <div class="flex h-9 items-center gap-2 border-b px-5 text-xs">
             <div class="flex overflow-hidden rounded-md border bg-muted/20 p-0.5">
@@ -1295,6 +1446,26 @@ onBeforeUnmount(() => {
               </Button>
             </div>
             <span class="flex-1" />
+            <Button
+              v-if="memberValueView === 'raw'"
+              variant="ghost"
+              size="sm"
+              class="h-6 rounded-[5px] px-2 text-xs"
+              :title="t('redis.formatJson')"
+              @click="handleFormatMemberJson"
+            >
+              <IndentIncrease class="h-3.5 w-3.5" />
+            </Button>
+            <Button
+              v-if="memberValueView === 'raw'"
+              variant="ghost"
+              size="sm"
+              class="h-6 rounded-[5px] px-2 text-xs"
+              :title="t('redis.compressJson')"
+              @click="handleCompressMemberJson"
+            >
+              <IndentDecrease class="h-3.5 w-3.5" />
+            </Button>
             <label class="flex items-center gap-1.5 text-muted-foreground">
               <WrapText class="h-3.5 w-3.5" />
               {{ t("redis.wordWrap") }}

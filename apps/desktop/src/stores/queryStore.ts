@@ -357,6 +357,31 @@ export const useQueryStore = defineStore("query", () => {
     return id;
   }
 
+  function openUserAdmin(connectionId: string) {
+    const existing = tabs.value.find((tab) => tab.mode === "users" && tab.connectionId === connectionId);
+    if (existing) {
+      activeTabId.value = existing.id;
+      return existing.id;
+    }
+
+    const conn = useConnectionStore().getConfig(connectionId);
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: t("userAdmin.title"),
+      connectionId,
+      database: conn?.database || "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "users",
+    };
+    tabs.value.push(tab);
+    activeTabId.value = id;
+    return id;
+  }
+
   function openTableStructure(connectionId: string, database: string, schema?: string, tableName?: string) {
     const resolvedTableName = tableName || "";
     if (resolvedTableName) {
@@ -498,6 +523,18 @@ export const useQueryStore = defineStore("query", () => {
     }
   }
 
+  function updateEditorViewport(id: string, viewport: { scrollTop: number; scrollLeft: number }) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab) return;
+    tab.editorViewport = viewport;
+  }
+
+  function updateEditorSelection(id: string, selection: { anchor: number; head: number }) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab) return;
+    tab.editorSelection = selection;
+  }
+
   function renameTab(id: string, title: string) {
     const trimmed = title.trim();
     if (!trimmed) return false;
@@ -615,6 +652,7 @@ export const useQueryStore = defineStore("query", () => {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab) return;
     tab.isExecuting = isExecuting;
+    tab.queryExecutionStartedAt = isExecuting ? Date.now() : undefined;
     if (!isExecuting) {
       tab.isCancelling = false;
       tab.executionId = undefined;
@@ -649,6 +687,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.resultSessionId = undefined;
     tab.isExecuting = false;
     tab.isCancelling = false;
+    tab.queryExecutionStartedAt = undefined;
     tab.executionId = undefined;
   }
 
@@ -931,6 +970,7 @@ export const useQueryStore = defineStore("query", () => {
     const elapsed = () => `${Math.round(performance.now() - startedAt)}ms`;
     tab.isExecuting = true;
     tab.isCancelling = false;
+    tab.queryExecutionStartedAt = Date.now();
     tab.executionId = executionId;
     tab.lastExecutedSql = sql;
     if (!options?.preserveTotalRowCountDuringExecution) {
@@ -1245,6 +1285,20 @@ export const useQueryStore = defineStore("query", () => {
           current.resultTotalRowCount = undefined;
         }
         current.resultTotalRowCountLoading = current.mode === "query" && !!current.result && !!countSql;
+        // Server-side pagination without a countSql: the backend (currently
+        // the Elasticsearch driver) already reports the true match total via
+        // affected_rows. Use it directly so the result-grid can compute the
+        // page count without issuing a separate COUNT query.
+        if (
+          current.result &&
+          current.mode === "query" &&
+          typeof pageLimit === "number" &&
+          !countSql &&
+          typeof current.result.affected_rows === "number"
+        ) {
+          current.resultTotalRowCount = current.result.affected_rows;
+          current.resultTotalRowCountLoading = false;
+        }
         touchResult(current);
         if (current.mode === "query" && current.result) {
           countQueryTotalRowsInBackground({
@@ -1306,6 +1360,7 @@ export const useQueryStore = defineStore("query", () => {
       if (current?.executionId === executionId) {
         current.isExecuting = false;
         current.isCancelling = false;
+        current.queryExecutionStartedAt = undefined;
         current.executionId = undefined;
         console.info("[DBX][executeTabSql:finish]", { traceId, elapsed: elapsed() });
       } else {
@@ -1473,6 +1528,7 @@ export const useQueryStore = defineStore("query", () => {
       stuck.forEach((tab) => {
         tab.isExecuting = false;
         tab.isCancelling = false;
+        tab.queryExecutionStartedAt = undefined;
         tab.executionId = undefined;
         tab.result = toErrorResult(new Error(t("editor.connectionMayBeLost")));
       });
@@ -1702,8 +1758,11 @@ export const useQueryStore = defineStore("query", () => {
     releaseConnectionTabs,
     releaseDatabaseTabs,
     updateSql,
+    updateEditorViewport,
+    updateEditorSelection,
     renameTab,
     openObjectBrowser,
+    openUserAdmin,
     openTableStructure,
     linkSavedSql,
     openSavedSql,

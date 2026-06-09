@@ -1,5 +1,5 @@
 use chrono::{DateTime, Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use duckdb::types::{TimeUnit, ValueRef};
+use duckdb::types::{TimeUnit, Value, ValueRef};
 use mysql_async::prelude::Queryable;
 use std::future::Future;
 use std::time::Duration;
@@ -14,6 +14,11 @@ use crate::sql::{split_sql_batches, split_sql_statements, starts_with_duckdb_res
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_ROWS: usize = 10000;
 pub const QUERY_CANCELED: &str = "Query canceled";
+
+async fn connection_is_mongodb(state: &AppState, connection_id: &str) -> bool {
+    let configs = state.configs.read().await;
+    configs.get(connection_id).is_some_and(|config| config.db_type == DatabaseType::MongoDb)
+}
 
 async fn connection_database_type(state: &AppState, connection_id: &str) -> Option<DatabaseType> {
     let configs = state.configs.read().await;
@@ -109,7 +114,70 @@ fn duckdb_value_to_json(row: &duckdb::Row<'_>, idx: usize) -> serde_json::Value 
         ValueRef::Interval { months, days, nanos } => {
             serde_json::Value::String(duckdb_interval_to_string(months, days, nanos))
         }
-        _ => row.get::<_, String>(idx).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null),
+        ValueRef::List(..)
+        | ValueRef::Array(..)
+        | ValueRef::Struct(..)
+        | ValueRef::Map(..)
+        | ValueRef::Enum(..)
+        | ValueRef::Union(..) => duckdb_owned_value_to_json(&value_ref.to_owned()),
+    }
+}
+
+fn duckdb_owned_value_to_json(value: &Value) -> serde_json::Value {
+    match value {
+        Value::Null => serde_json::Value::Null,
+        Value::Boolean(b) => serde_json::Value::Bool(*b),
+        Value::TinyInt(i) => serde_json::Value::Number((*i as i64).into()),
+        Value::SmallInt(i) => serde_json::Value::Number((*i as i64).into()),
+        Value::Int(i) => serde_json::Value::Number((*i as i64).into()),
+        Value::BigInt(i) => serde_json::Value::Number((*i).into()),
+        Value::HugeInt(i) => serde_json::Value::String(i.to_string()),
+        Value::UTinyInt(i) => serde_json::Value::Number((*i as u64).into()),
+        Value::USmallInt(i) => serde_json::Value::Number((*i as u64).into()),
+        Value::UInt(i) => serde_json::Value::Number((*i as u64).into()),
+        Value::UBigInt(i) => serde_json::Value::Number((*i).into()),
+        Value::Float(f) => {
+            serde_json::Number::from_f64(*f as f64).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+        }
+        Value::Double(f) => {
+            serde_json::Number::from_f64(*f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null)
+        }
+        Value::Decimal(d) => serde_json::Value::String(d.to_string()),
+        Value::Timestamp(unit, value) => {
+            duckdb_timestamp_to_string(*unit, *value).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null)
+        }
+        Value::Text(text) | Value::Enum(text) => serde_json::Value::String(text.clone()),
+        Value::Blob(bytes) => {
+            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            serde_json::Value::String(format!("\\x{hex}"))
+        }
+        Value::Date32(days) => {
+            duckdb_date32_to_string(*days).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null)
+        }
+        Value::Time64(unit, value) => {
+            duckdb_time64_to_string(*unit, *value).map(serde_json::Value::String).unwrap_or(serde_json::Value::Null)
+        }
+        Value::Interval { months, days, nanos } => {
+            serde_json::Value::String(duckdb_interval_to_string(*months, *days, *nanos))
+        }
+        Value::List(values) | Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(duckdb_owned_value_to_json).collect())
+        }
+        Value::Struct(entries) => serde_json::Value::Object(
+            entries.iter().map(|(key, value)| (key.clone(), duckdb_owned_value_to_json(value))).collect(),
+        ),
+        Value::Map(entries) => serde_json::Value::Array(
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    serde_json::json!({
+                        "key": duckdb_owned_value_to_json(key),
+                        "value": duckdb_owned_value_to_json(value),
+                    })
+                })
+                .collect(),
+        ),
+        Value::Union(value) => duckdb_owned_value_to_json(value),
     }
 }
 
@@ -235,6 +303,7 @@ pub fn duckdb_execute_with_max_rows(
         Ok(db::QueryResult {
             columns,
             column_types: Vec::new(),
+            column_sortables: vec![],
             rows: result_rows,
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
@@ -247,6 +316,7 @@ pub fn duckdb_execute_with_max_rows(
         Ok(db::QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            column_sortables: vec![],
             rows: vec![],
             affected_rows: affected as u64,
             execution_time_ms: start.elapsed().as_millis(),
@@ -741,12 +811,19 @@ pub async fn execute_sql_statement_with_options(
     cancel_token: Option<CancellationToken>,
     options: QueryExecutionOptions,
 ) -> Result<db::QueryResult, String> {
-    // When database is not set, fall back to the shared (non-session-scoped) pool
-    // to avoid creating a connection without a default database context.
-    // This is particularly important for Doris/StarRocks, where metadata connections
-    // omit the database and would cause "Current database is not selected" errors.
+    // MongoDB connections use shell-style commands dispatched through the
+    // frontend parser. Queries that fall through to the generic SQL executor
+    // (e.g. typos) must be rejected before any pool/key creation so that
+    // session-scoped pools do not leak MongoDB Clients and SSH tunnels.
+    if connection_is_mongodb(state, connection_id).await {
+        return Err("Use MongoDB-specific commands".to_string());
+    }
+
+    // When a query tab has a client session, keep even database-less execution
+    // on that tab-scoped pool so connection-level state (for example MySQL @vars)
+    // survives across runs.
     let pool_key = if database.is_empty() {
-        state.get_or_create_pool(connection_id, None).await?
+        state.get_or_create_pool_for_session(connection_id, None, options.client_session_id.as_deref()).await?
     } else {
         state
             .get_or_create_pool_for_session(connection_id, Some(database), options.client_session_id.as_deref())
@@ -765,11 +842,8 @@ pub async fn execute_sql_statement_with_options(
     match &result {
         Err(e) if is_connection_error(e) && !is_canceled(&cancel_token) => {
             let db_opt = if database.is_empty() { None } else { Some(database) };
-            let new_key = if database.is_empty() {
-                state.reconnect_pool(connection_id, db_opt).await?
-            } else {
-                state.reconnect_pool_for_session(connection_id, db_opt, options.client_session_id.as_deref()).await?
-            };
+            let new_key =
+                state.reconnect_pool_for_session(connection_id, db_opt, options.client_session_id.as_deref()).await?;
             do_execute(state, &new_key, mysql_dialect, Some(database), sql, schema, cancel_token, options).await
         }
         _ => result,
@@ -784,7 +858,7 @@ pub async fn close_query_session(
     client_session_id: Option<&str>,
 ) -> Result<bool, String> {
     let pool_key = if database.is_empty() {
-        state.get_or_create_pool(connection_id, None).await?
+        state.get_or_create_pool_for_session(connection_id, None, client_session_id).await?
     } else {
         state.get_or_create_pool_for_session(connection_id, Some(database), client_session_id).await?
     };
@@ -831,8 +905,13 @@ pub async fn execute_multi_core_with_options(
     cancel_token: Option<CancellationToken>,
     options: QueryExecutionOptions,
 ) -> Result<Vec<db::QueryResult>, String> {
+    // Reject MongoDB queries that fall through to the generic executor.
+    if connection_is_mongodb(state, connection_id).await {
+        return Err("Use MongoDB-specific commands".to_string());
+    }
+
     let pool_key = if database.is_empty() {
-        state.get_or_create_pool(connection_id, None).await?
+        state.get_or_create_pool_for_session(connection_id, None, options.client_session_id.as_deref()).await?
     } else {
         state
             .get_or_create_pool_for_session(connection_id, Some(database), options.client_session_id.as_deref())
@@ -951,6 +1030,7 @@ fn error_query_result(message: String) -> db::QueryResult {
     db::QueryResult {
         columns: vec!["Error".to_string()],
         column_types: Vec::new(),
+        column_sortables: vec![],
         rows: vec![vec![serde_json::Value::String(message)]],
         affected_rows: 0,
         execution_time_ms: 0,
@@ -976,6 +1056,7 @@ async fn execute_multi_sqlserver(
             all_results.push(db::QueryResult {
                 columns: vec!["Error".to_string()],
                 column_types: Vec::new(),
+                column_sortables: vec![],
                 rows: vec![vec![serde_json::Value::String(canceled_error())]],
                 affected_rows: 0,
                 execution_time_ms: 0,
@@ -1009,6 +1090,7 @@ async fn execute_multi_sqlserver(
                 all_results.push(db::QueryResult {
                     columns: vec!["Error".to_string()],
                     column_types: Vec::new(),
+                    column_sortables: vec![],
                     rows: vec![vec![serde_json::Value::String(e)]],
                     affected_rows: 0,
                     execution_time_ms: 0,
@@ -1024,6 +1106,7 @@ async fn execute_multi_sqlserver(
         all_results.push(db::QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            column_sortables: vec![],
             rows: vec![],
             affected_rows: 0,
             execution_time_ms: 0,
@@ -1088,6 +1171,7 @@ pub async fn execute_statements(
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        column_sortables: vec![],
         rows: vec![],
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
@@ -1191,6 +1275,7 @@ async fn exec_tx_pg_inner(
         Ok(total_affected) => Ok(db::QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            column_sortables: vec![],
             rows: vec![],
             affected_rows: total_affected,
             execution_time_ms: start.elapsed().as_millis(),
@@ -1239,6 +1324,7 @@ async fn exec_tx_mysql_inner(
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        column_sortables: vec![],
         rows: vec![],
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
@@ -1271,6 +1357,7 @@ async fn exec_tx_sqlite_inner(
             Ok(db::QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
+                column_sortables: vec![],
                 rows: vec![],
                 affected_rows: total_affected,
                 execution_time_ms: start.elapsed().as_millis(),
@@ -1351,6 +1438,7 @@ async fn exec_tx_explicit_inner(
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        column_sortables: vec![],
         rows: vec![],
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
@@ -1393,6 +1481,7 @@ async fn exec_tx_none_inner(
     Ok(db::QueryResult {
         columns: vec![],
         column_types: Vec::new(),
+        column_sortables: vec![],
         rows: vec![],
         affected_rows: total_affected,
         execution_time_ms: start.elapsed().as_millis(),
@@ -1417,6 +1506,7 @@ mod tests {
             Ok(db::QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
+                column_sortables: vec![],
                 rows: vec![],
                 affected_rows: 0,
                 execution_time_ms: 0,
@@ -1437,6 +1527,7 @@ mod tests {
             Ok(db::QueryResult {
                 columns: vec![],
                 column_types: Vec::new(),
+                column_sortables: vec![],
                 rows: vec![],
                 affected_rows: 0,
                 execution_time_ms: 0,
@@ -1572,6 +1663,46 @@ mod tests {
     }
 
     #[test]
+    fn duckdb_execute_returns_list_values_as_json_arrays() {
+        let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
+        let result = duckdb_execute(&con, "SELECT ['a','b','c','d'];").expect("execute list query");
+
+        assert_eq!(result.rows, vec![vec![serde_json::json!(["a", "b", "c", "d"])]]);
+    }
+
+    #[test]
+    fn duckdb_execute_preserves_nulls_inside_list_values() {
+        let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
+        let result = duckdb_execute(&con, "SELECT [1, NULL, 3] AS items;").expect("execute nullable list query");
+
+        assert_eq!(result.columns, vec!["items"]);
+        assert_eq!(result.rows, vec![vec![serde_json::json!([1, null, 3])]]);
+    }
+
+    #[test]
+    fn duckdb_execute_returns_nested_complex_values_as_json() {
+        let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
+        let result = duckdb_execute(
+            &con,
+            "SELECT {'name': 'Ada', 'scores': [10, 20]} AS profile, MAP(['x', 'y'], [1, 2]) AS lookup, [1, 2, 3]::INTEGER[3] AS fixed_items",
+        )
+        .expect("execute complex values query");
+
+        assert_eq!(result.columns, vec!["profile", "lookup", "fixed_items"]);
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                serde_json::json!({ "name": "Ada", "scores": [10, 20] }),
+                serde_json::json!([
+                    { "key": "x", "value": 1 },
+                    { "key": "y", "value": 2 },
+                ]),
+                serde_json::json!([1, 2, 3]),
+            ]]
+        );
+    }
+
+    #[test]
     fn duckdb_execute_formats_temporal_values_by_column_type() {
         let con = duckdb::Connection::open_in_memory().expect("connect in-memory DuckDB");
         let result = duckdb_execute(
@@ -1612,6 +1743,7 @@ mod tests {
             transport_layers: Vec::new(),
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
+            idle_timeout_secs: 60,
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
@@ -1739,6 +1871,7 @@ mod tests {
         let result = db::QueryResult {
             columns: vec!["id".to_string(), "nested".to_string()],
             column_types: Vec::new(),
+            column_sortables: vec![],
             rows: vec![vec![
                 serde_json::json!(2_041_797_190_226_354_178_i64),
                 serde_json::json!([1, 2_041_797_190_226_354_178_i64]),

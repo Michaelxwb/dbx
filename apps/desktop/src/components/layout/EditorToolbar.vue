@@ -18,14 +18,15 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { SearchableSelect } from "@/components/ui/searchable-select";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
+import TruncatedTextTooltip from "@/components/ui/TruncatedTextTooltip.vue";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
 import { useSchemaOptions } from "@/composables/useSchemaOptions";
 import { connectionIconType } from "@/lib/connectionPresentation";
-import { isDefaultDatabase } from "@/lib/defaultDatabase";
+import { formatDatabaseLabel, isDefaultDatabase } from "@/lib/defaultDatabase";
 import { connectionDisplayName } from "@/lib/tabPresentation";
-import { isSingleDatabase, usesTreeSchemaMode } from "@/lib/databaseCapabilities";
+import { isSingleDatabase } from "@/lib/databaseCapabilities";
 import { hexToRgba } from "@/lib/color";
 import type { QueryTab, ConnectionConfig } from "@/types/database";
 
@@ -103,10 +104,10 @@ const toolbarStyle = computed(() => {
 });
 
 function databaseDisplayName(database: string): string {
-  const connection = props.activeConnection;
-  if (connection?.db_type === "redis" && database !== "") return `db${database}`;
-  if (database === "" && usesTreeSchemaMode(connection?.db_type)) return t("editor.defaultDatabase");
-  return database || t("editor.noDatabase");
+  return formatDatabaseLabel(props.activeConnection, database, {
+    defaultDatabase: t("editor.defaultDatabase"),
+    noDatabase: t("editor.noDatabase"),
+  });
 }
 
 function connectionById(connectionId: string): ConnectionConfig | undefined {
@@ -254,7 +255,7 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
           <template #option-label="{ option, label }">
             <div class="flex min-w-0 items-center gap-2">
               <DatabaseIcon :db-type="connectionIconType(connectionById(option))" class="h-3.5 w-3.5 shrink-0" />
-              <span class="truncate">{{ label }}</span>
+              <TruncatedTextTooltip :text="label" class="min-w-0 flex-1" side="left" :side-offset="8" />
             </div>
           </template>
         </SearchableSelect>
@@ -278,7 +279,11 @@ function connectionById(connectionId: string): ConnectionConfig | undefined {
               if (open && activeConnection) loadDatabaseOptions(activeConnection.id).catch(() => {});
             }
           "
-        />
+        >
+          <template #option-label="{ label }">
+            <TruncatedTextTooltip :text="label" class="min-w-0 flex-1" side="left" :side-offset="8" />
+          </template>
+        </SearchableSelect>
         <Button
           v-if="activeDatabaseValue"
           variant="ghost"

@@ -75,6 +75,7 @@ export interface ConnectionConfig {
   transport_layers?: TransportLayerConfig[];
   connect_timeout_secs?: number;
   query_timeout_secs?: number;
+  idle_timeout_secs?: number;
   ssl?: boolean;
   ca_cert_path?: string;
   client_cert_path?: string;
@@ -178,7 +179,7 @@ export interface TableInfo {
   parent_name?: string | null;
 }
 
-export type DatabaseObjectType = "TABLE" | "VIEW" | "PROCEDURE" | "FUNCTION" | "PACKAGE" | "PACKAGE_BODY";
+export type DatabaseObjectType = "TABLE" | "VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
 
 export interface ObjectInfo {
   name: string;
@@ -191,7 +192,7 @@ export interface ObjectInfo {
   parent_name?: string | null;
 }
 
-export type ObjectSourceKind = "VIEW" | "PROCEDURE" | "FUNCTION" | "PACKAGE" | "PACKAGE_BODY";
+export type ObjectSourceKind = "VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
 
 export interface ObjectSource {
   name: string;
@@ -246,6 +247,11 @@ export interface QueryResult {
    * fallback query paths, older backends). Consumers must tolerate gaps.
    */
   column_types?: string[];
+  /**
+   * Sortable for each column. Parallel to `columns`. Optional and may
+   * be shorter/empty when a driver cannot supply sortable information.
+   */
+  column_sortables?: boolean[];
   rows: (string | number | boolean | null)[][];
   affected_rows: number;
   execution_time_ms: number;
@@ -288,6 +294,7 @@ export type TreeNodeType =
   | "view"
   | "procedure"
   | "function"
+  | "sequence"
   | "package"
   | "package-body"
   | "group-columns"
@@ -298,9 +305,11 @@ export type TreeNodeType =
   | "group-views"
   | "group-procedures"
   | "group-functions"
+  | "group-sequences"
   | "group-packages"
   | "group-partitions"
   | "object-browser"
+  | "user-admin"
   | "saved-sql-root"
   | "saved-sql-folder"
   | "saved-sql-file"
@@ -386,10 +395,19 @@ export interface QueryTab {
   lastExplainedSql?: string;
   isExecuting: boolean;
   isCancelling?: boolean;
+  queryExecutionStartedAt?: number;
+  editorViewport?: {
+    scrollTop: number;
+    scrollLeft: number;
+  };
+  editorSelection?: {
+    anchor: number;
+    head: number;
+  };
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  mode: "data" | "query" | "redis" | "mongo" | "etcd" | "objects" | "structure";
+  mode: "data" | "query" | "redis" | "mongo" | "etcd" | "objects" | "structure" | "users";
   structureTableName?: string;
   objectBrowser?: {
     schema?: string;

@@ -47,9 +47,11 @@ import {
   isModRShortcut,
   isNewQueryShortcut,
   isObjectSourceSaveShortcutTarget,
+  isOpenSettingsShortcut,
   isResetZoomShortcut,
   isRefreshDataShortcut,
   isSaveShortcut,
+  isToggleSidebarShortcut,
   isZoomInShortcut,
   isZoomOutShortcut,
 } from "@/lib/keyboardShortcuts";
@@ -124,8 +126,8 @@ const contentAreaRef = ref<InstanceType<typeof ContentArea> | null>(null);
 
 const selectedSql = ref("");
 const cursorPos = ref(0);
-const formatSqlRequestId = ref(0);
-const activeOutputView = ref<"result" | "explain" | "chart">("result");
+const formatSqlRequest = ref<{ id: number; tabId: string } | null>(null);
+const activeOutputView = ref<"result" | "summary" | "explain" | "chart">("result");
 const newQueryContextSource = ref<"tab" | "sidebar">("tab");
 const showSaveSqlDialog = ref(false);
 const saveSqlName = ref("");
@@ -252,6 +254,7 @@ async function applyUiScale(scale: number) {
   try {
     const { getCurrentWebview } = await import("@tauri-apps/api/webview");
     await getCurrentWebview().setZoom(scale);
+    window.dispatchEvent(new CustomEvent("dbx:ui-scale-applied", { detail: { scale } }));
   } catch (error) {
     console.warn("[DBX] Failed to apply UI scale", { scale, error });
   }
@@ -361,7 +364,10 @@ function analyzeHistoryWithAi(entry: HistoryEntry) {
 function formatActiveSql() {
   const tab = activeTab.value;
   if (!tab || tab.mode !== "query" || !tab.sql.trim()) return;
-  formatSqlRequestId.value++;
+  formatSqlRequest.value = {
+    id: (formatSqlRequest.value?.id ?? 0) + 1,
+    tabId: tab.id,
+  };
 }
 
 function defaultSavedSqlName(title: string) {
@@ -453,10 +459,9 @@ async function openSqlFile() {
   try {
     if (isTauriRuntime()) {
       const { open } = await import("@tauri-apps/plugin-dialog");
-      const { readTextFile } = await import("@tauri-apps/plugin-fs");
       const path = await open({ filters: [{ name: "SQL", extensions: ["sql"] }], multiple: false });
       if (path) {
-        const content = await readTextFile(path as string);
+        const content = await api.readExternalSqlFile(path as string);
         queryStore.updateSql(tab.id, content);
       }
     } else {
@@ -760,6 +765,12 @@ function handleKeydown(e: KeyboardEvent) {
 
   const shortcuts = settingsStore.editorSettings.shortcuts;
 
+  if (isOpenSettingsShortcut(e, shortcuts)) {
+    e.preventDefault();
+    e.stopPropagation();
+    showSettingsDialog.value = true;
+    return;
+  }
   if (isFocusSearchShortcut(e, shortcuts)) {
     const focused = contentAreaRef.value?.focusSearch() || appSidebarRef.value?.focusSearch();
     if (focused) {
@@ -778,6 +789,12 @@ function handleKeydown(e: KeyboardEvent) {
     e.preventDefault();
     e.stopPropagation();
     void newQuery();
+    return;
+  }
+  if (isToggleSidebarShortcut(e, shortcuts)) {
+    e.preventDefault();
+    e.stopPropagation();
+    setSidebarOpen(!sidebarOpen.value);
     return;
   }
   if (isCloseTabShortcut(e, shortcuts)) {
@@ -1096,7 +1113,7 @@ onUnmounted(() => {
                     :active-connection="activeConnection"
                     :executable-sql="executableSql"
                     :active-output-view="activeOutputView"
-                    :format-sql-request-id="formatSqlRequestId"
+                    :format-sql-request="formatSqlRequest"
                     :selected-sql="selectedSql"
                     :cursor-pos="cursorPos"
                     @update:active-output-view="activeOutputView = $event"
@@ -1104,13 +1121,17 @@ onUnmounted(() => {
                     @execute="tryExecute()"
                     @cancel="cancelActiveExecution()"
                     @explain="tryExplain()"
-                    @editor-update="
-                      (v: string) => {
-                        if (queryStore.activeTabId) queryStore.updateSql(queryStore.activeTabId, v);
-                      }
-                    "
+                    @editor-update="(tabId: string, v: string) => queryStore.updateSql(tabId, v)"
                     @editor-selection-change="(v: string) => (selectedSql = v)"
                     @editor-cursor-change="(p: number) => (cursorPos = p)"
+                    @editor-viewport-change="
+                      (tabId: string, viewport: { scrollTop: number; scrollLeft: number }) =>
+                        queryStore.updateEditorViewport(tabId, viewport)
+                    "
+                    @editor-selection-state-change="
+                      (tabId: string, selection: { anchor: number; head: number }) =>
+                        queryStore.updateEditorSelection(tabId, selection)
+                    "
                     @format-error="toast(t('toolbar.formatSqlFailed'))"
                     @save-sql="void openSaveSqlDialog()"
                     @reload="

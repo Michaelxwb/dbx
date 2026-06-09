@@ -1,6 +1,6 @@
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
-import type { QueryTab } from "@/types/database";
+import type { QueryResult, QueryTab } from "@/types/database";
 
 type Translate = (key: string, params?: Record<string, unknown>) => string;
 
@@ -68,6 +68,10 @@ export function tabDisplayTitle(tab: QueryTab, t: Translate): string {
     if (compact) return schema || tab.title;
     return schema ? `${schema}@${database}` : `${tab.title}@${database}`;
   }
+  if (tab.mode === "users") {
+    if (compact) return t("tabs.users");
+    return `${t("tabs.users")}@${connectionDisplayName(tab.connectionId)}`;
+  }
   return tab.title;
 }
 
@@ -93,13 +97,39 @@ export function tabTooltipLines(tab: QueryTab, t: Translate): { label: string; v
   return lines;
 }
 
-export function shouldShowTabOverflowControls(
-  tabCount: number,
-  hasTabOverflow: boolean,
-  canScrollLeft: boolean,
-  canScrollRight: boolean,
-): boolean {
-  return tabCount > 0 && (hasTabOverflow || canScrollLeft || canScrollRight);
+export function tabularResultItems(
+  results: QueryResult[] | undefined,
+): { result: QueryResult; index: number; n: number }[] {
+  if (!results) return [];
+  return results
+    .map((result, index) => ({ result, index }))
+    .filter((item) => item.result.columns.length > 0)
+    .map((item, ordinal) => ({ ...item, n: ordinal + 1 }));
+}
+
+export interface ExecutionSummaryItem {
+  result: QueryResult;
+  index: number;
+  returnedColumns: number;
+  returnedRows: number;
+  affectedRows: number;
+  executionTimeMs: number;
+  hasTabularResult: boolean;
+  isError: boolean;
+}
+
+export function executionSummaryItems(tab: Pick<QueryTab, "result" | "results">): ExecutionSummaryItem[] {
+  const results = tab.results?.length ? tab.results : tab.result ? [tab.result] : [];
+  return results.map((result, index) => ({
+    result,
+    index,
+    returnedColumns: result.columns.length,
+    returnedRows: result.rows.length,
+    affectedRows: result.affected_rows,
+    executionTimeMs: result.execution_time_ms,
+    hasTabularResult: result.columns.length > 0,
+    isError: result.columns.includes("Error"),
+  }));
 }
 
 export function tabModeLabel(tab: QueryTab, t: Translate): string {
@@ -109,5 +139,6 @@ export function tabModeLabel(tab: QueryTab, t: Translate): string {
   if (tab.mode === "redis") return t("tabs.redis");
   if (tab.mode === "etcd") return t("tabs.etcd");
   if (tab.mode === "objects") return t("tabs.objects");
+  if (tab.mode === "users") return t("tabs.users");
   return tab.mode;
 }

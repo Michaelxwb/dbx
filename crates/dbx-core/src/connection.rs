@@ -8,7 +8,8 @@ use mysql_async::Row as MysqlRow;
 
 use crate::agent_connection::{
     agent_connect_params, h2_file_path_from_jdbc_url, is_h2_file_connection, mongo_legacy_error_with_auth_hint,
-    oracle_alternate_connect_config, oracle_auth_fallback_profiles, should_retry_oracle_with_10g_driver,
+    oracle_alternate_connect_config, oracle_auth_fallback_profiles, oracle_error_with_driver_hint,
+    should_retry_oracle_with_10g_driver,
 };
 use crate::agent_manager::{JavaRuntimeMode, DEFAULT_JRE_KEY};
 use crate::database_capabilities;
@@ -16,7 +17,6 @@ use crate::db;
 use crate::db::agent_driver::AgentMethod;
 use crate::db::proxy_tunnel::ProxyTunnelManager;
 use crate::db::ssh_tunnel::TunnelManager;
-use crate::external;
 use crate::models::connection::{
     parse_jdbc_host_port, parse_mongo_first_host, rewrite_jdbc_url_host, ConnectionConfig, DatabaseType,
 };
@@ -27,6 +27,20 @@ use crate::storage::Storage;
 
 pub const JDBC_PLUGIN_NOT_INSTALLED: &str =
     "JDBC plugin is not installed. Install the optional JDBC plugin to use this connection.";
+
+#[cfg(feature = "duckdb-bundled")]
+mod duckdb_types {
+    use std::sync::Arc;
+    pub type DuckDbHandle = Arc<std::sync::Mutex<duckdb::Connection>>;
+    pub type ExternalTabularHandle = Arc<crate::external::ExternalPool>;
+}
+#[cfg(not(feature = "duckdb-bundled"))]
+mod duckdb_types {
+    pub type DuckDbHandle = ();
+    pub type ExternalTabularHandle = ();
+}
+
+use duckdb_types::{DuckDbHandle, ExternalTabularHandle};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MysqlMode {
@@ -40,14 +54,16 @@ pub enum PoolKind {
     Postgres(deadpool_postgres::Pool),
     Sqlite(db::sqlite::SqliteHandle),
     Rqlite(db::rqlite_driver::RqliteClient),
+    Turso(db::turso_driver::TursoClient),
     Redis(db::redis_driver::RedisConnection),
-    DuckDb(Arc<std::sync::Mutex<duckdb::Connection>>),
+    DuckDb(DuckDbHandle),
     MongoDb(mongodb::Client),
     ClickHouse(db::clickhouse_driver::ChClient),
     SqlServer(Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>),
     Elasticsearch(db::elasticsearch_driver::EsClient),
+    InfluxDb(db::influxdb_driver::InfluxdbClient),
     Agent(Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>),
-    ExternalTabular(Arc<external::ExternalPool>),
+    ExternalTabular(ExternalTabularHandle),
     ExternalDriver { driver_id: String, config: Arc<ConnectionConfig>, session: Arc<PluginDriverSession> },
 }
 
@@ -377,6 +393,16 @@ impl AppState {
                 db::rqlite_driver::test_connection(&client, connect_timeout).await?;
                 PoolKind::Rqlite(client)
             }
+            DatabaseType::Turso => {
+                let auth_token = if !db_config.password.is_empty() {
+                    db_config.password.clone()
+                } else {
+                    db_config.url_params.as_deref().and_then(extract_auth_token_from_params).unwrap_or_default()
+                };
+                let client = db::turso_driver::TursoClient::new(&url, &auth_token, db_config.ssl, connect_timeout)?;
+                db::turso_driver::test_connection(&client, connect_timeout).await?;
+                PoolKind::Turso(client)
+            }
             DatabaseType::Redis => {
                 let con = if db_config.uses_redis_cluster() {
                     db::redis_driver::RedisConnection::Cluster(db::redis_driver::connect_cluster(&db_config).await?)
@@ -391,6 +417,7 @@ impl AppState {
                 };
                 PoolKind::Redis(con)
             }
+            #[cfg(feature = "duckdb-bundled")]
             DatabaseType::DuckDb => {
                 let con = db::duckdb_driver::connect_path(&expand_tilde(&db_config.host))?;
                 {
@@ -400,6 +427,10 @@ impl AppState {
                     }
                 }
                 PoolKind::DuckDb(con)
+            }
+            #[cfg(not(feature = "duckdb-bundled"))]
+            DatabaseType::DuckDb => {
+                return Err("DuckDB support is not compiled in this build. Rebuild with default features.".to_string());
             }
             DatabaseType::MongoDb => {
                 let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
@@ -469,6 +500,19 @@ impl AppState {
                 );
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
                 PoolKind::Elasticsearch(client)
+            }
+            DatabaseType::InfluxDb => {
+                let username = if db_config.username.is_empty() { None } else { Some(db_config.username.clone()) };
+                let password = if db_config.password.is_empty() { None } else { Some(db_config.password.clone()) };
+                let client = db::influxdb_driver::InfluxdbClient::new_with_ca_cert(
+                    &url,
+                    username,
+                    password,
+                    Some(&db_config.ca_cert_path),
+                    connect_timeout,
+                )?;
+                db::influxdb_driver::test_connection(&client, connect_timeout).await?;
+                PoolKind::InfluxDb(client)
             }
             DatabaseType::Dameng
             | DatabaseType::Kingbase
@@ -566,7 +610,7 @@ impl AppState {
                             )
                         })?;
                     } else {
-                        return Err(err);
+                        return Err(oracle_error_with_driver_hint(&db_config, &err));
                     }
                 }
                 PoolKind::Agent(Arc::new(tokio::sync::Mutex::new(client)))
@@ -720,6 +764,7 @@ impl AppState {
         keys
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     pub async fn duckdb_existing_pool_is_usable_for_config(&self, config: &ConnectionConfig) -> Result<bool, String> {
         if config.db_type != DatabaseType::DuckDb {
             return Ok(false);
@@ -939,14 +984,19 @@ pub async fn close_pool_kind(pool: PoolKind) {
         PoolKind::Postgres(p) => p.close(),
         PoolKind::Sqlite(_) => {}
         PoolKind::Rqlite(_) => {}
+        PoolKind::Turso(_) => {}
         PoolKind::Redis(_) => {}
+        #[cfg(feature = "duckdb-bundled")]
         PoolKind::DuckDb(con) => {
             crate::db::duckdb_driver::close_connection(con);
         }
+        #[cfg(not(feature = "duckdb-bundled"))]
+        PoolKind::DuckDb(_) => {}
         PoolKind::MongoDb(_) => {}
         PoolKind::ClickHouse(_) => {}
         PoolKind::SqlServer(_) => {}
         PoolKind::Elasticsearch(_) => {}
+        PoolKind::InfluxDb(_) => {}
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
             let _ = client.disconnect().await;
@@ -954,6 +1004,19 @@ pub async fn close_pool_kind(pool: PoolKind) {
         PoolKind::ExternalTabular(_) => {}
         PoolKind::ExternalDriver { .. } => {}
     }
+}
+
+fn extract_auth_token_from_params(params: &str) -> Option<String> {
+    params
+        .trim()
+        .trim_start_matches('?')
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| {
+            let k = key.trim().to_ascii_lowercase();
+            k == "auth_token" || k == "authtoken" || k == "auth-token"
+        })
+        .map(|(_, value)| value.trim().to_string())
 }
 
 fn base_pool_key_for(
@@ -1042,6 +1105,7 @@ fn native_postgres_url_config(config: &ConnectionConfig) -> Option<ConnectionCon
     }
 }
 
+#[cfg(feature = "duckdb-bundled")]
 fn duckdb_paths_match(left: &str, right: &str) -> bool {
     let left = expand_tilde(left);
     let right = expand_tilde(right);
@@ -1164,8 +1228,8 @@ mod tests {
     use crate::agent_manager::{AgentState, JavaRuntimeConfig, JavaRuntimeMode, DEFAULT_JRE_KEY};
     use crate::db;
     use crate::models::connection::{
-        default_connect_timeout_secs, ConnectionConfig, DatabaseType, ProxyTunnelConfig, ProxyType,
-        TransportLayerConfig,
+        default_connect_timeout_secs, default_redis_key_separator, ConnectionConfig, DatabaseType, ProxyTunnelConfig,
+        ProxyType, TransportLayerConfig,
     };
     use crate::query;
     use crate::schema;
@@ -1205,11 +1269,13 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            redis_key_separator: default_redis_key_separator(),
             etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            read_only: false,
         }
     }
 
@@ -1882,6 +1948,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[tokio::test]
     async fn duckdb_existing_pool_can_be_used_for_connection_test() {
         let (state, dir) = test_app_state().await;
@@ -1928,6 +1995,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[cfg(feature = "duckdb-bundled")]
     #[tokio::test]
     async fn duckdb_client_session_reuses_base_pool_to_avoid_file_locks() {
         let (state, dir) = test_app_state().await;

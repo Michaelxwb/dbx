@@ -60,6 +60,8 @@ pub struct ConnectionConfig {
     pub redis_sentinel_tls: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub redis_cluster_nodes: String,
+    #[serde(default = "default_redis_key_separator", skip_serializing_if = "is_default_redis_separator")]
+    pub redis_key_separator: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub etcd_endpoints: String,
     /// Typed configuration for external tabular sources.
@@ -71,6 +73,8 @@ pub struct ConnectionConfig {
     pub jdbc_driver_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub one_time: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -134,6 +138,8 @@ pub struct SshTunnelConfig {
     pub connect_timeout_secs: u64,
     #[serde(default)]
     pub expose_lan: bool,
+    #[serde(default)]
+    pub use_ssh_agent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,6 +198,14 @@ fn default_proxy_port() -> u16 {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+pub fn default_redis_key_separator() -> String {
+    ":".to_string()
+}
+
+fn is_default_redis_separator(value: &str) -> bool {
+    value == ":"
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -270,6 +284,10 @@ pub enum DatabaseType {
     Etcd,
     #[serde(rename = "iris")]
     Iris,
+    #[serde(rename = "turso")]
+    Turso,
+    #[serde(rename = "influxdb")]
+    InfluxDb,
     Jdbc,
 }
 
@@ -331,6 +349,8 @@ struct ConnectionConfigData {
     pub redis_sentinel_tls: bool,
     #[serde(default)]
     pub redis_cluster_nodes: String,
+    #[serde(default = "default_redis_key_separator")]
+    pub redis_key_separator: String,
     #[serde(default)]
     pub etcd_endpoints: String,
     #[serde(default)]
@@ -341,6 +361,8 @@ struct ConnectionConfigData {
     pub jdbc_driver_paths: Vec<String>,
     #[serde(default)]
     pub one_time: bool,
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 impl From<ConnectionConfigData> for ConnectionConfig {
@@ -378,11 +400,13 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             redis_sentinel_password: data.redis_sentinel_password,
             redis_sentinel_tls: data.redis_sentinel_tls,
             redis_cluster_nodes: data.redis_cluster_nodes,
+            redis_key_separator: data.redis_key_separator,
             etcd_endpoints: data.etcd_endpoints,
             external_config: data.external_config,
             jdbc_driver_class: data.jdbc_driver_class,
             jdbc_driver_paths: data.jdbc_driver_paths,
             one_time: data.one_time,
+            read_only: data.read_only,
         }
     }
 }
@@ -554,7 +578,7 @@ impl ConnectionConfig {
             },
             DatabaseType::Redshift => Some("dev"),
             DatabaseType::ClickHouse => Some("default"),
-            DatabaseType::Rqlite => Some("main"),
+            DatabaseType::Rqlite | DatabaseType::Turso => Some("main"),
             DatabaseType::Gaussdb | DatabaseType::OpenGauss => Some("postgres"),
             DatabaseType::Kwdb => Some("defaultdb"),
             DatabaseType::Kingbase | DatabaseType::Vastbase => Some("postgres"),
@@ -642,6 +666,7 @@ impl ConnectionConfig {
             }
             DatabaseType::ClickHouse => clickhouse_http_url(self, raw_host, port),
             DatabaseType::Rqlite => rqlite_http_url(self, raw_host, port),
+            DatabaseType::Turso => turso_http_url(self, raw_host, port),
             DatabaseType::SqlServer => {
                 format!("server=tcp:{host},{port};database={}", self.database.as_deref().unwrap_or("master"))
             }
@@ -720,6 +745,10 @@ impl ConnectionConfig {
                 format!("etcd://{host}:{port}")
             }
             DatabaseType::Iris => format!("iris://{host}:{port}{db_part}"),
+            DatabaseType::InfluxDb => {
+                let scheme = if self.ssl { "https" } else { "http" };
+                format!("{scheme}://{host}:{port}")
+            }
             DatabaseType::Jdbc => "jdbc:<redacted>".to_string(),
         }
     }
@@ -758,6 +787,7 @@ impl ConnectionConfig {
             }
             DatabaseType::ClickHouse => clickhouse_http_url(self, raw_host, port),
             DatabaseType::Rqlite => rqlite_http_url(self, raw_host, port),
+            DatabaseType::Turso => turso_http_url(self, raw_host, port),
             DatabaseType::SqlServer => format!(
                 "server=tcp:{host},{port};user={};password={};database={}",
                 self.username,
@@ -908,6 +938,10 @@ impl ConnectionConfig {
             }
             DatabaseType::Iris => {
                 format!("iris://{}:{}@{host}:{port}{db_part}", username, password)
+            }
+            DatabaseType::InfluxDb => {
+                let scheme = if self.ssl { "https" } else { "http" };
+                format!("{scheme}://{host}:{port}")
             }
             DatabaseType::Jdbc => {
                 self.connection_string.as_deref().filter(|value| !value.is_empty()).unwrap_or("jdbc:").to_string()
@@ -1135,6 +1169,19 @@ fn rqlite_http_url(config: &ConnectionConfig, host: &str, port: u16) -> String {
     format!("{scheme}://{}:{port}", bracket_ipv6(trimmed))
 }
 
+fn turso_http_url(config: &ConnectionConfig, host: &str, port: u16) -> String {
+    let trimmed = host.trim();
+    if let Some(rest) = trimmed.strip_prefix("https://").or_else(|| trimmed.strip_prefix("libsql://")) {
+        return format!("https://{}", trim_http_host_port(rest, port));
+    }
+    if let Some(rest) = trimmed.strip_prefix("http://") {
+        let scheme = if config.ssl { "https" } else { "http" };
+        return format!("{scheme}://{}", trim_http_host_port(rest, port));
+    }
+    let scheme = if config.ssl { "https" } else { "http" };
+    format!("{scheme}://{}:{port}", bracket_ipv6(trimmed))
+}
+
 fn trim_http_host_port(value: &str, default_port: u16) -> String {
     let authority = value.trim_end_matches('/').split('/').next().unwrap_or(value).split('?').next().unwrap_or(value);
     if authority.starts_with('[') && !authority.contains("]:") {
@@ -1305,8 +1352,8 @@ fn bracket_ipv6(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_query_timeout_secs, default_ssh_connect_timeout_secs, ConnectionConfig, DatabaseType,
-        ProxyTunnelConfig, ProxyType, TransportLayerConfig,
+        default_query_timeout_secs, default_redis_key_separator, default_ssh_connect_timeout_secs, ConnectionConfig,
+        DatabaseType, ProxyTunnelConfig, ProxyType, TransportLayerConfig,
     };
     use std::str::FromStr;
 
@@ -1344,11 +1391,13 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            redis_key_separator: default_redis_key_separator(),
             etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            read_only: false,
         }
     }
 

@@ -30,6 +30,7 @@ import { useVisibilityChange } from "@/composables/useVisibilityChange";
 import "@/i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import * as api from "@/lib/api";
+import { connectionRedactedNameLabel } from "@/lib/connectionPresentation";
 import { resolveDefaultDatabase } from "@/lib/defaultDatabase";
 import { findTreeNodeById, resolveNewQueryTarget } from "@/lib/newQueryContext";
 import { buildExecutableObjectSourceStatements, objectSourceSaveExecutionMode } from "@/lib/objectSourceEditor";
@@ -61,6 +62,7 @@ import { classifyAiSqlExecution } from "@/lib/aiSqlExecutionPolicy";
 import { buildHistoryAiAnalysisPrompt } from "@/lib/historyAiAnalysis";
 import { countAvailableAgentDriverUpdates, type AgentDriverUpdateBadgeState } from "@/lib/agentDriverUpdateBadge";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/safeStorage";
+import { rankSavedSqlHistory } from "@/lib/savedSqlHistory";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -70,6 +72,7 @@ import type { AiAction } from "@/lib/ai";
 
 const AiAssistant = defineAsyncComponent(() => import("@/components/editor/AiAssistant.vue"));
 const QueryHistory = defineAsyncComponent(() => import("@/components/editor/QueryHistory.vue"));
+const SqlLibraryPanel = defineAsyncComponent(() => import("@/components/layout/SqlLibraryPanel.vue"));
 const DriverStorePage = defineAsyncComponent(() => import("@/components/config/DriverStoreDialog.vue"));
 const UpdateDialog = defineAsyncComponent(() => import("@/components/layout/UpdateDialog.vue"));
 const LoginPage = defineAsyncComponent(() => import("@/components/auth/LoginPage.vue"));
@@ -85,21 +88,7 @@ const settingsStore = useSettingsStore();
 const savedSqlStore = useSavedSqlStore();
 const { message: toastMessage, visible: toastVisible, toast } = useToast();
 const { isDark, themeMode, applyTheme, setThemeMode } = useTheme();
-const {
-  checkingUpdates,
-  updateInfo,
-  updateCheckMessage,
-  showUpdateDialog,
-  isDownloadingUpdate,
-  downloadProgress,
-  updateReady,
-  hasUpdateAvailable,
-  openUrl,
-  checkUpdates,
-  openLatestRelease,
-  downloadAndInstallUpdate,
-  restartApp,
-} = useAppUpdater();
+const { checkingUpdates, updateInfo, updateCheckMessage, showUpdateDialog, isDownloadingUpdate, downloadProgress, updateReady, hasUpdateAvailable, openUrl, checkUpdates, openLatestRelease, downloadAndInstallUpdate, restartApp } = useAppUpdater();
 const { setupFileDrop } = useFileDrop();
 
 const isDesktop = isTauriRuntime();
@@ -116,10 +105,10 @@ const showDriverStore = ref(false);
 const agentDriverUpdateCount = ref(0);
 const showHistory = ref(false);
 const showAiPanel = ref(safeLocalStorageGet("dbx-ai-panel-open") === "true");
+const showSqlLibraryPanel = ref(safeLocalStorageGet("dbx-sql-library-open") === "true");
 const sidebarOpen = ref(safeLocalStorageGet("dbx-sidebar-open") !== "false");
 const aiPanelReady = ref(false);
-const { sidebarWidth, aiPanelWidth, historyWidth, startSidebarResize, startAiPanelResize, startHistoryResize } =
-  usePanelResize();
+const { sidebarWidth, aiPanelWidth, historyWidth, sqlLibraryWidth, startSidebarResize, startAiPanelResize, startHistoryResize, startSqlLibraryResize } = usePanelResize();
 const aiAssistantRef = ref<AiAssistantHandle | null>(null);
 const appSidebarRef = ref<InstanceType<typeof AppSidebar> | null>(null);
 const contentAreaRef = ref<InstanceType<typeof ContentArea> | null>(null);
@@ -196,18 +185,7 @@ async function resolveActiveExecutableSql() {
     : "";
 }
 
-const {
-  dangerSql,
-  pendingDangerSql,
-  showDangerDialog,
-  suppressDangerConfirm,
-  tryExecute,
-  doExecute,
-  cancelActiveExecution,
-  tryExplain,
-  onDangerConfirm,
-  explainMode,
-} = useSqlExecution({
+const { dangerSql, pendingDangerSql, showDangerDialog, suppressDangerConfirm, tryExecute, doExecute, cancelActiveExecution, tryExplain, onDangerConfirm, explainMode } = useSqlExecution({
   activeTab,
   activeConnection,
   executableSql,
@@ -217,8 +195,7 @@ const {
 
 const dialogs = useDialogSources();
 const { getDatabaseOptions } = useDatabaseOptions();
-const { openLineageTarget, openDatabaseSearchTarget, onStructureEditorSaved, openTableTarget } =
-  useNavigationTargets(dialogs);
+const { openLineageTarget, openDatabaseSearchTarget, onStructureEditorSaved, openTableTarget } = useNavigationTargets(dialogs);
 const { onExecuteSql, onReloadData, onPaginate, onSort } = useDataGridActions(activeTab);
 const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
   openTableTarget,
@@ -231,22 +208,31 @@ useVisibilityChange();
 const appVersion = ref("");
 const isClassicLayout = computed(() => settingsStore.editorSettings.appLayout === "classic");
 const updateNotificationsEnabled = computed(() => settingsStore.editorSettings.updateNotificationsEnabled);
-const toolbarAgentDriverUpdateCount = computed(() =>
-  updateNotificationsEnabled.value ? agentDriverUpdateCount.value : 0,
-);
+const toolbarAgentDriverUpdateCount = computed(() => (updateNotificationsEnabled.value ? agentDriverUpdateCount.value : 0));
 const toolbarHasUpdateAvailable = computed(() => updateNotificationsEnabled.value && hasUpdateAvailable.value);
-const hasSqlFileConnections = computed(() =>
-  connectionStore.connections.some((c) => supportsSqlFileExecution(c.db_type)),
-);
+const hasSqlFileConnections = computed(() => connectionStore.connections.some((c) => supportsSqlFileExecution(c.db_type)));
 const connectionStats = computed(() => ({
   total: connectionStore.connections.length,
   connected: connectionStore.connectedIds.size,
   types: new Set(connectionStore.connections.map((c) => c.driver_profile || c.db_type)).size,
 }));
 const recentConnections = computed(() => connectionStore.connections.slice(0, 5));
+const savedSqlHistoryItems = computed(() => {
+  const folderById = new Map(savedSqlStore.allFolders.map((folder) => [folder.id, folder.name]));
+  return rankSavedSqlHistory(savedSqlStore.allFiles, { limit: 6 }).map((file) => {
+    const connection = connectionStore.getConfig(file.connectionId);
+    return {
+      id: file.id,
+      name: file.name,
+      connectionName: connection ? connectionRedactedNameLabel(connection) : t("welcome.unknownConnection"),
+      database: file.database,
+      folderName: file.folderId ? folderById.get(file.folderId) : undefined,
+      openCount: file.openCount ?? 0,
+    };
+  });
+});
 const saveSqlFolders = computed(() => {
-  const tab = activeTab.value;
-  return tab ? savedSqlStore.listFolders(tab.connectionId) : [];
+  return savedSqlStore.allFolders;
 });
 
 async function applyUiScale(scale: number) {
@@ -281,11 +267,7 @@ function isGlobalUiZoomTarget(target: EventTarget | null): target is Element {
   if (target.closest("[data-query-editor-root], [data-cell-detail-editor-root], [data-object-source-editor]")) {
     return true;
   }
-  if (
-    target instanceof HTMLInputElement ||
-    target instanceof HTMLTextAreaElement ||
-    (target instanceof HTMLElement && target.isContentEditable)
-  ) {
+  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || (target instanceof HTMLElement && target.isContentEditable)) {
     return false;
   }
   return !target.closest("[contenteditable='true']");
@@ -323,6 +305,11 @@ watch(
 function toggleAiPanel() {
   showAiPanel.value = !showAiPanel.value;
   safeLocalStorageSet("dbx-ai-panel-open", String(showAiPanel.value));
+}
+
+function toggleSqlLibrary() {
+  showSqlLibraryPanel.value = !showSqlLibraryPanel.value;
+  safeLocalStorageSet("dbx-sql-library-open", String(showSqlLibraryPanel.value));
 }
 
 function fixWithAi(errorMessage: string) {
@@ -371,8 +358,9 @@ function formatActiveSql() {
 }
 
 function defaultSavedSqlName(title: string) {
-  const trimmed = title.trim() || "Query";
-  return trimmed.endsWith(".sql") ? trimmed : `${trimmed}.sql`;
+  const trimmed = title.trim() || "query";
+  const normalized = trimmed.replace(/\s+/g, "_");
+  return normalized.endsWith(".sql") ? normalized : `${normalized}.sql`;
 }
 
 async function openSaveSqlDialog() {
@@ -394,7 +382,6 @@ async function openSaveSqlDialog() {
       sql: tab.sql,
     });
     queryStore.linkSavedSql(tab.id, updated.id, updated.name);
-    connectionStore.refreshSavedSqlTree(tab.connectionId);
     toast(t("savedSql.saved"), 2000);
     return;
   }
@@ -445,7 +432,6 @@ async function confirmSaveSqlToLibrary() {
       sql: tab.sql,
     });
     queryStore.linkSavedSql(tab.id, saved.id, saved.name);
-    connectionStore.refreshSavedSqlTree(tab.connectionId);
     showSaveSqlDialog.value = false;
     toast(t("savedSql.saved"), 2000);
   } catch (e: any) {
@@ -490,8 +476,7 @@ async function openSqlFilePath(path: string) {
   if (!isTauriRuntime()) return;
   try {
     const content = await api.readExternalSqlFile(path);
-    const connectionId =
-      connectionStore.activeConnectionId || activeTab.value?.connectionId || connectionStore.connections[0]?.id || "";
+    const connectionId = connectionStore.activeConnectionId || activeTab.value?.connectionId || connectionStore.connections[0]?.id || "";
     const connection = connectionId ? connectionStore.getConfig(connectionId) : undefined;
     const database = activeTab.value?.database || (connection ? resolveDefaultDatabase(connection, []) : "");
     const tabId = queryStore.createTab(connectionId, database, sqlFileTitleFromPath(path), "query");
@@ -524,6 +509,7 @@ function getDbTypeFromPath(path: string): "sqlite" | "duckdb" | null {
 
 async function openDbFilePath(path: string) {
   if (!isTauriRuntime()) return;
+  await connectionStore.initFromDisk();
   try {
     const name = path.split("/").pop()?.split("\\").pop() || path;
     const dbType = getDbTypeFromPath(path);
@@ -581,6 +567,7 @@ async function openPendingDbFiles() {
 }
 
 async function openConnectionDeepLink(url: string) {
+  await connectionStore.initFromDisk();
   try {
     const draft = parseConnectionDeepLink(url);
     if (!draft) return;
@@ -646,6 +633,15 @@ async function openConnectionQuery(connectionId: string) {
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
   }
+}
+
+function openSavedSqlFromWelcome(fileId: string) {
+  const file = savedSqlStore.getFile(fileId);
+  if (!file) return;
+  queryStore.openSavedSql(file);
+  connectionStore.activeConnectionId = file.connectionId;
+  void savedSqlStore.recordFileUsage(file.id);
+  toast(t("welcome.fileOpened", { name: file.name }), 2000);
 }
 
 async function onClickTable(tableName: string) {
@@ -815,12 +811,7 @@ function handleKeydown(e: KeyboardEvent) {
     void openSaveSqlDialog();
     return;
   }
-  if (
-    activeTab.value?.mode === "query" &&
-    isExecuteSqlShortcut(e, shortcuts) &&
-    e.target instanceof Element &&
-    e.target.closest("[data-query-editor-root]")
-  ) {
+  if (activeTab.value?.mode === "query" && isExecuteSqlShortcut(e, shortcuts) && e.target instanceof Element && e.target.closest("[data-query-editor-root]")) {
     e.preventDefault();
     e.stopPropagation();
     tryExecute();
@@ -868,9 +859,10 @@ function onLoginSuccess() {
 function initApp() {
   const t0 = performance.now();
   console.log("[STARTUP] initApp begin");
-  settingsStore.initDesktopSettings().catch(() => {});
-  savedSqlStore
-    .initFromStorage()
+  settingsStore
+    .initDesktopSettings()
+    .catch(() => {})
+    .then(() => savedSqlStore.initFromStorage())
     .then(() => {
       console.log(`[STARTUP]   savedSqlStore.initFromStorage: ${(performance.now() - t0).toFixed(0)}ms`);
       return connectionStore.initFromDisk();
@@ -995,21 +987,16 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <LoginPage
-    v-if="setupRequired || (needsAuth && !authenticated)"
-    :setup-mode="setupRequired"
-    @authenticated="onLoginSuccess"
-  />
-  <div v-show="!setupRequired && (!needsAuth || authenticated)" class="h-screen w-screen overflow-hidden">
+  <LoginPage v-if="setupRequired || (needsAuth && !authenticated)" :setup-mode="setupRequired" @authenticated="onLoginSuccess" />
+  <div v-show="!setupRequired && (!needsAuth || authenticated)" class="fixed inset-0 h-screen w-screen overflow-hidden">
     <TooltipProvider :delay-duration="300">
-      <div
-        class="h-screen w-screen max-w-full min-w-[760px] min-h-[600px] flex flex-col bg-background text-foreground overflow-hidden"
-      >
+      <div class="h-screen w-screen max-w-full min-w-[760px] min-h-[600px] flex flex-col bg-background text-foreground overflow-hidden">
         <AppToolbar
           :is-dark="isDark"
           :theme-mode="themeMode"
           :show-ai-panel="showAiPanel"
           :show-history="showHistory"
+          :show-sql-library="showSqlLibraryPanel"
           :show-driver-store="showDriverStore"
           :checking-updates="checkingUpdates"
           :has-update-available="toolbarHasUpdateAvailable"
@@ -1021,6 +1008,7 @@ onUnmounted(() => {
           @set-theme-mode="setThemeMode"
           @toggle-ai="toggleAiPanel"
           @toggle-history="showHistory = !showHistory"
+          @toggle-sql-library="toggleSqlLibrary"
           @open-github="openGitHub"
           @open-settings="showSettingsDialog = true"
           @open-driver-store="showDriverStore = !showDriverStore"
@@ -1031,60 +1019,18 @@ onUnmounted(() => {
           @open-data-compare="dialogs.showDataCompareDialog.value = true"
         />
 
-        <div
-          :class="
-            isClassicLayout
-              ? 'app-layout-classic flex-1 flex min-h-0'
-              : 'app-panel-gutter flex-1 flex min-h-0 gap-1 p-1'
-          "
-        >
-          <AppSidebar
-            v-show="sidebarOpen"
-            ref="appSidebarRef"
-            :sidebar-width="sidebarWidth"
-            :classic-layout="isClassicLayout"
-            @import="dialogs.onImportClick"
-            @export="dialogs.onExportClick"
-            @start-resize="startSidebarResize"
-            @collapse="setSidebarOpen(false)"
-          />
-          <div
-            v-show="!sidebarOpen"
-            class="flex h-full w-8 shrink-0 items-start justify-center border-r bg-background/80 pt-2"
-            :class="isClassicLayout ? '' : 'rounded-md border border-border/80'"
-          >
-            <Button
-              variant="ghost"
-              size="icon"
-              class="h-7 w-7"
-              :title="t('sidebar.expand')"
-              :aria-label="t('sidebar.expand')"
-              @click="setSidebarOpen(true)"
-            >
+        <div :class="isClassicLayout ? 'app-layout-classic flex-1 flex min-h-0' : 'app-panel-gutter flex-1 flex min-h-0 gap-1 p-1'">
+          <AppSidebar v-show="sidebarOpen" ref="appSidebarRef" :sidebar-width="sidebarWidth" :classic-layout="isClassicLayout" @import="dialogs.onImportClick" @export="dialogs.onExportClick" @start-resize="startSidebarResize" @collapse="setSidebarOpen(false)" />
+          <div v-show="!sidebarOpen" class="flex h-full w-8 shrink-0 items-start justify-center border-r bg-background/80 pt-2" :class="isClassicLayout ? '' : 'rounded-md border border-border/80'">
+            <Button variant="ghost" size="icon" class="h-7 w-7" :title="t('sidebar.expand')" :aria-label="t('sidebar.expand')" @click="setSidebarOpen(true)">
               <ChevronsRight class="h-4 w-4" />
             </Button>
           </div>
 
-          <div
-            :class="
-              isClassicLayout
-                ? 'flex-1 min-w-0 overflow-hidden'
-                : 'flex-1 min-w-0 overflow-hidden rounded-md border border-border/80 bg-background'
-            "
-          >
+          <div :class="isClassicLayout ? 'flex-1 min-w-0 overflow-hidden' : 'flex-1 min-w-0 overflow-hidden rounded-md border border-border/80 bg-background'">
             <div class="h-full flex flex-col min-w-0">
-              <AppTabBar
-                :show-driver-store="showDriverStore"
-                :agent-driver-update-count="toolbarAgentDriverUpdateCount"
-                @toggle-driver-store="showDriverStore = true"
-                @close-driver-store="showDriverStore = false"
-              />
-              <DriverStorePage
-                v-if="showDriverStore"
-                class="flex-1 min-h-0"
-                :update-notifications-enabled="updateNotificationsEnabled"
-                @update-count-change="updateAgentDriverUpdateCount"
-              />
+              <AppTabBar :show-driver-store="showDriverStore" :agent-driver-update-count="toolbarAgentDriverUpdateCount" @toggle-driver-store="showDriverStore = true" @close-driver-store="showDriverStore = false" />
+              <DriverStorePage v-if="showDriverStore" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" @update-count-change="updateAgentDriverUpdateCount" />
               <div v-else-if="activeTab" class="flex flex-col flex-1 min-h-0">
                 <EditorToolbar
                   v-if="activeTab.mode === 'query' && !isPreviewTab(activeTab)"
@@ -1124,26 +1070,11 @@ onUnmounted(() => {
                     @editor-update="(tabId: string, v: string) => queryStore.updateSql(tabId, v)"
                     @editor-selection-change="(v: string) => (selectedSql = v)"
                     @editor-cursor-change="(p: number) => (cursorPos = p)"
-                    @editor-viewport-change="
-                      (tabId: string, viewport: { scrollTop: number; scrollLeft: number }) =>
-                        queryStore.updateEditorViewport(tabId, viewport)
-                    "
-                    @editor-selection-state-change="
-                      (tabId: string, selection: { anchor: number; head: number }) =>
-                        queryStore.updateEditorSelection(tabId, selection)
-                    "
+                    @editor-viewport-change="(tabId: string, viewport: { scrollTop: number; scrollLeft: number }) => queryStore.updateEditorViewport(tabId, viewport)"
+                    @editor-selection-state-change="(tabId: string, selection: { anchor: number; head: number }) => queryStore.updateEditorSelection(tabId, selection)"
                     @format-error="toast(t('toolbar.formatSqlFailed'))"
                     @save-sql="void openSaveSqlDialog()"
-                    @reload="
-                      (
-                        sql?: string,
-                        searchText?: string,
-                        whereInput?: string,
-                        orderBy?: string,
-                        limit?: number,
-                        offset?: number,
-                      ) => onReloadData(sql, searchText, whereInput, orderBy, limit, offset)
-                    "
+                    @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number) => onReloadData(sql, searchText, whereInput, orderBy, limit, offset)"
                     @paginate="onPaginate"
                     @sort="onSort"
                     @execute-sql="onExecuteSql"
@@ -1182,9 +1113,11 @@ onUnmounted(() => {
                 v-else
                 :connection-stats="connectionStats"
                 :recent-connections="recentConnections"
+                :saved-sql-history-items="savedSqlHistoryItems"
                 :app-version="appVersion"
                 :has-connections="connectionStore.connections.length > 0"
                 @open-connection-query="openConnectionQuery"
+                @open-saved-sql="openSavedSqlFromWelcome"
                 @new-connection="showConnectionDialog = true"
                 @new-query="newQuery"
                 @show-history="showHistory = true"
@@ -1195,45 +1128,23 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <div
-            v-if="showAiPanel"
-            :class="
-              isClassicLayout
-                ? 'h-full shrink-0 relative z-30 isolate bg-background'
-                : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'
-            "
-            :style="{ width: aiPanelWidth + 'px' }"
-          >
+          <div v-if="showAiPanel" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: aiPanelWidth + 'px' }">
             <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startAiPanelResize" />
             <div class="h-full min-h-0 overflow-hidden">
-              <AiAssistant
-                v-if="aiPanelReady"
-                ref="aiAssistantRef"
-                :tab="activeTab"
-                :connection="activeConnection"
-                @replace-sql="onAiReplaceSql"
-                @execute-sql="onAiExecuteSql"
-                @request-auto-execute-sql="onAiRequestAutoExecuteSql"
-                @close="toggleAiPanel"
-              />
+              <AiAssistant v-if="aiPanelReady" ref="aiAssistantRef" :tab="activeTab" :connection="activeConnection" @replace-sql="onAiReplaceSql" @execute-sql="onAiExecuteSql" @request-auto-execute-sql="onAiRequestAutoExecuteSql" @close="toggleAiPanel" />
             </div>
           </div>
 
-          <div
-            v-if="showHistory"
-            :class="
-              isClassicLayout
-                ? 'h-full shrink-0 relative z-30 isolate bg-background'
-                : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'
-            "
-            :style="{ width: historyWidth + 'px' }"
-          >
+          <div v-if="showHistory" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: historyWidth + 'px' }">
             <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startHistoryResize" />
-            <QueryHistory
-              @restore="restoreHistorySql"
-              @analyze-ai="analyzeHistoryWithAi"
-              @close="showHistory = false"
-            />
+            <QueryHistory @restore="restoreHistorySql" @analyze-ai="analyzeHistoryWithAi" @close="showHistory = false" />
+          </div>
+
+          <div v-if="showSqlLibraryPanel" :class="isClassicLayout ? 'h-full shrink-0 relative z-30 isolate bg-background' : 'h-full shrink-0 relative z-30 isolate rounded-md border border-border/80 bg-background'" :style="{ width: sqlLibraryWidth + 'px' }">
+            <div class="panel-resize-handle panel-resize-handle--left" @mousedown="startSqlLibraryResize" />
+            <div class="h-full min-h-0 overflow-hidden">
+              <SqlLibraryPanel @close="showSqlLibraryPanel = false" />
+            </div>
           </div>
         </div>
 
@@ -1252,9 +1163,7 @@ onUnmounted(() => {
           @danger-confirm="onDangerConfirm"
           @connect-started="(name: string) => toast(t('connection.connecting', { name }), 30000)"
           @connect-succeeded="(name: string) => toast(t('connection.connectSuccess', { name }), 2000)"
-          @connect-failed="
-            (msg: string) => toast(t('connection.connectFailed', { message: translateBackendError(t, msg) }), 5000)
-          "
+          @connect-failed="(msg: string) => toast(t('connection.connectFailed', { message: translateBackendError(t, msg) }), 5000)"
           @open-driver-store="
             setConnectionDialogOpen(false);
             showDriverStore = true;
@@ -1275,10 +1184,7 @@ onUnmounted(() => {
           @restart="restartApp"
         />
         <Transition name="toast">
-          <div
-            v-if="toastVisible"
-            class="fixed bottom-6 left-1/2 -translate-x-1/2 z-100 px-4 py-2 rounded-lg bg-foreground text-background text-sm shadow-lg"
-          >
+          <div v-if="toastVisible" class="fixed bottom-6 left-1/2 -translate-x-1/2 z-100 px-4 py-2 rounded-lg bg-foreground text-background text-sm shadow-lg">
             {{ toastMessage }}
           </div>
         </Transition>

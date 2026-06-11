@@ -4,11 +4,17 @@ import type { ColumnExtra, EditableStructureColumn, EditableStructureIndex } fro
 export const DATA_TYPE_OPTIONS: Record<string, string[]> = {
   mysql: [
     "tinyint",
+    "tinyint unsigned",
     "smallint",
+    "smallint unsigned",
     "mediumint",
+    "mediumint unsigned",
     "int",
+    "int unsigned",
     "integer",
+    "integer unsigned",
     "bigint",
+    "bigint unsigned",
     "float",
     "double",
     "double precision",
@@ -115,6 +121,7 @@ export const DATA_TYPE_OPTIONS: Record<string, string[]> = {
   ],
   sqlite: ["integer", "real", "text", "blob", "numeric"],
   rqlite: ["integer", "real", "text", "blob", "numeric"],
+  turso: ["integer", "real", "text", "blob", "numeric"],
   sqlserver: [
     "bit",
     "tinyint",
@@ -255,12 +262,18 @@ export function getDataTypeOptions(dbType: DatabaseType | undefined): string[] {
 
 export const DEFAULT_TYPE_LENGTHS: Record<string, string> = {
   tinyint: "4",
+  "tinyint unsigned": "4",
   smallint: "6",
+  "smallint unsigned": "6",
   mediumint: "9",
+  "mediumint unsigned": "9",
   int: "11",
+  "int unsigned": "11",
   integer: "11",
+  "integer unsigned": "11",
   int4: "11",
   bigint: "20",
+  "bigint unsigned": "20",
   int8: "20",
   float: "10,2",
   real: "10,2",
@@ -296,15 +309,7 @@ export function parseExtraToColumnExtra(extra: string | null | undefined, databa
     if (lower.includes("on update current_timestamp")) {
       result.onUpdateCurrentTimestamp = true;
     }
-  } else if (
-    databaseType === "postgres" ||
-    databaseType === "gaussdb" ||
-    databaseType === "kwdb" ||
-    databaseType === "opengauss" ||
-    databaseType === "highgo" ||
-    databaseType === "vastbase" ||
-    databaseType === "kingbase"
-  ) {
+  } else if (databaseType === "postgres" || databaseType === "gaussdb" || databaseType === "kwdb" || databaseType === "opengauss" || databaseType === "highgo" || databaseType === "vastbase" || databaseType === "kingbase") {
     const identityMatch = lower.match(/generated\s+(by\s+default|always)\s+as\s+identity/i);
     if (identityMatch) {
       const sequenceMatch = lower.match(/start\s+with\s*(-?\d+)\s+increment\s+by\s*(-?\d+)/i);
@@ -413,14 +418,7 @@ function isTemporalPrecisionType(dbType: DatabaseType | undefined, baseType: str
     case "vastbase":
     case "kingbase":
     case "redshift":
-      return [
-        "time",
-        "time without time zone",
-        "time with time zone",
-        "timestamp",
-        "timestamp without time zone",
-        "timestamp with time zone",
-      ].includes(normalized);
+      return ["time", "time without time zone", "time with time zone", "timestamp", "timestamp without time zone", "timestamp with time zone"].includes(normalized);
     case "sqlserver":
       return ["time", "datetime2", "datetimeoffset"].includes(normalized);
     case "oracle":
@@ -444,12 +442,7 @@ export function getDefaultLengthForType(_dbType: DatabaseType | undefined, baseT
   return DEFAULT_TYPE_LENGTHS[key] ?? "";
 }
 
-export function buildStructureTargetLabel(
-  connectionName: string | undefined,
-  database: string | undefined,
-  schema: string | undefined,
-  tableName: string | undefined,
-): string {
+export function buildStructureTargetLabel(connectionName: string | undefined, database: string | undefined, schema: string | undefined, tableName: string | undefined): string {
   const parts = [connectionName, database];
   if (schema && schema !== database) parts.push(schema);
   if (tableName) parts.push(tableName);

@@ -1,7 +1,19 @@
 export type ShortcutActionId =
   | "executeSql"
+  | "formatSql"
   | "saveSql"
   | "acceptCompletion"
+  | "indentMore"
+  | "indentLess"
+  | "duplicateLine"
+  | "deleteLine"
+  | "moveLineUp"
+  | "moveLineDown"
+  | "copyLineUp"
+  | "copyLineDown"
+  | "undo"
+  | "redo"
+  | "selectAll"
   | "copyCurrentRow"
   | "deleteCurrentRow"
   | "newQuery"
@@ -37,6 +49,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Mod+Enter",
   },
   {
+    id: "formatSql",
+    labelKey: "settings.shortcutFormatSql",
+    scope: "editor",
+    defaultShortcut: "Shift+Mod+F",
+  },
+  {
     id: "saveSql",
     labelKey: "settings.shortcutSaveSql",
     scope: "editor",
@@ -47,6 +65,72 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutAcceptCompletion",
     scope: "editor",
     defaultShortcut: "Tab",
+  },
+  {
+    id: "indentMore",
+    labelKey: "settings.shortcutIndentMore",
+    scope: "editor",
+    defaultShortcut: "",
+  },
+  {
+    id: "indentLess",
+    labelKey: "settings.shortcutIndentLess",
+    scope: "editor",
+    defaultShortcut: "Shift+Tab",
+  },
+  {
+    id: "duplicateLine",
+    labelKey: "settings.shortcutDuplicateLine",
+    scope: "editor",
+    defaultShortcut: "Mod+D",
+  },
+  {
+    id: "deleteLine",
+    labelKey: "settings.shortcutDeleteLine",
+    scope: "editor",
+    defaultShortcut: "Shift+Mod+K",
+  },
+  {
+    id: "moveLineUp",
+    labelKey: "settings.shortcutMoveLineUp",
+    scope: "editor",
+    defaultShortcut: "Alt+ArrowUp",
+  },
+  {
+    id: "moveLineDown",
+    labelKey: "settings.shortcutMoveLineDown",
+    scope: "editor",
+    defaultShortcut: "Alt+ArrowDown",
+  },
+  {
+    id: "copyLineUp",
+    labelKey: "settings.shortcutCopyLineUp",
+    scope: "editor",
+    defaultShortcut: "Shift+Alt+ArrowUp",
+  },
+  {
+    id: "copyLineDown",
+    labelKey: "settings.shortcutCopyLineDown",
+    scope: "editor",
+    defaultShortcut: "Shift+Alt+ArrowDown",
+  },
+  {
+    id: "undo",
+    labelKey: "settings.shortcutUndo",
+    scope: "editor",
+    defaultShortcut: "Mod+Z",
+  },
+  {
+    id: "redo",
+    labelKey: "settings.shortcutRedo",
+    scope: "editor",
+    defaultShortcut: "Shift+Mod+Z",
+  },
+  {
+    id: "selectAll",
+    labelKey: "settings.shortcutSelectAll",
+    scope: "editor",
+    defaultShortcut: "Mod+A",
   },
   {
     id: "copyCurrentRow",
@@ -140,19 +224,10 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
   },
 ];
 
-export const DEFAULT_SHORTCUT_SETTINGS: ShortcutSettings = Object.fromEntries(
-  SHORTCUT_DEFINITIONS.map((definition) => [definition.id, definition.defaultShortcut]),
-) as ShortcutSettings;
+export const DEFAULT_SHORTCUT_SETTINGS: ShortcutSettings = Object.fromEntries(SHORTCUT_DEFINITIONS.map((definition) => [definition.id, definition.defaultShortcut])) as ShortcutSettings;
 
 export function normalizeShortcutSettings(settings?: Partial<ShortcutSettings>): ShortcutSettings {
-  return Object.fromEntries(
-    SHORTCUT_DEFINITIONS.map((definition) => [
-      definition.id,
-      typeof settings?.[definition.id] === "string" && settings[definition.id]?.trim()
-        ? settings[definition.id]
-        : definition.defaultShortcut,
-    ]),
-  ) as ShortcutSettings;
+  return Object.fromEntries(SHORTCUT_DEFINITIONS.map((definition) => [definition.id, typeof settings?.[definition.id] === "string" ? settings[definition.id] : definition.defaultShortcut])) as ShortcutSettings;
 }
 
 export function shortcutToCodeMirrorKey(shortcut: string): string {
@@ -174,16 +249,11 @@ export function formatShortcut(shortcut: string, platform = globalThis.navigator
     .join("+");
 }
 
-export function findShortcutConflict(
-  actionId: ShortcutActionId,
-  shortcut: string,
-  shortcuts: ShortcutSettings,
-): ShortcutActionId | null {
+export function findShortcutConflict(actionId: ShortcutActionId, shortcut: string, shortcuts: ShortcutSettings): ShortcutActionId | null {
+  if (!shortcut) return null;
   const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === actionId);
   if (!definition) return null;
 
-  const conflict = SHORTCUT_DEFINITIONS.find(
-    (item) => item.id !== actionId && item.scope === definition.scope && shortcuts[item.id] === shortcut,
-  );
+  const conflict = SHORTCUT_DEFINITIONS.find((item) => item.id !== actionId && item.scope === definition.scope && shortcuts[item.id] === shortcut);
   return conflict?.id ?? null;
 }

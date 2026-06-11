@@ -3,6 +3,7 @@ export type DatabaseType =
   | "postgres"
   | "sqlite"
   | "rqlite"
+  | "turso"
   | "redis"
   | "duckdb"
   | "clickhouse"
@@ -48,6 +49,7 @@ export type DatabaseType =
   | "iotdb"
   | "etcd"
   | "iris"
+  | "influxdb"
   | "jdbc";
 
 export interface SqlSnippet {
@@ -92,8 +94,10 @@ export interface ConnectionConfig {
   redis_sentinel_password?: string;
   redis_sentinel_tls?: boolean;
   redis_cluster_nodes?: string;
+  redis_key_separator?: string;
   etcd_endpoints?: string;
   one_time?: boolean;
+  read_only?: boolean;
 }
 
 export type TransportLayerConfig = ({ type: "ssh" } & SshTunnelConfig) | ({ type: "proxy" } & ProxyTunnelConfig);
@@ -110,6 +114,7 @@ export interface SshTunnelConfig {
   key_passphrase?: string;
   connect_timeout_secs?: number;
   expose_lan?: boolean;
+  use_ssh_agent?: boolean;
 }
 
 export interface ProxyTunnelConfig {
@@ -320,7 +325,8 @@ export type TreeNodeType =
   | "redis-db"
   | "etcd-root"
   | "mongo-db"
-  | "mongo-collection";
+  | "mongo-collection"
+  | "elasticsearch-index";
 
 export interface ConnectionGroup {
   id: string;
@@ -328,9 +334,7 @@ export interface ConnectionGroup {
   collapsed: boolean;
 }
 
-export type SidebarOrderEntry =
-  | { type: "group"; id: string; connectionIds: string[] }
-  | { type: "connection"; id: string };
+export type SidebarOrderEntry = { type: "group"; id: string; connectionIds: string[] } | { type: "connection"; id: string };
 
 export interface SidebarLayout {
   groups: ConnectionGroup[];
@@ -439,27 +443,17 @@ export interface QueryTab {
     }[];
   };
   querySourceColumns?: Array<string | undefined>;
-  queryEditabilityReason?:
-    | "not-select"
-    | "cte"
-    | "set-operation"
-    | "aggregation"
-    | "external-source"
-    | "complex-source"
-    | "computed-columns"
-    | "no-table"
-    | "no-primary-key"
-    | "primary-key-not-returned"
-    | "aliased-columns"
-    | "metadata-unavailable";
+  queryEditabilityReason?: "not-select" | "cte" | "set-operation" | "aggregation" | "external-source" | "complex-source" | "computed-columns" | "no-table" | "no-primary-key" | "primary-key-not-returned" | "aliased-columns" | "metadata-unavailable";
   resultEvicted?: boolean;
   whereInput?: string;
+  previewSql?: string;
 }
 
 export interface SavedSqlFolder {
   id: string;
   connectionId: string;
   name: string;
+  orderIndex?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -472,6 +466,9 @@ export interface SavedSqlFile {
   database: string;
   schema?: string;
   sql: string;
+  orderIndex?: number;
+  openCount?: number;
+  openedAt?: string;
   createdAt: string;
   updatedAt: string;
 }

@@ -242,6 +242,10 @@ async fn main() {
         .route("/redis/list-remove", post(routes::redis::list_remove))
         .route("/redis/set-add", post(routes::redis::set_add))
         .route("/redis/set-remove", post(routes::redis::set_remove))
+        .route("/redis/zadd", post(routes::redis::zadd))
+        .route("/redis/stream-add", post(routes::redis::stream_add))
+        .route("/redis/json-set", post(routes::redis::json_set))
+        .route("/redis/check-json-module", post(routes::redis::check_json_module))
         .route("/redis/delete-keys", post(routes::redis::delete_keys))
         .route("/redis/flush-db", post(routes::redis::flush_db))
         .route("/redis/execute-command", post(routes::redis::execute_command))
@@ -253,6 +257,7 @@ async fn main() {
         // MongoDB
         .route("/mongo/list-databases", post(routes::mongo::list_databases))
         .route("/mongo/list-collections", post(routes::mongo::list_collections))
+        .route("/document-store/find-documents", post(routes::mongo::document_find_documents))
         .route("/mongo/find-documents", post(routes::mongo::find_documents))
         .route("/mongo/aggregate-documents", post(routes::mongo::aggregate_documents))
         .route("/mongo/insert-document", post(routes::mongo::insert_document))

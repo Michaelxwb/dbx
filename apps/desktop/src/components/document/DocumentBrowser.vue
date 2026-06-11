@@ -2,24 +2,7 @@
 import { computed, ref, onMounted, onBeforeUnmount } from "vue";
 import { uuid } from "@/lib/utils";
 import { useI18n } from "vue-i18n";
-import {
-  RefreshCw,
-  RefreshCcw,
-  Loader2,
-  Trash2,
-  Plus,
-  Save,
-  ChevronLeft,
-  ChevronRight,
-  Table2,
-  Braces,
-  X,
-  Columns3,
-  Check,
-  Search,
-  Wrench,
-  Filter,
-} from "@lucide/vue";
+import { RefreshCw, RefreshCcw, Loader2, Trash2, Plus, Save, ChevronLeft, ChevronRight, Table2, Braces, X, Columns3, Check, Search, Wrench, Filter } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -29,11 +12,12 @@ import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import DataGrid from "@/components/grid/DataGrid.vue";
 import * as api from "@/lib/api";
 import { clampSearchSplitWidth } from "@/lib/dataGridSearchSplit";
+import { buildDocumentFilterCondition, combineDocumentFilterConditions, currentDocumentFilterJson, defaultDocumentFilterRule, documentFilterModeNeedsValue, documentFilterModeOptions, documentStoreProviderFor, type DocumentFilterMode, type DocumentFilterRule } from "@/lib/documentStoreProvider";
 import { normalizeResultPageSize } from "@/lib/paginationPageSize";
 import { useSettingsStore } from "@/stores/settingsStore";
 import JsonEditNode from "./JsonEditNode.vue";
 import type { EditNode } from "@/types/editor";
-import type { QueryResult } from "@/types/database";
+import type { DatabaseType, QueryResult } from "@/types/database";
 import { Splitpanes, Pane } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
 
@@ -44,6 +28,7 @@ const props = defineProps<{
   connectionId: string;
   database: string;
   collection: string;
+  databaseType?: DatabaseType;
 }>();
 
 type JsonRecord = Record<string, unknown>;
@@ -70,19 +55,22 @@ const filterInput = ref("");
 const sortInput = ref("");
 const dataGridRef = ref<InstanceType<typeof DataGrid>>();
 const columnVisibilitySearch = ref("");
-const columnVisibilityOptions = computed(
-  () => dataGridRef.value?.filteredColumnVisibilityOptions(columnVisibilitySearch.value) ?? [],
-);
+const columnVisibilityOptions = computed(() => dataGridRef.value?.filteredColumnVisibilityOptions(columnVisibilitySearch.value) ?? []);
 const tableSearchSplitContainerRef = ref<HTMLDivElement>();
 const tableFindPaneWidth = ref<number | null>(null);
 const isResizingTableSearchSplit = ref(false);
 let tableSearchSplitStartX = 0;
 let tableSearchSplitStartWidth = 0;
+const documentStoreProvider = computed(() => documentStoreProviderFor(props.databaseType));
 
 const tableFindPaneStyle = computed(() => {
   if (tableFindPaneWidth.value == null) return {};
   return { flex: `0 0 ${tableFindPaneWidth.value}px` };
 });
+const documentStoreLabels = computed(() => ({
+  documentsLabel: documentStoreProvider.value.documentsLabel({ total: total.value, t }),
+  queryPreview: documentQueryPreview.value,
+}));
 
 type PendingDelete = { kind: "document"; index: number } | { kind: "field"; index: number; name: string };
 type LocalFilterSummary = {
@@ -91,36 +79,9 @@ type LocalFilterSummary = {
   values: string[];
   hiddenValueCount: number;
 };
-type MongoFilterMode =
-  | "equals"
-  | "not-equals"
-  | "like"
-  | "not-like"
-  | "greater-than"
-  | "less-than"
-  | "is-null"
-  | "is-not-null";
-type MongoFilterRule = {
-  id: string;
-  fieldName: string;
-  mode: MongoFilterMode;
-  rawValue: string;
-  conjunction: "AND" | "OR";
-};
-
-const mongoFilterModeOptions: Array<{ value: MongoFilterMode; labelKey: string }> = [
-  { value: "equals", labelKey: "grid.filterBuilderEquals" },
-  { value: "not-equals", labelKey: "grid.filterBuilderNotEquals" },
-  { value: "like", labelKey: "grid.filterBuilderContains" },
-  { value: "not-like", labelKey: "grid.filterBuilderNotContains" },
-  { value: "greater-than", labelKey: "grid.filterBuilderGreaterThan" },
-  { value: "less-than", labelKey: "grid.filterBuilderLessThan" },
-  { value: "is-null", labelKey: "grid.filterBuilderIsNull" },
-  { value: "is-not-null", labelKey: "grid.filterBuilderIsNotNull" },
-];
-const mongoFilterBuilderOpen = ref(false);
-const mongoFilterRules = ref<MongoFilterRule[]>([]);
-const appliedMongoFilter = ref<Record<string, unknown> | null>(null);
+const documentFilterBuilderOpen = ref(false);
+const documentFilterRules = ref<DocumentFilterRule[]>([]);
+const appliedDocumentFilter = ref<Record<string, unknown> | null>(null);
 
 const pendingDelete = ref<PendingDelete | null>(null);
 
@@ -141,6 +102,7 @@ const deleteDetails = computed(() => {
   if (!pending) return "";
   if (pending.kind === "document") {
     const id = documents.value[pending.index]?._id ?? "";
+    if (props.databaseType === "elasticsearch") return `Elasticsearch index: ${props.collection}\nDocument _id: ${String(id)}`;
     return t("dangerDialog.mongoDocumentDetails", { collection: props.collection, id: String(id) });
   }
   return t("dangerDialog.mongoFieldDetails", { field: pending.name || t("mongo.field") });
@@ -179,154 +141,82 @@ const gridResult = computed<QueryResult>(() => {
 
   return { columns, rows, affected_rows: 0, execution_time_ms: 0, truncated: false };
 });
-const mongoFilterFieldOptions = computed(() => gridResult.value.columns);
-const mongoStructuredFilterCount = computed(() => (appliedMongoFilter.value ? 1 : 0));
+const documentFilterFieldOptions = computed(() => gridResult.value.columns);
+const documentStructuredFilterCount = computed(() => (appliedDocumentFilter.value ? 1 : 0));
 
-function defaultMongoFilterRule(): MongoFilterRule {
-  return {
-    id: uuid(),
-    fieldName: mongoFilterFieldOptions.value[0] ?? "",
-    mode: "equals",
-    rawValue: "",
-    conjunction: "AND",
-  };
+function createDocumentFilterRule(): DocumentFilterRule {
+  return defaultDocumentFilterRule(uuid(), documentFilterFieldOptions.value[0] ?? "");
 }
 
-function ensureMongoFilterRule() {
-  if (mongoFilterRules.value.length === 0 && mongoFilterFieldOptions.value.length > 0) {
-    mongoFilterRules.value = [defaultMongoFilterRule()];
+function ensureDocumentFilterRule() {
+  if (documentFilterRules.value.length === 0 && documentFilterFieldOptions.value.length > 0) {
+    documentFilterRules.value = [createDocumentFilterRule()];
   }
 }
 
-function addMongoFilterRule() {
-  ensureMongoFilterRule();
-  mongoFilterRules.value = [...mongoFilterRules.value, defaultMongoFilterRule()];
+function addDocumentFilterRule() {
+  ensureDocumentFilterRule();
+  documentFilterRules.value = [...documentFilterRules.value, createDocumentFilterRule()];
 }
 
-function removeMongoFilterRule(ruleId: string) {
-  mongoFilterRules.value = mongoFilterRules.value.filter((rule) => rule.id !== ruleId);
-  if (mongoFilterRules.value.length === 0) appliedMongoFilter.value = null;
+function removeDocumentFilterRule(ruleId: string) {
+  documentFilterRules.value = documentFilterRules.value.filter((rule) => rule.id !== ruleId);
+  if (documentFilterRules.value.length === 0) appliedDocumentFilter.value = null;
 }
 
-function updateMongoFilterRule(ruleId: string, patch: Partial<MongoFilterRule>) {
-  mongoFilterRules.value = mongoFilterRules.value.map((rule) => {
+function updateDocumentFilterRule(ruleId: string, patch: Partial<DocumentFilterRule>) {
+  documentFilterRules.value = documentFilterRules.value.map((rule) => {
     if (rule.id !== ruleId) return rule;
     const next = { ...rule, ...patch };
-    if (!mongoFilterModeNeedsValue(next.mode)) next.rawValue = "";
+    if (!documentFilterModeNeedsValue(next.mode)) next.rawValue = "";
     return next;
   });
 }
 
-function resetMongoFilterBuilder() {
-  appliedMongoFilter.value = null;
-  mongoFilterRules.value = mongoFilterFieldOptions.value.length > 0 ? [defaultMongoFilterRule()] : [];
+function resetDocumentFilterBuilder() {
+  appliedDocumentFilter.value = null;
+  documentFilterRules.value = documentFilterFieldOptions.value.length > 0 ? [createDocumentFilterRule()] : [];
 }
 
-function mongoFilterModeNeedsValue(mode: MongoFilterMode): boolean {
-  return mode !== "is-null" && mode !== "is-not-null";
+function currentDocumentFilter(): string | undefined {
+  return currentDocumentFilterJson(filterInput.value, appliedDocumentFilter.value);
 }
 
-function parseMongoFilterValue(raw: string): unknown {
-  const trimmed = raw.trim();
-  if (!trimmed) return "";
-  try {
-    return JSON.parse(trimmed);
-  } catch {
-    return trimmed;
-  }
-}
-
-function mongoConditionForRule(rule: MongoFilterRule): Record<string, unknown> | null {
-  if (!rule.fieldName) return null;
-  if (mongoFilterModeNeedsValue(rule.mode) && !rule.rawValue.trim()) return null;
-  const value = mongoFilterModeNeedsValue(rule.mode) ? parseMongoFilterValue(rule.rawValue) : null;
-  switch (rule.mode) {
-    case "equals":
-      return { [rule.fieldName]: value };
-    case "not-equals":
-      return { [rule.fieldName]: { $ne: value } };
-    case "like":
-      return { [rule.fieldName]: { $regex: String(value), $options: "i" } };
-    case "not-like":
-      return { [rule.fieldName]: { $not: { $regex: String(value), $options: "i" } } };
-    case "greater-than":
-      return { [rule.fieldName]: { $gt: value } };
-    case "less-than":
-      return { [rule.fieldName]: { $lt: value } };
-    case "is-null":
-      return { [rule.fieldName]: null };
-    case "is-not-null":
-      return { [rule.fieldName]: { $ne: null } };
-  }
-}
-
-function combineMongoConditions(
-  conditions: Record<string, unknown>[],
-  rules: MongoFilterRule[],
-): Record<string, unknown> | null {
-  if (conditions.length === 0) return null;
-  let result = conditions[0];
-  for (let i = 1; i < conditions.length; i++) {
-    const operator = rules[i]?.conjunction === "OR" ? "$or" : "$and";
-    result = { [operator]: [result, conditions[i]] };
-  }
-  return result;
-}
-
-function parseMongoFilterInput(): Record<string, unknown> {
-  const trimmed = filterInput.value.trim();
-  if (!trimmed) return {};
-  const parsed = JSON.parse(trimmed);
-  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
-}
-
-function currentMongoFilter(): string | undefined {
-  const manual = parseMongoFilterInput();
-  const structured = appliedMongoFilter.value;
-  const filter = structured ? (Object.keys(manual).length ? { $and: [manual, structured] } : structured) : manual;
-  return Object.keys(filter).length ? JSON.stringify(filter) : undefined;
-}
-
-const mongoQueryPreview = computed(() => {
+const documentQueryPreview = computed(() => {
   let filter = "{}";
   try {
-    filter = currentMongoFilter() ?? "{}";
+    filter = currentDocumentFilter() ?? "{}";
   } catch {
     filter = filterInput.value.trim() || "{}";
   }
-  const sort = sortInput.value.trim();
-  const parts = [`db.${props.collection}.find(${filter})`];
-  if (sort) parts.push(`.sort(${sort})`);
-  parts.push(`.skip(${page.value * pageSize.value}).limit(${pageSize.value})`);
-  return parts.join("");
+  return documentStoreProvider.value.queryPreview({
+    collection: props.collection,
+    filterJson: filter,
+    sortJson: sortInput.value.trim(),
+    skip: page.value * pageSize.value,
+    limit: pageSize.value,
+  });
 });
 
-async function applyMongoStructuredFilters() {
-  const items = mongoFilterRules.value
-    .map((rule) => ({ rule, condition: mongoConditionForRule(rule) }))
-    .filter((item): item is { rule: MongoFilterRule; condition: Record<string, unknown> } => !!item.condition);
-  const structured = combineMongoConditions(
+async function applyDocumentStructuredFilters() {
+  const items = documentFilterRules.value.map((rule) => ({ rule, condition: buildDocumentFilterCondition(rule) })).filter((item): item is { rule: DocumentFilterRule; condition: Record<string, unknown> } => !!item.condition);
+  const structured = combineDocumentFilterConditions(
     items.map((item) => item.condition),
     items.map((item) => item.rule),
   );
-  appliedMongoFilter.value = structured;
-  mongoFilterBuilderOpen.value = false;
+  appliedDocumentFilter.value = structured;
+  documentFilterBuilderOpen.value = false;
   applyFilter();
 }
 
-function clearMongoFilters(clearLocalFilter?: (columnIndex?: number) => void) {
-  appliedMongoFilter.value = null;
-  resetMongoFilterBuilder();
+function clearDocumentFilters(clearLocalFilter?: (columnIndex?: number) => void) {
+  appliedDocumentFilter.value = null;
+  resetDocumentFilterBuilder();
   clearLocalFilter?.();
   applyFilter();
 }
 
-async function gridSave(changes: {
-  dirtyRows: Map<number, Map<number, string | number | boolean | null>>;
-  deletedRows: Set<number>;
-  columns: string[];
-  rows: (string | number | boolean | null)[][];
-}) {
+async function gridSave(changes: { dirtyRows: Map<number, Map<number, string | number | boolean | null>>; deletedRows: Set<number>; columns: string[]; rows: (string | number | boolean | null)[][] }) {
   const cols = changes.columns;
   const idColIdx = cols.indexOf("_id");
   if (idColIdx < 0) throw new Error("No _id column");
@@ -353,13 +243,7 @@ async function gridSave(changes: {
         updated[col] = newVal;
       }
     }
-    await api.mongoUpdateDocument(
-      props.connectionId,
-      props.database,
-      props.collection,
-      String(id),
-      JSON.stringify(updated),
-    );
+    await api.mongoUpdateDocument(props.connectionId, props.database, props.collection, String(id), JSON.stringify(updated));
   }
 
   for (const rowIdx of changes.deletedRows) {
@@ -376,17 +260,9 @@ async function load() {
   loading.value = true;
   error.value = "";
   try {
-    const filter = currentMongoFilter();
+    const filter = currentDocumentFilter();
     const sort = sortInput.value.trim() || undefined;
-    const result = await api.mongoFindDocuments(
-      props.connectionId,
-      props.database,
-      props.collection,
-      page.value * pageSize.value,
-      pageSize.value,
-      filter,
-      sort,
-    );
+    const result = await api.documentFindDocuments(props.connectionId, props.database, props.collection, page.value * pageSize.value, pageSize.value, filter, sort);
     const nextDocuments = result.documents.map(asRecord);
     documents.value = nextDocuments;
     if (nextDocuments.length > 0) {
@@ -420,11 +296,7 @@ function paginate(offset: number, limit: number) {
 }
 
 function onSort(column: string, _columnIndex: number, direction: "asc" | "desc" | null) {
-  if (direction) {
-    sortInput.value = JSON.stringify({ [column]: direction === "asc" ? 1 : -1 });
-  } else {
-    sortInput.value = "";
-  }
+  sortInput.value = documentStoreProvider.value.sortInputForColumn(column, direction);
   page.value = 0;
   load();
 }
@@ -455,9 +327,7 @@ function startNew() {
 function startEdit() {
   const doc = selectedDoc.value;
   if (!doc) return;
-  editFields.value = Object.entries(doc).map(([name, value]) =>
-    createEditNode(name, value, name === "_id", name === "_id"),
-  );
+  editFields.value = Object.entries(doc).map(([name, value]) => createEditNode(name, value, name === "_id", name === "_id"));
   isEditing.value = true;
   isNew.value = false;
 }
@@ -497,9 +367,7 @@ function createEditNode(keyName: string, value: unknown, readonlyKey: boolean, r
       valueText: "",
       readonlyKey,
       readonlyValue,
-      children: Object.entries(value as JsonRecord).map(([childName, child]) =>
-        createEditNode(childName, child, readonlyValue, readonlyValue),
-      ),
+      children: Object.entries(value as JsonRecord).map(([childName, child]) => createEditNode(childName, child, readonlyValue, readonlyValue)),
     };
   }
 
@@ -589,13 +457,7 @@ async function saveDoc() {
         error.value = "No _id field";
         return;
       }
-      await api.mongoUpdateDocument(
-        props.connectionId,
-        props.database,
-        props.collection,
-        String(id),
-        JSON.stringify(doc),
-      );
+      await api.mongoUpdateDocument(props.connectionId, props.database, props.collection, String(id), JSON.stringify(doc));
     }
     isEditing.value = false;
     isNew.value = false;
@@ -666,16 +528,13 @@ function docPreview(doc: JsonRecord): string {
 function highlightedJson(json: string): string {
   const escaped = json.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
-  return escaped.replace(
-    /("(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(?:true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g,
-    (match) => {
-      let cls = "json-number";
-      if (match.startsWith('"')) cls = match.endsWith(":") ? "json-key" : "json-string";
-      else if (match === "true" || match === "false") cls = "json-boolean";
-      else if (match === "null") cls = "json-null";
-      return `<span class="${cls}">${match}</span>`;
-    },
-  );
+  return escaped.replace(/("(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(?:true|false|null)\b|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/g, (match) => {
+    let cls = "json-number";
+    if (match.startsWith('"')) cls = match.endsWith(":") ? "json-key" : "json-string";
+    else if (match === "true" || match === "false") cls = "json-boolean";
+    else if (match === "null") cls = "json-null";
+    return `<span class="${cls}">${match}</span>`;
+  });
 }
 
 onMounted(load);
@@ -731,49 +590,25 @@ function resetTableSearchSplitWidth() {
     <!-- Top toolbar: view toggle + document count + pagination + actions -->
     <div class="h-9 flex items-center gap-1 px-3 border-b shrink-0 text-xs text-muted-foreground">
       <div class="flex items-center border rounded-md overflow-hidden mr-2">
-        <Button
-          variant="ghost"
-          size="icon"
-          class="h-5 w-5 rounded-none"
-          :class="{ 'bg-accent': viewMode === 'document' }"
-          :title="t('mongo.documentView')"
-          @click="viewMode = 'document'"
-        >
+        <Button variant="ghost" size="icon" class="h-5 w-5 rounded-none" :class="{ 'bg-accent': viewMode === 'document' }" :title="t('mongo.documentView')" @click="viewMode = 'document'">
           <Braces class="h-3 w-3" />
         </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          class="h-5 w-5 rounded-none"
-          :class="{ 'bg-accent': viewMode === 'table' }"
-          :title="t('mongo.tableView')"
-          @click="viewMode = 'table'"
-        >
+        <Button variant="ghost" size="icon" class="h-5 w-5 rounded-none" :class="{ 'bg-accent': viewMode === 'table' }" :title="t('mongo.tableView')" @click="viewMode = 'table'">
           <Table2 class="h-3 w-3" />
         </Button>
       </div>
 
-      <span class="shrink-0 ml-1">{{ t("mongo.documents", { count: total }) }}</span>
+      <span class="shrink-0 ml-1">{{ documentStoreLabels.documentsLabel }}</span>
 
-      <Button v-if="viewMode === 'document'" variant="ghost" size="icon" class="h-5 w-5" @click="startNew"
-        ><Plus class="h-3 w-3"
-      /></Button>
-      <Button v-if="viewMode === 'document'" variant="ghost" size="icon" class="h-5 w-5" @click="load"
-        ><RefreshCw class="h-3 w-3" :class="{ 'animate-spin': loading }"
-      /></Button>
+      <Button v-if="viewMode === 'document'" variant="ghost" size="icon" class="h-5 w-5" @click="startNew"><Plus class="h-3 w-3" /></Button>
+      <Button v-if="viewMode === 'document'" variant="ghost" size="icon" class="h-5 w-5" @click="load"><RefreshCw class="h-3 w-3" :class="{ 'animate-spin': loading }" /></Button>
 
       <div v-if="viewMode === 'document'" class="flex items-center gap-1 ml-1">
         <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="page <= 0" @click="prevPage">
           <ChevronLeft class="h-3 w-3" />
         </Button>
         <span>{{ page + 1 }} / {{ Math.max(1, Math.ceil(total / pageSize)) }}</span>
-        <Button
-          variant="ghost"
-          size="icon"
-          class="h-5 w-5"
-          :disabled="(page + 1) * pageSize >= total"
-          @click="nextPage"
-        >
+        <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="(page + 1) * pageSize >= total" @click="nextPage">
           <ChevronRight class="h-3 w-3" />
         </Button>
       </div>
@@ -782,92 +617,41 @@ function resetTableSearchSplitWidth() {
 
       <Popover v-if="viewMode === 'table' && gridResult.columns.length">
         <PopoverTrigger as-child>
-          <Button
-            variant="ghost"
-            size="sm"
-            class="h-5 shrink-0 gap-1 px-1.5 text-xs text-foreground hover:bg-accent"
-            :class="{ 'bg-accent text-foreground': (dataGridRef?.hiddenColumnCount ?? 0) > 0 }"
-            :title="t('grid.columnVisibility')"
-            :aria-label="t('grid.columnVisibility')"
-          >
+          <Button variant="ghost" size="sm" class="h-5 shrink-0 gap-1 px-1.5 text-xs text-foreground hover:bg-accent" :class="{ 'bg-accent text-foreground': (dataGridRef?.hiddenColumnCount ?? 0) > 0 }" :title="t('grid.columnVisibility')" :aria-label="t('grid.columnVisibility')">
             <Columns3 class="h-3.5 w-3.5" />
             {{ t("grid.columnVisibility") }}
-            <span v-if="(dataGridRef?.hiddenColumnCount ?? 0) > 0" class="tabular-nums">
-              {{ dataGridRef?.visibleColumnCount }}/{{ dataGridRef?.displayableColumnCount }}
-            </span>
+            <span v-if="(dataGridRef?.hiddenColumnCount ?? 0) > 0" class="tabular-nums"> {{ dataGridRef?.visibleColumnCount }}/{{ dataGridRef?.displayableColumnCount }} </span>
           </Button>
         </PopoverTrigger>
-        <PopoverContent
-          align="end"
-          class="w-64 max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-xl border bg-popover p-0 text-popover-foreground shadow-xl"
-          @click.stop
-          @keydown.stop
-        >
+        <PopoverContent align="end" class="w-64 max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-xl border bg-popover p-0 text-popover-foreground shadow-xl" @click.stop @keydown.stop>
           <div class="border-b bg-muted/40 px-2 py-1.5">
             <div class="flex items-center justify-between gap-2">
               <div class="text-xs font-semibold">{{ t("grid.columnVisibility") }}</div>
-              <div class="text-[10px] text-muted-foreground tabular-nums">
-                {{ dataGridRef?.visibleColumnCount ?? 0 }}/{{ dataGridRef?.displayableColumnCount ?? 0 }}
-              </div>
+              <div class="text-[10px] text-muted-foreground tabular-nums">{{ dataGridRef?.visibleColumnCount ?? 0 }}/{{ dataGridRef?.displayableColumnCount ?? 0 }}</div>
             </div>
           </div>
           <div class="flex items-center gap-1.5 border-b px-2 py-1.5">
             <Search class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-            <input
-              v-model="columnVisibilitySearch"
-              autocapitalize="off"
-              autocorrect="off"
-              spellcheck="false"
-              class="h-6 min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
-              :placeholder="t('grid.searchColumns')"
-            />
+            <input v-model="columnVisibilitySearch" autocapitalize="off" autocorrect="off" spellcheck="false" class="h-6 min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground" :placeholder="t('grid.searchColumns')" />
           </div>
           <div class="max-h-72 overflow-auto py-0.5">
-            <button
-              v-for="option in columnVisibilityOptions"
-              :key="`${option.index}:${option.column}`"
-              type="button"
-              class="grid w-full grid-cols-[1.5rem_minmax(0,1fr)] items-center px-2 py-1 text-left text-xs hover:bg-accent"
-              @click="dataGridRef?.toggleColumnVisibility(option.index)"
-            >
-              <span
-                class="flex h-4 w-4 items-center justify-center rounded border"
-                :class="
-                  dataGridRef?.isColumnVisible(option.index)
-                    ? 'border-primary bg-primary text-primary-foreground'
-                    : 'border-border bg-background text-transparent'
-                "
-              >
+            <button v-for="option in columnVisibilityOptions" :key="`${option.index}:${option.column}`" type="button" class="grid w-full grid-cols-[1.5rem_minmax(0,1fr)] items-center px-2 py-1 text-left text-xs hover:bg-accent" @click="dataGridRef?.toggleColumnVisibility(option.index)">
+              <span class="flex h-4 w-4 items-center justify-center rounded border" :class="dataGridRef?.isColumnVisible(option.index) ? 'border-primary bg-primary text-primary-foreground' : 'border-border bg-background text-transparent'">
                 <Check class="h-3 w-3 stroke-[3]" />
               </span>
               <span class="truncate font-mono text-xs" :title="option.column">{{ option.column }}</span>
             </button>
-            <div
-              v-if="columnVisibilityOptions.length === 0"
-              class="px-2 py-6 text-center text-xs text-muted-foreground"
-            >
+            <div v-if="columnVisibilityOptions.length === 0" class="px-2 py-6 text-center text-xs text-muted-foreground">
               {{ t("grid.noSearchResults") }}
             </div>
           </div>
           <div class="flex items-center justify-between gap-2 border-t bg-muted/30 px-2 py-1.5">
             <span class="text-[11px] text-muted-foreground">{{ t("grid.columnVisibilityHint") }}</span>
             <div class="flex items-center gap-1">
-              <Button
-                variant="ghost"
-                size="sm"
-                class="h-7 px-2 text-xs"
-                :disabled="(dataGridRef?.displayableColumnCount ?? 0) <= 1"
-                @click="dataGridRef?.invertColumnVisibility()"
-              >
+              <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="(dataGridRef?.displayableColumnCount ?? 0) <= 1" @click="dataGridRef?.invertColumnVisibility()">
                 {{ t("grid.invertColumnVisibility") }}
               </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                class="h-7 px-2 text-xs"
-                :disabled="(dataGridRef?.hiddenColumnCount ?? 0) === 0"
-                @click="dataGridRef?.showAllColumns()"
-              >
+              <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" :disabled="(dataGridRef?.hiddenColumnCount ?? 0) === 0" @click="dataGridRef?.showAllColumns()">
                 {{ t("grid.showAllColumns") }}
               </Button>
             </div>
@@ -877,42 +661,19 @@ function resetTableSearchSplitWidth() {
 
       <Popover v-if="viewMode === 'table' && gridResult.columns.length">
         <PopoverTrigger as-child>
-          <Button
-            variant="ghost"
-            size="icon"
-            class="h-6 w-7 shrink-0 text-foreground hover:bg-accent"
-            :class="{ 'bg-accent text-foreground': dataGridRef?.nullColumnsHidden }"
-            :title="t('grid.viewOptions')"
-            :aria-label="t('grid.viewOptions')"
-          >
+          <Button variant="ghost" size="icon" class="h-6 w-7 shrink-0 text-foreground hover:bg-accent" :class="{ 'bg-accent text-foreground': dataGridRef?.nullColumnsHidden }" :title="t('grid.viewOptions')" :aria-label="t('grid.viewOptions')">
             <Wrench class="h-4 w-4" />
           </Button>
         </PopoverTrigger>
-        <PopoverContent
-          align="end"
-          class="w-max min-w-44 max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-xl border bg-popover p-0 text-popover-foreground shadow-xl"
-          @click.stop
-          @keydown.stop
-        >
+        <PopoverContent align="end" class="w-max min-w-44 max-w-[calc(100vw-2rem)] gap-0 overflow-hidden rounded-xl border bg-popover p-0 text-popover-foreground shadow-xl" @click.stop @keydown.stop>
           <div class="border-b bg-muted/40 px-3 py-2">
             <div class="text-xs font-semibold">{{ t("grid.viewOptions") }}</div>
           </div>
-          <label
-            class="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs hover:bg-accent"
-            :class="{ 'cursor-not-allowed opacity-60': !dataGridRef?.canToggleAllNullColumns }"
-          >
-            <input
-              type="checkbox"
-              class="h-3.5 w-3.5 shrink-0 accent-primary"
-              :checked="!!dataGridRef?.nullColumnsHidden"
-              :disabled="!dataGridRef?.canToggleAllNullColumns"
-              @change="dataGridRef?.toggleAllNullColumns()"
-            />
+          <label class="flex cursor-pointer items-center gap-2 px-3 py-2 text-xs hover:bg-accent" :class="{ 'cursor-not-allowed opacity-60': !dataGridRef?.canToggleAllNullColumns }">
+            <input type="checkbox" class="h-3.5 w-3.5 shrink-0 accent-primary" :checked="!!dataGridRef?.nullColumnsHidden" :disabled="!dataGridRef?.canToggleAllNullColumns" @change="dataGridRef?.toggleAllNullColumns()" />
             <span class="min-w-0 flex items-center gap-1 font-medium">
               {{ t("grid.hideNullColumns") }}
-              <span v-if="(dataGridRef?.allNullColumnCount ?? 0) > 0" class="text-muted-foreground tabular-nums">
-                ({{ dataGridRef?.allNullColumnCount }})
-              </span>
+              <span v-if="(dataGridRef?.allNullColumnCount ?? 0) > 0" class="text-muted-foreground tabular-nums"> ({{ dataGridRef?.allNullColumnCount }}) </span>
             </span>
           </label>
         </PopoverContent>
@@ -929,7 +690,7 @@ function resetTableSearchSplitWidth() {
       editable
       :custom-save="gridSave"
       :loading="loading"
-      :sql="mongoQueryPreview"
+      :sql="documentStoreLabels.queryPreview"
       :page-offset="page * pageSize"
       :page-limit="pageSize"
       :total-row-count="total"
@@ -937,54 +698,32 @@ function resetTableSearchSplitWidth() {
       @reload="load"
       @paginate="(offset: number, limit: number) => paginate(offset, limit)"
     >
-      <template
-        #search-bar="{
-          localFilterCount,
-          hasLocalColumnFilters,
-          localFilterSummaries,
-          clearLocalFilter,
-        }: {
-          localFilterCount: number;
-          hasLocalColumnFilters: boolean;
-          localFilterSummaries: LocalFilterSummary[];
-          clearLocalFilter: (columnIndex?: number) => void;
-        }"
-      >
+      <template #search-bar="{ localFilterCount, hasLocalColumnFilters, localFilterSummaries, clearLocalFilter }: { localFilterCount: number; hasLocalColumnFilters: boolean; localFilterSummaries: LocalFilterSummary[]; clearLocalFilter: (columnIndex?: number) => void }">
         <div ref="tableSearchSplitContainerRef" class="flex flex-1 min-w-0">
           <div class="flex flex-1 items-center gap-1 px-2 py-0.5 min-w-0" :style="tableFindPaneStyle">
-            <Popover v-model:open="mongoFilterBuilderOpen">
+            <Popover v-model:open="documentFilterBuilderOpen">
               <PopoverTrigger as-child>
                 <button
                   type="button"
                   class="relative flex h-5 w-5 shrink-0 items-center justify-center rounded border text-[11px] font-medium transition-colors"
-                  :class="
-                    hasLocalColumnFilters || appliedMongoFilter
-                      ? 'border-primary/40 bg-primary/10 text-primary hover:bg-primary/15'
-                      : 'border-border/70 text-muted-foreground hover:bg-accent hover:text-foreground'
-                  "
-                  @click="ensureMongoFilterRule"
+                  :class="hasLocalColumnFilters || appliedDocumentFilter ? 'border-primary/40 bg-primary/10 text-primary hover:bg-primary/15' : 'border-border/70 text-muted-foreground hover:bg-accent hover:text-foreground'"
+                  @click="ensureDocumentFilterRule"
                 >
                   <Filter class="h-3 w-3" />
-                  <span
-                    v-if="localFilterCount + mongoStructuredFilterCount"
-                    class="absolute -right-1 -top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] leading-none text-primary-foreground"
-                  >
-                    {{ localFilterCount + mongoStructuredFilterCount }}
+                  <span v-if="localFilterCount + documentStructuredFilterCount" class="absolute -right-1 -top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] leading-none text-primary-foreground">
+                    {{ localFilterCount + documentStructuredFilterCount }}
                   </span>
                 </button>
               </PopoverTrigger>
               <PopoverContent align="start" class="w-[360px] max-w-[calc(100vw-24px)] gap-3 p-3">
                 <div class="flex items-center justify-between gap-3">
                   <div class="text-xs font-medium text-foreground">{{ t("grid.filter") }}</div>
-                  <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="addMongoFilterRule">
+                  <Button variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="addDocumentFilterRule">
                     <Plus class="mr-1 h-3.5 w-3.5" />
                     {{ t("grid.filterBuilderAddRule") }}
                   </Button>
                 </div>
-                <div
-                  v-if="hasLocalColumnFilters"
-                  class="space-y-2 rounded-md border border-primary/20 bg-primary/5 px-2.5 py-2"
-                >
+                <div v-if="hasLocalColumnFilters" class="space-y-2 rounded-md border border-primary/20 bg-primary/5 px-2.5 py-2">
                   <div class="flex items-center justify-between gap-3">
                     <div class="flex min-w-0 items-center gap-2 text-xs font-medium text-primary">
                       <Filter class="h-3.5 w-3.5 shrink-0" />
@@ -996,11 +735,7 @@ function resetTableSearchSplitWidth() {
                     </Button>
                   </div>
                   <div class="space-y-1">
-                    <div
-                      v-for="summary in localFilterSummaries"
-                      :key="summary.columnIndex"
-                      class="grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.6fr)_auto] items-center gap-2 rounded border border-primary/10 bg-background/70 px-2 py-1 text-xs"
-                    >
+                    <div v-for="summary in localFilterSummaries" :key="summary.columnIndex" class="grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.6fr)_auto] items-center gap-2 rounded border border-primary/10 bg-background/70 px-2 py-1 text-xs">
                       <span class="truncate font-medium text-foreground" :title="summary.columnName">
                         {{ summary.columnName }}
                       </span>
@@ -1013,28 +748,22 @@ function resetTableSearchSplitWidth() {
                           {{ t("grid.localFilterMoreValues", { count: summary.hiddenValueCount }) }}
                         </span>
                       </span>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        class="h-6 w-6 text-muted-foreground hover:text-destructive"
-                        :title="t('grid.clearFilter')"
-                        @click="clearLocalFilter(summary.columnIndex)"
-                      >
+                      <Button variant="ghost" size="icon" class="h-6 w-6 text-muted-foreground hover:text-destructive" :title="t('grid.clearFilter')" @click="clearLocalFilter(summary.columnIndex)">
                         <X class="h-3.5 w-3.5" />
                       </Button>
                     </div>
                   </div>
                 </div>
 
-                <div v-if="mongoFilterRules.length" class="space-y-2">
-                  <template v-for="(rule, index) in mongoFilterRules" :key="rule.id">
+                <div v-if="documentFilterRules.length" class="space-y-2">
+                  <template v-for="(rule, index) in documentFilterRules" :key="rule.id">
                     <div v-if="index > 0" class="flex justify-center">
                       <Button
                         variant="ghost"
                         size="sm"
                         class="h-6 px-2 text-[11px] font-medium text-muted-foreground hover:text-foreground"
                         @click="
-                          updateMongoFilterRule(rule.id, {
+                          updateDocumentFilterRule(rule.id, {
                             conjunction: rule.conjunction === 'AND' ? 'OR' : 'AND',
                           })
                         "
@@ -1042,73 +771,42 @@ function resetTableSearchSplitWidth() {
                         {{ rule.conjunction }}
                       </Button>
                     </div>
-                    <div
-                      class="grid grid-cols-[minmax(0,1fr)_minmax(0,0.95fr)_minmax(0,1fr)_auto] items-center gap-1.5"
-                    >
-                      <Select
-                        :model-value="rule.fieldName"
-                        @update:model-value="
-                          (value: any) => updateMongoFilterRule(rule.id, { fieldName: String(value) })
-                        "
-                      >
-                        <SelectTrigger
-                          class="h-8 w-full min-w-0 overflow-hidden text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate"
-                        >
+                    <div class="grid grid-cols-[minmax(0,1fr)_minmax(0,0.95fr)_minmax(0,1fr)_auto] items-center gap-1.5">
+                      <Select :model-value="rule.fieldName" @update:model-value="(value: any) => updateDocumentFilterRule(rule.id, { fieldName: String(value) })">
+                        <SelectTrigger class="h-8 w-full min-w-0 overflow-hidden text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate">
                           <SelectValue :placeholder="t('grid.filterBuilderColumn')" />
                         </SelectTrigger>
                         <SelectContent position="popper">
-                          <SelectItem v-for="fieldName in mongoFilterFieldOptions" :key="fieldName" :value="fieldName">
+                          <SelectItem v-for="fieldName in documentFilterFieldOptions" :key="fieldName" :value="fieldName">
                             {{ fieldName }}
                           </SelectItem>
                         </SelectContent>
                       </Select>
 
-                      <Select
-                        :model-value="rule.mode"
-                        @update:model-value="
-                          (value: any) => updateMongoFilterRule(rule.id, { mode: value as MongoFilterMode })
-                        "
-                      >
-                        <SelectTrigger
-                          class="h-8 w-full min-w-0 overflow-hidden text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate"
-                        >
+                      <Select :model-value="rule.mode" @update:model-value="(value: any) => updateDocumentFilterRule(rule.id, { mode: value as DocumentFilterMode })">
+                        <SelectTrigger class="h-8 w-full min-w-0 overflow-hidden text-xs [&_[data-slot=select-value]]:min-w-0 [&_[data-slot=select-value]]:truncate">
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent position="popper">
-                          <SelectItem
-                            v-for="option in mongoFilterModeOptions"
-                            :key="option.value"
-                            :value="option.value"
-                          >
+                          <SelectItem v-for="option in documentFilterModeOptions" :key="option.value" :value="option.value">
                             {{ t(option.labelKey) }}
                           </SelectItem>
                         </SelectContent>
                       </Select>
 
                       <Input
-                        v-if="mongoFilterModeNeedsValue(rule.mode)"
+                        v-if="documentFilterModeNeedsValue(rule.mode)"
                         :model-value="rule.rawValue"
                         class="h-8 min-w-0 text-xs"
                         :placeholder="t('grid.filterBuilderValue')"
-                        @update:model-value="
-                          (value) => updateMongoFilterRule(rule.id, { rawValue: String(value ?? '') })
-                        "
-                        @keydown.enter.prevent="applyMongoStructuredFilters"
+                        @update:model-value="(value) => updateDocumentFilterRule(rule.id, { rawValue: String(value ?? '') })"
+                        @keydown.enter.prevent="applyDocumentStructuredFilters"
                       />
-                      <div
-                        v-else
-                        class="flex h-8 min-w-0 items-center overflow-hidden rounded-md border border-dashed px-2 text-xs text-muted-foreground"
-                      >
+                      <div v-else class="flex h-8 min-w-0 items-center overflow-hidden rounded-md border border-dashed px-2 text-xs text-muted-foreground">
                         <span class="truncate">{{ t("grid.filterBuilderNoValue") }}</span>
                       </div>
 
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        class="h-8 w-8 shrink-0 text-muted-foreground hover:text-destructive"
-                        :disabled="mongoFilterRules.length === 1"
-                        @click="removeMongoFilterRule(rule.id)"
-                      >
+                      <Button variant="ghost" size="icon" class="h-8 w-8 shrink-0 text-muted-foreground hover:text-destructive" :disabled="documentFilterRules.length === 1" @click="removeDocumentFilterRule(rule.id)">
                         <Trash2 class="h-3.5 w-3.5" />
                       </Button>
                     </div>
@@ -1119,35 +817,22 @@ function resetTableSearchSplitWidth() {
                 </div>
 
                 <div class="flex items-center justify-between gap-2 pt-1">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    class="h-8 px-2 text-xs"
-                    @click="clearMongoFilters(clearLocalFilter)"
-                  >
+                  <Button variant="ghost" size="sm" class="h-8 px-2 text-xs" @click="clearDocumentFilters(clearLocalFilter)">
                     {{ t("grid.clearFilter") }}
                   </Button>
                   <div class="flex items-center gap-2">
-                    <Button variant="ghost" size="sm" class="h-8 px-2 text-xs" @click="resetMongoFilterBuilder">
+                    <Button variant="ghost" size="sm" class="h-8 px-2 text-xs" @click="resetDocumentFilterBuilder">
                       {{ t("grid.resetFilterBuilder") }}
                     </Button>
-                    <Button size="sm" class="h-8 px-3 text-xs" @click="applyMongoStructuredFilters">
+                    <Button size="sm" class="h-8 px-3 text-xs" @click="applyDocumentStructuredFilters">
                       {{ t("grid.applyFilter") }}
                     </Button>
                   </div>
                 </div>
               </PopoverContent>
             </Popover>
-            <span class="text-blue-600 dark:text-blue-400 text-xs font-medium select-none shrink-0">find</span>
-            <input
-              v-model="filterInput"
-              autocapitalize="off"
-              autocorrect="off"
-              spellcheck="false"
-              class="flex-1 h-5 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60 font-mono"
-              placeholder="{}"
-              @keydown.enter="applyFilter"
-            />
+            <span class="text-blue-600 dark:text-blue-400 text-xs font-medium select-none shrink-0">{{ documentStoreProvider.filterInputLabel }}</span>
+            <input v-model="filterInput" autocapitalize="off" autocorrect="off" spellcheck="false" class="flex-1 h-5 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60 font-mono" placeholder="{}" @keydown.enter="applyFilter" />
             <button
               v-if="filterInput.trim()"
               class="text-muted-foreground hover:text-foreground shrink-0"
@@ -1162,23 +847,15 @@ function resetTableSearchSplitWidth() {
           <button
             type="button"
             class="group relative flex w-2 shrink-0 cursor-col-resize items-center justify-center border-l border-r border-border/80 bg-muted/15 hover:bg-primary/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
-            aria-label="Resize find and sort"
+            aria-label="Resize document filter and sort"
             @mousedown="startTableSearchSplitResize"
             @dblclick.stop="resetTableSearchSplitWidth"
           >
             <span class="h-5 w-px bg-border group-hover:bg-primary/60" />
           </button>
           <div class="flex flex-1 items-center gap-1 px-2 py-0.5 min-w-0">
-            <span class="text-orange-600 dark:text-orange-400 text-xs font-medium select-none shrink-0">sort</span>
-            <input
-              v-model="sortInput"
-              autocapitalize="off"
-              autocorrect="off"
-              spellcheck="false"
-              class="flex-1 h-5 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60 font-mono"
-              placeholder="{}"
-              @keydown.enter="applyFilter"
-            />
+            <span class="text-orange-600 dark:text-orange-400 text-xs font-medium select-none shrink-0">{{ documentStoreProvider.sortInputLabel }}</span>
+            <input v-model="sortInput" autocapitalize="off" autocorrect="off" spellcheck="false" class="flex-1 h-5 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60 font-mono" placeholder="{}" @keydown.enter="applyFilter" />
             <button
               v-if="sortInput.trim()"
               class="text-muted-foreground hover:text-foreground shrink-0"
@@ -1207,20 +884,9 @@ function resetTableSearchSplitWidth() {
       <Pane :size="30" :min-size="15" :max-size="50">
         <div class="h-full flex flex-col overflow-hidden">
           <div class="flex-1 overflow-y-auto">
-            <div
-              v-for="(doc, idx) in documents"
-              :key="idx"
-              class="px-3 py-1.5 border-b text-xs font-mono cursor-pointer hover:bg-accent/50 flex items-center gap-2 group"
-              :class="{ 'bg-accent': selectedIdx === idx }"
-              @click="selectDoc(idx)"
-            >
+            <div v-for="(doc, idx) in documents" :key="idx" class="px-3 py-1.5 border-b text-xs font-mono cursor-pointer hover:bg-accent/50 flex items-center gap-2 group" :class="{ 'bg-accent': selectedIdx === idx }" @click="selectDoc(idx)">
               <span class="truncate flex-1">{{ docPreview(doc) }}</span>
-              <Button
-                variant="ghost"
-                size="icon"
-                class="h-5 w-5 opacity-0 group-hover:opacity-100 text-destructive shrink-0"
-                @click.stop="requestDeleteDoc(idx)"
-              >
+              <Button variant="ghost" size="icon" class="h-5 w-5 opacity-0 group-hover:opacity-100 text-destructive shrink-0" @click.stop="requestDeleteDoc(idx)">
                 <Trash2 class="w-3 h-3" />
               </Button>
             </div>
@@ -1238,51 +904,28 @@ function resetTableSearchSplitWidth() {
             <div class="h-9 flex items-center gap-2 px-4 border-b bg-muted/30 shrink-0">
               <Badge variant="secondary" class="text-xs">{{ isNew ? "New" : selectedDoc?._id }}</Badge>
               <span class="flex-1" />
-              <Button v-if="!isEditing" variant="ghost" size="sm" class="h-6 text-xs" @click="startEdit">{{
-                t("mongo.edit")
-              }}</Button>
+              <Button v-if="!isEditing" variant="ghost" size="sm" class="h-6 text-xs" @click="startEdit">{{ t("mongo.edit") }}</Button>
               <template v-if="isEditing">
-                <Button variant="ghost" size="sm" class="h-6 text-xs" @click="addField">
-                  <Plus class="w-3 h-3 mr-1" /> {{ t("mongo.addField") }}
-                </Button>
-                <Button variant="ghost" size="sm" class="h-6 text-xs" @click="cancelEdit">{{
-                  t("grid.discard")
-                }}</Button>
-                <Button size="sm" class="h-6 text-xs" @click="saveDoc"
-                  ><Save class="w-3 h-3 mr-1" />{{ t("grid.save") }}</Button
-                >
+                <Button variant="ghost" size="sm" class="h-6 text-xs" @click="addField"> <Plus class="w-3 h-3 mr-1" /> {{ t("mongo.addField") }} </Button>
+                <Button variant="ghost" size="sm" class="h-6 text-xs" @click="cancelEdit">{{ t("grid.discard") }}</Button>
+                <Button size="sm" class="h-6 text-xs" @click="saveDoc"><Save class="w-3 h-3 mr-1" />{{ t("grid.save") }}</Button>
               </template>
             </div>
 
             <div v-if="isEditing" class="flex-1 overflow-auto bg-muted/10">
-              <div
-                class="json-edit min-w-fit p-5 font-mono text-[13px] leading-6"
-                :style="{ '--mongo-key-width': editKeyWidth }"
-              >
+              <div class="json-edit min-w-fit p-5 font-mono text-[13px] leading-6" :style="{ '--mongo-key-width': editKeyWidth }">
                 <div class="json-edit-brace">{</div>
 
-                <JsonEditNode
-                  v-for="(field, idx) in editFields"
-                  :key="field.key"
-                  :node="field"
-                  parent-kind="root"
-                  :removable="!field.readonlyValue"
-                  @remove="requestRemoveField(idx)"
-                />
+                <JsonEditNode v-for="(field, idx) in editFields" :key="field.key" :node="field" parent-kind="root" :removable="!field.readonlyValue" @remove="requestRemoveField(idx)" />
 
-                <Button variant="ghost" size="sm" class="json-edit-add" @click="addField">
-                  <Plus class="w-3 h-3 mr-1" /> {{ t("mongo.addField") }}
-                </Button>
+                <Button variant="ghost" size="sm" class="json-edit-add" @click="addField"> <Plus class="w-3 h-3 mr-1" /> {{ t("mongo.addField") }} </Button>
 
                 <div class="json-edit-brace">}</div>
               </div>
             </div>
 
             <div v-else class="flex-1 overflow-auto bg-muted/10">
-              <pre
-                class="json-viewer min-w-fit p-5 font-mono text-[13px] leading-6"
-                v-html="highlightedJson(editJson)"
-              />
+              <pre class="json-viewer min-w-fit p-5 font-mono text-[13px] leading-6" v-html="highlightedJson(editJson)" />
             </div>
           </template>
           <div v-else class="h-full flex items-center justify-center text-muted-foreground text-sm">
@@ -1292,13 +935,7 @@ function resetTableSearchSplitWidth() {
           <div v-if="error" class="px-3 py-1.5 border-t bg-destructive/10 text-destructive text-xs shrink-0">
             {{ error }}
           </div>
-          <DangerConfirmDialog
-            v-model:open="showDeleteConfirm"
-            :message="t('dangerDialog.deleteMessage')"
-            :details="deleteDetails"
-            :confirm-label="t('dangerDialog.deleteConfirm')"
-            @confirm="confirmDelete"
-          />
+          <DangerConfirmDialog v-model:open="showDeleteConfirm" :message="t('dangerDialog.deleteMessage')" :details="deleteDetails" :confirm-label="t('dangerDialog.deleteConfirm')" @confirm="confirmDelete" />
         </div>
       </Pane>
     </Splitpanes>

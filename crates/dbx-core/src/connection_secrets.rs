@@ -506,11 +506,13 @@ mod tests {
             redis_sentinel_password: String::new(),
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
+            redis_key_separator: crate::models::connection::default_redis_key_separator(),
             etcd_endpoints: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            read_only: false,
         }
     }
 
@@ -527,6 +529,7 @@ mod tests {
             key_passphrase: passphrase.to_string(),
             connect_timeout_secs: 5,
             expose_lan: false,
+            use_ssh_agent: false,
         }
     }
 

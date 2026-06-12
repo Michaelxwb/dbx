@@ -62,8 +62,11 @@ export const readKeychainPasswords = forward("readKeychainPasswords");
 export const decryptConfig = forward("decryptConfig");
 export const listPlugins = forward("listPlugins");
 export const listJdbcDrivers = forward("listJdbcDrivers");
+export const listJdbcMavenBundles = forward("listJdbcMavenBundles");
 export const importJdbcDrivers = forward("importJdbcDrivers");
+export const installJdbcDriverFromMaven = forward("installJdbcDriverFromMaven");
 export const deleteJdbcDriver = forward("deleteJdbcDriver");
+export const deleteJdbcMavenBundle = forward("deleteJdbcMavenBundle");
 export const jdbcPluginStatus = forward("jdbcPluginStatus");
 export const installJdbcPlugin = forward("installJdbcPlugin");
 export const installJdbcPluginLocal = forward("installJdbcPluginLocal");
@@ -110,6 +113,10 @@ export const listIndexes = forward("listIndexes");
 export const listForeignKeys = forward("listForeignKeys");
 export const listTriggers = forward("listTriggers");
 export const getTableDdl = forward("getTableDdl");
+export const listFunctions = forward("listFunctions");
+export const listSequences = forward("listSequences");
+export const listRules = forward("listRules");
+export const listOwners = forward("listOwners");
 export const prepareSchemaDiff = forward("prepareSchemaDiff");
 export const generateSchemaSyncSql = forward("generateSchemaSyncSql");
 
@@ -171,6 +178,7 @@ export const buildDataCompareSyncPlan = forward("buildDataCompareSyncPlan");
 // AI
 export const aiComplete = forward("aiComplete");
 export const aiStream = forward("aiStream");
+export const aiAgentStream = forward("aiAgentStream");
 export const aiCancelStream = forward("aiCancelStream");
 export const aiTestConnection = forward("aiTestConnection");
 export const aiListModels = forward("aiListModels");
@@ -350,4 +358,5 @@ export type {
   TableExportProgress,
   TableExportStatus,
   TableExportRequest,
+  AgentEvent,
 } from "./tauri";

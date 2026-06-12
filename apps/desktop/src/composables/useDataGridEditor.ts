@@ -179,7 +179,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   const isSaving = ref(false);
   const saveError = ref("");
 
-  const useTransaction = computed(() => editable.value && supportsDataGridTransaction(databaseType.value) && (!!customSaveHandler?.value || (!!connectionId.value && !!database.value && !!tableMeta.value)));
+  const hasBackendSaveTarget = computed(() => !!connectionId.value && !!tableMeta.value);
+  const useTransaction = computed(() => editable.value && supportsDataGridTransaction(databaseType.value) && (!!customSaveHandler?.value || hasBackendSaveTarget.value));
 
   if (hasPendingChanges.value && useTransaction.value) {
     transactionActive.value = true;
@@ -223,6 +224,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
 
   // --- Scroll helpers ---
   let isCancelling = false;
+  let isCommitting = false;
   let cancelScrollRestoreFrame = 0;
   let resetScrollFrame = 0;
   let resetScrollAfterResult = false;
@@ -396,12 +398,14 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   function commitEdit() {
-    if (isCancelling) return;
+    if (isCancelling || isCommitting) return;
     if (!editingCell.value) return;
+    isCommitting = true;
     const { rowId, col } = editingCell.value;
     const item = getRowItem(rowId);
     if (!item || item.isDeleted) {
       editingCell.value = null;
+      isCommitting = false;
       return;
     }
 
@@ -412,15 +416,18 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         newRows.value[item.newIndex][col] = newVal;
       }
       editingCell.value = null;
+      isCommitting = false;
       return;
     }
 
     if (item.sourceIndex === undefined) {
       editingCell.value = null;
+      isCommitting = false;
       return;
     }
     if (!canEditExistingRows.value) {
       editingCell.value = null;
+      isCommitting = false;
       return;
     }
 
@@ -439,6 +446,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     }
     dirtyRows.value = new Map(dirtyRows.value);
     editingCell.value = null;
+    isCommitting = false;
   }
 
   function commitEditFromBlur() {
@@ -648,7 +656,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
   }
 
   async function recordDataGridHistory(statements: string[], rollbackStatements: string[], elapsed: number, historyResult?: { affected_rows?: number; success?: boolean; error?: string }) {
-    if (!connectionId.value || !database.value || !tableMeta.value) return;
+    if (!connectionId.value || !tableMeta.value) return;
     const connName = connectionStore.getConfig(connectionId.value)?.name || "";
     const success = historyResult?.success ?? true;
     const details = {
@@ -664,7 +672,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     await historyStore.add({
       connection_id: connectionId.value,
       connection_name: connName,
-      database: database.value,
+      database: database.value ?? "",
       sql: statements.join("\n"),
       execution_time_ms: elapsed,
       success,
@@ -757,17 +765,17 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       rollbackStatements: rollbackStmts,
     });
 
-    if (useTransaction.value && connectionId.value && database.value) {
+    if (useTransaction.value && hasBackendSaveTarget.value) {
       try {
-        apiResult = await api.executeInTransaction(connectionId.value, database.value, stmts, preparedSave?.executionSchema);
+        apiResult = await api.executeInTransaction(connectionId.value!, database.value ?? "", stmts, preparedSave?.executionSchema);
       } catch (e: any) {
         saveError.value = await recordFailedDataGridHistory(stmts, rollbackStmts, start, e);
         isSaving.value = false;
         return;
       }
-    } else if (connectionId.value && database.value) {
+    } else if (hasBackendSaveTarget.value) {
       try {
-        apiResult = await api.executeBatch(connectionId.value, database.value, stmts);
+        apiResult = await api.executeBatch(connectionId.value!, database.value ?? "", stmts, preparedSave?.executionSchema);
       } catch (e: any) {
         saveError.value = await recordFailedDataGridHistory(stmts, rollbackStmts, start, e);
         isSaving.value = false;

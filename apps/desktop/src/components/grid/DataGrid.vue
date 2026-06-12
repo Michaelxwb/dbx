@@ -3414,6 +3414,16 @@ const canvasDevicePixelRatio = ref(typeof window === "undefined" ? 1 : window.de
 const canvasBackingPixelRatio = computed(() => Math.min(4, Math.max(1, canvasDevicePixelRatio.value * settingsStore.editorSettings.uiScale)));
 const useCanvasGridRows = computed(() => dataGridRenderMode.value === "canvas");
 const canvasContentHeight = computed(() => Math.max(1, displayRowCount.value * CANVAS_DATA_GRID_ROW_HEIGHT));
+// Clamp the sticky canvas/overlay to the content width. A viewport-wide sticky surface inflates the
+// scroller's scrollWidth up to clientWidth, so with few columns it sits right on the overflow threshold
+// and the custom horizontal scrollbar flickers while the pane shrinks (canvas width lags clientWidth).
+const canvasSurfaceWidth = computed(() => {
+  const total = totalWidth.value;
+  const vw = canvasViewportWidth.value;
+  if (total <= 0) return Math.max(0, vw);
+  if (vw <= 0) return total;
+  return Math.min(vw, total);
+});
 const canvasRenderStyleKey = computed(() => `${settingsStore.editorSettings.theme}:${settingsStore.editorSettings.uiScale}:${canvasBackingPixelRatio.value}:${isDark.value}`);
 const CANVAS_MOUSE_WHEEL_SCROLL_MULTIPLIER = 1.5;
 const CANVAS_TRACKPAD_DELTA_THRESHOLD = 40;
@@ -3729,9 +3739,11 @@ function canvasEditingCellViewportRect() {
 function canvasEditingCellIsVisible() {
   const rect = canvasEditingCellViewportRect();
   if (!rect) return false;
+  const viewportWidth = canvasEffectiveViewportWidth();
+  const viewportHeight = canvasEffectiveViewportHeight();
   const clippedLeft = Math.max(DATA_GRID_ROW_NUM_WIDTH, rect.left);
-  const clippedRight = Math.min(canvasViewportWidth.value, rect.left + rect.width);
-  return rect.top + rect.height > 0 && rect.top < canvasViewportHeight.value && clippedRight - clippedLeft > 0;
+  const clippedRight = viewportWidth > 0 ? Math.min(viewportWidth, rect.left + rect.width) : rect.left + rect.width;
+  return rect.top + rect.height > 0 && rect.top < viewportHeight && clippedRight - clippedLeft > 0;
 }
 
 function commitHiddenCanvasEditBeforeCellInteraction() {
@@ -3763,11 +3775,29 @@ const canvasSingleSelectedCell = computed(() => {
   return { rowIndex: range.startRow, visibleColIdx: range.startCol };
 });
 
+function canvasEffectiveViewportWidth(): number {
+  return canvasViewportWidth.value || canvasScrollerElement()?.clientWidth || 0;
+}
+
+function canvasEffectiveViewportHeight(): number {
+  return canvasViewportHeight.value || canvasScrollerElement()?.clientHeight || 0;
+}
+
+const canvasOverlayStyle = computed(() => {
+  const vh = canvasEffectiveViewportHeight();
+  return {
+    width: `${canvasSurfaceWidth.value}px`,
+    height: `${vh}px`,
+    marginTop: `-${vh}px`,
+  };
+});
+
 const canvasEditingCellStyle = computed(() => {
   const cell = canvasEditingCell.value;
   if (!cell) return {};
+  const viewportWidth = canvasEffectiveViewportWidth();
   const clippedLeft = Math.max(DATA_GRID_ROW_NUM_WIDTH, cell.rect.left);
-  const clippedRight = Math.min(canvasViewportWidth.value, cell.rect.left + cell.rect.width);
+  const clippedRight = viewportWidth > 0 ? Math.min(viewportWidth, cell.rect.left + cell.rect.width) : cell.rect.left + cell.rect.width;
   return {
     left: `${clippedLeft}px`,
     top: `${cell.rect.top}px`,
@@ -3784,11 +3814,13 @@ const canvasDetailButtonCell = computed(() => {
   if (visibleColIdx < 0) return null;
   const rect = canvasCellViewportRect(target.rowIndex, visibleColIdx);
   if (!rect) return null;
+  const viewportWidth = canvasEffectiveViewportWidth();
+  const viewportHeight = canvasEffectiveViewportHeight();
   const visibleLeft = Math.max(DATA_GRID_ROW_NUM_WIDTH, rect.left);
-  const visibleRight = Math.min(canvasViewportWidth.value, rect.left + rect.width);
+  const visibleRight = viewportWidth > 0 ? Math.min(viewportWidth, rect.left + rect.width) : rect.left + rect.width;
   const canQuickDownload = canQuickDownloadCellValue(target.rowIndex, target.col);
   const minWidth = canQuickDownload ? 46 : 24;
-  if (rect.top < 0 || rect.top > canvasViewportHeight.value - 1 || visibleRight - visibleLeft < minWidth) return null;
+  if (rect.top < 0 || rect.top > viewportHeight - 1 || visibleRight - visibleLeft < minWidth) return null;
   return { rowIndex: target.rowIndex, visibleColIdx, actualColIdx: target.col, rect, canQuickDownload };
 });
 
@@ -3810,7 +3842,7 @@ function drawCanvasGrid() {
   drawCanvasDataGrid({
     canvas,
     scroller,
-    width: Math.max(1, canvasViewportWidth.value || scroller.clientWidth),
+    width: Math.max(1, canvasSurfaceWidth.value || scroller.clientWidth),
     height: Math.max(1, canvasViewportHeight.value || scroller.clientHeight),
     pixelRatio: canvasBackingPixelRatio.value,
     isDark: isDark.value,
@@ -6693,22 +6725,14 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                   <canvas
                     ref="canvasRef"
                     class="canvas-grid-surface sticky left-0 top-0 z-0 block text-xs font-sans font-normal"
-                    :style="{ width: `${canvasViewportWidth}px`, height: `${canvasViewportHeight}px` }"
+                    :style="{ width: `${canvasSurfaceWidth}px`, height: `${canvasViewportHeight}px` }"
                     @mousemove="onCanvasMouseMove"
                     @mouseleave="onCanvasMouseLeave"
                     @mousedown="onCanvasMouseDown"
                     @contextmenu="onCanvasContext"
                     @dblclick="onCanvasDblClick"
                   />
-                  <div
-                    ref="canvasOverlayRef"
-                    class="canvas-grid-overlay sticky left-0 top-0 z-10 overflow-hidden"
-                    :style="{
-                      width: `${canvasViewportWidth}px`,
-                      height: `${canvasViewportHeight}px`,
-                      marginTop: `-${canvasViewportHeight}px`,
-                    }"
-                  >
+                  <div ref="canvasOverlayRef" class="canvas-grid-overlay sticky left-0 top-0 z-10 overflow-hidden" :style="canvasOverlayStyle">
                     <div v-if="canvasEditingCell" class="absolute pointer-events-auto z-20" :class="{ 'tabular-nums': canvasEditingCellIsNumeric }" :style="canvasEditingCellStyle" @mousedown.stop @click.stop>
                       <TemporalCellEditor v-if="temporalEditorKindForColumn(canvasEditingCell.actualColIdx)" v-model="editValue" :kind="temporalEditorKindForColumn(canvasEditingCell.actualColIdx)!" @cancel="cancelEdit" @commit="commitGridEdit" />
                       <EnumCellEditor
@@ -7742,7 +7766,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
 .data-grid-horizontal-scrollbar {
   position: absolute;
   inset-inline: calc(var(--row-num-w) + 8px) 10px;
-  bottom: 8px;
+  bottom: 2px;
   z-index: 30;
   height: 10px;
   cursor: pointer;
@@ -7756,7 +7780,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
   top: 4px;
   height: 2px;
   border-radius: 999px;
-  background: color-mix(in oklch, var(--foreground) 12%, transparent);
+  background: color-mix(in oklch, var(--foreground) 7%, transparent);
 }
 
 .data-grid-horizontal-scrollbar__thumb {
@@ -7765,7 +7789,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
   height: 4px;
   min-width: 24px;
   border-radius: 999px;
-  background: color-mix(in oklch, var(--foreground) 42%, transparent);
+  background: color-mix(in oklch, var(--foreground) 24%, transparent);
   transition:
     height 120ms ease,
     background-color 120ms ease,
@@ -7776,7 +7800,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
 .data-grid-horizontal-scrollbar--dragging .data-grid-horizontal-scrollbar__thumb {
   top: 2px;
   height: 6px;
-  background: color-mix(in oklch, var(--foreground) 62%, transparent);
+  background: color-mix(in oklch, var(--foreground) 42%, transparent);
 }
 
 .canvas-grid-surface {

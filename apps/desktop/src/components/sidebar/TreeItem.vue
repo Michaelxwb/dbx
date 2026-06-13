@@ -62,6 +62,8 @@ import { uuid } from "@/lib/utils";
 import { resolveDefaultDatabase } from "@/lib/defaultDatabase";
 import { canTreeNodeShowExpander, treeItemPaddingLeft, usesFullWidthTreeLabel } from "@/lib/sidebarTreeItemLayout";
 import { buildTableSelectSql } from "@/lib/tableSelectSql";
+import { connectionFilePath } from "@/lib/connectionFile";
+import { revealPathInFileManager } from "@/lib/tauri";
 import { clearActiveTableReferencePayload, createTableReferencePayload, createTableReferenceDropEvent, setActiveTableReferencePayload, type QueryEditorTableReferencePayload } from "@/lib/queryEditorTableDrop";
 import { editablePrimaryKeys, usesSyntheticRowIdKey } from "@/lib/tableEditing";
 import { supportsDatabaseCreation, supportsDatabaseSearch, supportsFieldLineage, supportsObjectBrowserTreeNode, supportsSchemaDiagram, supportsSqlFileExecution, supportsTableImport, supportsTableTruncate, supportsTableStructureEditing, usesTreeSchemaMode } from "@/lib/databaseCapabilities";
@@ -245,6 +247,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return { icon: Package, colorClass: "text-cyan-500" };
     case "group-partitions":
       return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-green-400" };
+    case "load-more":
+      return { icon: Plus, colorClass: "text-primary" };
     default:
       return { icon: Database, colorClass: "text-muted-foreground" };
   }
@@ -258,6 +262,7 @@ function isGroupLabel(node: TreeNode): boolean {
 }
 
 function displayLabel(node: TreeNode): string {
+  if (node.type === "load-more") return t(node.label);
   if (node.type === "object-browser") return t(node.label, { count: node.objectCount ?? 0 });
   if (node.type === "user-admin") return t(node.label);
   if (node.label === "tree.defaultDatabase") return t(node.label);
@@ -390,6 +395,10 @@ async function toggle() {
 
 function runRowClickAction() {
   const node = props.node;
+  if (node.type === "load-more") {
+    void loadMoreObjectGroupChildren();
+    return;
+  }
   if (node.type === "object-browser") {
     void openObjectBrowser();
     return;
@@ -401,6 +410,14 @@ function runRowClickAction() {
     void viewObjectSource();
   } else if (action === "toggle") {
     toggle();
+  }
+}
+
+async function loadMoreObjectGroupChildren() {
+  try {
+    await connectionStore.loadMoreObjectGroupChildren(props.node);
+  } catch (e: any) {
+    toast(t("connection.connectFailed", { message: translateBackendError(t, e?.message || String(e)) }), 5000);
   }
 }
 
@@ -686,6 +703,7 @@ async function openData() {
   queryStore.setTableMeta(tabId, {
     schema: tableSchema,
     tableName: node.label,
+    tableType: node.type === "view" ? "VIEW" : "TABLE",
     columns: [],
     primaryKeys: [],
   });
@@ -711,7 +729,7 @@ async function openData() {
         elapsed: elapsed(),
       });
       columns = await api.getColumns(node.connectionId, node.database, querySchema, node.label);
-      primaryKeys = editablePrimaryKeys(effectiveDbType, columns);
+      primaryKeys = editablePrimaryKeys(effectiveDbType, columns, node.type === "view" ? "VIEW" : "TABLE");
       console.info("[DBX][openData:get-columns:done]", {
         traceId,
         columnCount: columns.length,
@@ -721,6 +739,7 @@ async function openData() {
       queryStore.setTableMeta(tabId, {
         schema: tableSchema,
         tableName: node.label,
+        tableType: node.type === "view" ? "VIEW" : "TABLE",
         columns,
         primaryKeys,
       });
@@ -2101,6 +2120,24 @@ function editConnection() {
   }
 }
 
+const revealConnectionFilePath = computed<string | null>(() => {
+  if (props.node.type !== "connection" || !props.node.connectionId) return null;
+  const config = connectionStore.getConfig(props.node.connectionId);
+  if (!config) return null;
+  return connectionFilePath(config);
+});
+
+async function revealDatabaseFile() {
+  const path = revealConnectionFilePath.value;
+  if (!path) return;
+  try {
+    await revealPathInFileManager(path);
+  } catch (e: any) {
+    const message = typeof e === "string" ? e : e?.message || String(e);
+    toast(message, 5000);
+  }
+}
+
 async function disconnectConnection() {
   if (props.node.connectionId) {
     try {
@@ -2696,6 +2733,13 @@ function treeItemMenuItems(): ContextMenuItem[] {
       });
     }
     items.push({ label: t("contextMenu.editConnection"), action: editConnection, icon: Pencil });
+    if (revealConnectionFilePath.value) {
+      items.push({
+        label: t("contextMenu.revealDatabaseFile"),
+        action: revealDatabaseFile,
+        icon: FolderOpen,
+      });
+    }
     items.push({ label: t("contextMenu.duplicateConnection"), action: duplicateConnection, icon: CopyPlus });
     items.push({ label: "", separator: true });
     items.push({
@@ -3066,6 +3110,7 @@ function treeItemMenuItems(): ContextMenuItem[] {
           </template>
           <span v-else class="w-3.5 h-3.5 shrink-0" />
           <DatabaseIcon v-if="node.type === 'connection'" :db-type="connectionIconType(node.connectionId)" class="w-3.5 h-3.5 shrink-0" />
+          <Loader2 v-else-if="node.type === 'load-more' && node.isLoading" class="w-3.5 h-3.5 shrink-0 animate-spin text-primary" />
           <component v-else :is="getIconInfo(node)?.icon || Database" class="w-3.5 h-3.5 shrink-0" :class="nodeIconClass" />
           <input
             v-if="isRenamingGroup"
@@ -3380,12 +3425,22 @@ function treeItemMenuItems(): ContextMenuItem[] {
 .tree-item-highlight {
   background-color: rgb(253 225 167) !important;
   background-color: oklch(0.92 0.08 85) !important;
-  transition: background-color 0.8s ease-out 0.6s;
+  transition: background-color 0.28s ease-out;
 }
 
 :root.dark .tree-item-highlight {
   background-color: rgb(110 67 0) !important;
   background-color: oklch(0.42 0.12 80) !important;
-  transition: background-color 0.8s ease-out 0.6s;
+  transition: background-color 0.28s ease-out;
+}
+
+.tree-item-connection-tint.tree-item-highlight::before {
+  background-color: rgb(253 225 167) !important;
+  background-color: oklch(0.92 0.08 85) !important;
+}
+
+:root.dark .tree-item-connection-tint.tree-item-highlight::before {
+  background-color: rgb(110 67 0) !important;
+  background-color: oklch(0.42 0.12 80) !important;
 }
 </style>

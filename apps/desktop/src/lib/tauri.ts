@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ConnectionConfig,
@@ -126,6 +126,9 @@ export interface DesktopSettings {
   icon_theme: "default" | "black";
   debug_logging_enabled: boolean;
   saved_sql_sync_dir?: string | null;
+  driver_store_dir?: string | null;
+  plugin_store_dir?: string | null;
+  agent_store_dir?: string | null;
 }
 
 export interface SavedSqlSyncEntry {
@@ -288,7 +291,7 @@ export type AgentEvent =
   | { type: "agent_end"; total_tokens?: number }
   | { type: "error"; message: string };
 
-export async function aiAgentStream(sessionId: string, request: AiCompletionRequest, connectionId: string, database: string, dbType: string, onEvent: (event: AgentEvent) => void): Promise<string> {
+export async function aiAgentStream(sessionId: string, request: AiCompletionRequest, connectionId: string, database: string, dbType: string, onEvent: (event: AgentEvent) => void, mode?: string, _signal?: AbortSignal): Promise<string> {
   const unlisten: UnlistenFn = await listen<AgentEvent>("ai-agent-event", (event) => {
     onEvent(event.payload);
     if (event.payload.type === "agent_end" || event.payload.type === "error") {
@@ -296,7 +299,7 @@ export async function aiAgentStream(sessionId: string, request: AiCompletionRequ
     }
   });
   try {
-    return await invoke("ai_agent_stream", { sessionId, request, connectionId, database, dbType });
+    return await invoke("ai_agent_stream", { sessionId, request, connectionId, database, dbType, mode });
   } catch (e) {
     unlisten();
     throw e;
@@ -329,6 +332,38 @@ export async function loadDesktopSettings(): Promise<DesktopSettings> {
 
 export async function saveDesktopSettings(settings: DesktopSettings): Promise<void> {
   return invoke("save_desktop_settings", { settings });
+}
+
+export interface DriverStoreMigrationResult {
+  driver_store_dir: string | null;
+  plugin_store_dir: string | null;
+  agent_store_dir: string | null;
+  migrated_plugins: boolean;
+  migrated_agents: boolean;
+}
+
+export async function setDriverStoreDir(newDir: string | null): Promise<DriverStoreMigrationResult> {
+  return invoke("set_driver_store_dir", { newDir });
+}
+
+export async function setPluginStoreDir(newDir: string | null): Promise<DriverStoreMigrationResult> {
+  return invoke("set_plugin_store_dir", { newDir });
+}
+
+export async function setAgentStoreDir(newDir: string | null): Promise<DriverStoreMigrationResult> {
+  return invoke("set_agent_store_dir", { newDir });
+}
+
+export interface DriverStorePathInfo {
+  driver_store_dir: string | null;
+  plugin_store_dir: string | null;
+  agent_store_dir: string | null;
+  plugins_dir: string;
+  agents_dir: string;
+}
+
+export async function getDriverStorePath(): Promise<DriverStorePathInfo> {
+  return invoke("get_driver_store_path");
 }
 
 export async function webdavSyncTest(config: WebDavConfig): Promise<void> {
@@ -449,8 +484,8 @@ export async function deleteSchemaCachePrefix(prefix: string): Promise<void> {
   return invoke("delete_schema_cache_prefix", { prefix });
 }
 
-export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number): Promise<TableInfo[]> {
-  return invoke("list_tables", { connectionId, database, schema, filter, limit });
+export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number): Promise<TableInfo[]> {
+  return invoke("list_tables", { connectionId, database, schema, filter, limit, offset });
 }
 
 export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[]): Promise<ObjectInfo[]> {
@@ -958,6 +993,10 @@ export async function savedSqlStorageDir(): Promise<string> {
 
 export async function openSavedSqlStorageDir(dir?: string | null): Promise<void> {
   return invoke("open_saved_sql_storage_dir", { dir });
+}
+
+export async function revealPathInFileManager(path: string): Promise<void> {
+  return invoke("reveal_path_in_file_manager", { path });
 }
 
 export async function syncSavedSqlDirectory(request: SavedSqlSyncRequest): Promise<void> {

@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   ConnectionConfig,
   DatabaseInfo,
   TableInfo,
@@ -372,6 +372,10 @@ export async function openSavedSqlStorageDir(_dir?: string | null): Promise<void
   throw new Error("SQL storage directory is only available in the desktop app.");
 }
 
+export async function revealPathInFileManager(_path: string): Promise<void> {
+  throw new Error("Reveal in file manager is only available in the desktop app.");
+}
+
 export async function syncSavedSqlDirectory(_request: SavedSqlSyncRequest): Promise<void> {
   throw new Error("SQL directory sync is only available in the desktop app.");
 }
@@ -400,8 +404,8 @@ export async function listSchemas(connectionId: string, database: string): Promi
   return get(`/api/schema/schemas?${qs({ connection_id: connectionId, database })}`);
 }
 
-export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number): Promise<TableInfo[]> {
-  return get(`/api/schema/tables?${qs({ connection_id: connectionId, database, schema, filter, limit })}`);
+export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number): Promise<TableInfo[]> {
+  return get(`/api/schema/tables?${qs({ connection_id: connectionId, database, schema, filter, limit, offset })}`);
 }
 
 export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[]): Promise<ObjectInfo[]> {
@@ -792,11 +796,11 @@ function isAgentEvent(v: unknown): v is import("./tauri").AgentEvent {
   return typeof v === "object" && v !== null && "type" in v && typeof (v as Record<string, unknown>).type === "string";
 }
 
-export async function aiAgentStream(sessionId: string, request: AiCompletionRequest, connectionId: string, database: string, dbType: string, onEvent: (event: import("./tauri").AgentEvent) => void, signal?: AbortSignal): Promise<string> {
+export async function aiAgentStream(sessionId: string, request: AiCompletionRequest, connectionId: string, database: string, dbType: string, onEvent: (event: import("./tauri").AgentEvent) => void, mode?: string, signal?: AbortSignal): Promise<string> {
   const res = await fetch("/api/ai/agent-stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, request, connection_id: connectionId, database, db_type: dbType }),
+    body: JSON.stringify({ session_id: sessionId, request, connection_id: connectionId, database, db_type: dbType, mode: mode || "ask" }),
     signal,
   });
   if (!res.ok) throw new Error(await res.text());
@@ -847,11 +851,43 @@ export async function loadAiConfig(): Promise<AiConfig | null> {
 }
 
 export async function loadDesktopSettings(): Promise<DesktopSettings> {
-  return { show_tray_icon: true, icon_theme: "default", debug_logging_enabled: false, saved_sql_sync_dir: null };
+  return { show_tray_icon: true, icon_theme: "default", debug_logging_enabled: false, saved_sql_sync_dir: null, driver_store_dir: null, plugin_store_dir: null, agent_store_dir: null };
 }
 
 export async function saveDesktopSettings(_settings: DesktopSettings): Promise<void> {
   return;
+}
+
+export interface DriverStoreMigrationResult {
+  driver_store_dir: string | null;
+  plugin_store_dir: string | null;
+  agent_store_dir: string | null;
+  migrated_plugins: boolean;
+  migrated_agents: boolean;
+}
+
+export async function setDriverStoreDir(_newDir: string | null): Promise<DriverStoreMigrationResult> {
+  throw new Error("Not available in web mode");
+}
+
+export async function setPluginStoreDir(_newDir: string | null): Promise<DriverStoreMigrationResult> {
+  throw new Error("Not available in web mode");
+}
+
+export async function setAgentStoreDir(_newDir: string | null): Promise<DriverStoreMigrationResult> {
+  throw new Error("Not available in web mode");
+}
+
+export interface DriverStorePathInfo {
+  driver_store_dir: string | null;
+  plugin_store_dir: string | null;
+  agent_store_dir: string | null;
+  plugins_dir: string;
+  agents_dir: string;
+}
+
+export async function getDriverStorePath(): Promise<DriverStorePathInfo> {
+  throw new Error("Not available in web mode");
 }
 
 export interface WebDavConfig {
@@ -1459,5 +1495,5 @@ export async function loadSidebarLayout(): Promise<SidebarLayout | null> {
 }
 
 export async function refreshConnections(): Promise<void> {
-  // Web mode doesn't maintain persistent connection pools — no-op
+  // Web mode doesn't maintain persistent connection pools 鈥?no-op
 }

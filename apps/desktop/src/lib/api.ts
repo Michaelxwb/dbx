@@ -96,6 +96,7 @@ export const saveSavedSqlFile = forward("saveSavedSqlFile");
 export const deleteSavedSqlFile = forward("deleteSavedSqlFile");
 export const savedSqlStorageDir = forward("savedSqlStorageDir");
 export const openSavedSqlStorageDir = forward("openSavedSqlStorageDir");
+export const revealPathInFileManager = forward("revealPathInFileManager");
 export const syncSavedSqlDirectory = forward("syncSavedSqlDirectory");
 
 // Schema
@@ -186,6 +187,10 @@ export const saveAiConfig = forward("saveAiConfig");
 export const loadAiConfig = forward("loadAiConfig");
 export const loadDesktopSettings = forward("loadDesktopSettings");
 export const saveDesktopSettings = forward("saveDesktopSettings");
+export const setDriverStoreDir = forward("setDriverStoreDir");
+export const setPluginStoreDir = forward("setPluginStoreDir");
+export const setAgentStoreDir = forward("setAgentStoreDir");
+export const getDriverStorePath = forward("getDriverStorePath");
 export const loadPinnedTreeNodeIds = forward("loadPinnedTreeNodeIds");
 export const savePinnedTreeNodeIds = forward("savePinnedTreeNodeIds");
 export const webdavSyncTest = forward("webdavSyncTest");
@@ -317,6 +322,8 @@ export type {
   JavaRuntimeMode,
   JavaRuntimeConfig,
   DriverInstallProgress,
+  DriverStoreMigrationResult,
+  DriverStorePathInfo,
   WebDavConfig,
   WebDavPasswordStatus,
   WebDavSyncSummary,

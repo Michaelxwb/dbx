@@ -6,6 +6,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
+import PasswordInput from "@/components/ui/PasswordInput.vue";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -13,6 +14,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
 import type { ConnectionConfig, DatabaseType, JdbcDriverInfo, JdbcMavenBundleInfo, ProxyTunnelConfig, SshTunnelConfig, TransportLayerConfig } from "@/types/database";
+import type { MqAdminConfig, MqAuth, MqSystemKind } from "@/types/mq";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
@@ -24,10 +26,11 @@ import type { ConnectionDeepLinkDraft } from "@/lib/connectionDeepLink";
 import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connectionPresentation";
 import { h2ConnectionModeForConfig, h2FileJdbcUrl, h2FilePathFromJdbcUrl, type H2ConnectionMode } from "@/lib/h2Connection";
 import { isLocalFileTypeDb } from "@/lib/connectionFile";
+import { MQ_PINNED_VERSION_OPTIONS, pinnedVersionToSelection, selectionToPinnedVersion } from "@/lib/mqPinnedVersionOptions";
 import { mongodbAuthFailureHint, mongoUrlParam, setMongoUrlParam } from "@/lib/mongoConnectionOptions";
 import { copyToClipboard } from "@/lib/clipboard";
 import { showAgentDriverInstallHint, type AgentDriverInstallState } from "@/lib/agentDriverInstallHint";
-import { ArrowLeft, ArrowDown, ArrowUp, CheckSquare, ChevronRight, Copy, ExternalLink, FilePlus2, FolderOpen, GripVertical, Grid3X3, KeyRound, Link2, List, ListFilter, Loader2, Pipette, Plus, Search, ShieldCheck, Square, Trash2 } from "@lucide/vue";
+import { ArrowLeft, ArrowDown, ArrowUp, CheckSquare, ChevronRight, CircleHelp, Copy, ExternalLink, FilePlus2, FolderOpen, GripVertical, Grid3X3, KeyRound, Link2, List, ListFilter, Loader2, Pipette, Plus, Search, ShieldCheck, Square, Trash2 } from "@lucide/vue";
 import { buildDraftVisibleDatabasesConnectionId, connectionCanChooseVisibleDatabases, initialVisibleDatabaseSelection, visibleDatabaseSelectionIsStale } from "@/lib/connectionVisibleDatabases";
 import { canSaveVisibleDatabaseSelection, filterDatabaseNamesForConnection, isSystemDatabaseName, normalizeVisibleDatabaseSelection } from "@/lib/visibleDatabases";
 
@@ -36,6 +39,7 @@ type DbCategory = { key: string; title: string; options: DbOption[] };
 type DialogStep = "select" | "config";
 type DbPickerView = "icon" | "list";
 type ConfigTab = "connection" | "advanced" | "tls" | "transport";
+type MqTokenSigningMode = "none" | "hs256" | "rs256";
 type JdbcDriverSelectItem = {
   id: string;
   label: string;
@@ -111,6 +115,7 @@ const defaultForm = (): ConnectionForm => ({
   connect_timeout_secs: 5,
   query_timeout_secs: 30,
   idle_timeout_secs: 60,
+  keepalive_interval_secs: 0,
   ssl: false,
   ca_cert_path: "",
   client_cert_path: "",
@@ -129,6 +134,8 @@ const defaultForm = (): ConnectionForm => ({
   redis_cluster_nodes: "",
   redis_key_separator: ":",
   etcd_endpoints: "",
+  gbase_server: "",
+  external_config: undefined,
   read_only: false,
   visible_databases: undefined,
 });
@@ -247,6 +254,17 @@ function sshLayersForConfig(config: LegacyConnectionConfig): SshTunnelConfig[] {
 }
 
 const form = ref(defaultForm());
+const keepaliveEnabled = computed({
+  get: () => Number(form.value.keepalive_interval_secs) > 0,
+  set: (enabled: boolean) => {
+    if (enabled) {
+      const current = Number(form.value.keepalive_interval_secs);
+      form.value.keepalive_interval_secs = Number.isFinite(current) && current > 0 ? current : 30;
+    } else {
+      form.value.keepalive_interval_secs = 0;
+    }
+  },
+});
 const selectedTransportLayerId = ref<string | null>(null);
 const draggedTransportLayerId = ref<string | null>(null);
 const selectedType = ref("mysql");
@@ -265,6 +283,24 @@ const dialogStep = ref<DialogStep>("select");
 const dbPickerView = ref<DbPickerView>("icon");
 const dbSearchQuery = ref("");
 const configTab = ref<ConfigTab>("connection");
+type MqAuthKind = MqAuth["kind"];
+const mqAdminUrl = ref("http://127.0.0.1:8080");
+const mqSystemKind = ref<MqSystemKind>("pulsar");
+const mqAuthKind = ref<MqAuthKind>("none");
+const mqToken = ref("");
+const mqBasicUsername = ref("");
+const mqBasicPassword = ref("");
+const mqApiKeyHeader = ref("Authorization");
+const mqApiKeyValue = ref("");
+const mqOauthIssuerUrl = ref("");
+const mqOauthClientId = ref("");
+const mqOauthClientSecret = ref("");
+const mqOauthAudience = ref("");
+const mqOauthScope = ref("");
+const mqTlsSkipVerify = ref(false);
+const mqPinnedVersion = ref(pinnedVersionToSelection(undefined));
+const mqTokenSigningMode = ref<MqTokenSigningMode>("none");
+const mqTokenSigningKey = ref("");
 
 const colorOptions = [
   { value: "", class: "bg-transparent border-dashed", labelKey: "connection.colorNone" },
@@ -388,7 +424,8 @@ const driverProfiles: Record<
   vertica: { type: "vertica", port: 5433, user: "dbadmin", label: "Vertica", icon: "vertica" },
   firebird: { type: "firebird", port: 3050, user: "SYSDBA", label: "Firebird", icon: "firebird" },
   exasol: { type: "exasol", port: 8563, user: "sys", label: "Exasol", icon: "exasol" },
-  gbase: { type: "gbase", port: 5258, user: "gbasedbt", label: "GBase", icon: "gbase" },
+  gbase: { type: "gbase", port: 5258, user: "gbasedbt", label: "GBase 8a", icon: "gbase" },
+  gbase8a: { type: "gbase", port: 5258, user: "gbasedbt", label: "GBase 8a", icon: "gbase" },
   gbase8s: { type: "gbase", port: 9088, user: "gbasedbt", label: "GBase 8s", icon: "gbase" },
   opengauss: {
     type: "opengauss",
@@ -399,6 +436,7 @@ const driverProfiles: Record<
   },
   gaussdb: { type: "gaussdb", port: 5432, user: "gaussdb", label: "GaussDB", icon: "gaussdb" },
   kwdb: { type: "kwdb", port: 26257, user: "root", label: "KWDB", icon: "kwdb" },
+  questdb: { type: "questdb", port: 8812, user: "questdb", label: "QuestDB", icon: "questdb" },
   kingbase: { type: "kingbase", port: 54321, user: "system", label: "KingBase", icon: "kingbase" },
   highgo: { type: "highgo", port: 5866, user: "highgo", label: "瀚高 HighGo", icon: "highgo" },
   yashandb: { type: "yashandb", port: 1688, user: "sys", label: "崖山 YashanDB", icon: "yashandb" },
@@ -418,6 +456,14 @@ const driverProfiles: Record<
     user: "root",
     label: "StarRocks",
     icon: "starrocks",
+    urlParams: "",
+  },
+  manticoresearch: {
+    type: "manticoresearch",
+    port: 9306,
+    user: "root",
+    label: "Manticore Search",
+    icon: "manticoresearch",
     urlParams: "",
   },
   redshift: { type: "redshift", port: 5439, user: "awsuser", label: "Redshift", icon: "redshift" },
@@ -452,6 +498,7 @@ const driverProfiles: Record<
   xugu: { type: "xugu", port: 5138, user: "", label: "虚谷 XuguDB", icon: "xugu" },
   iotdb: { type: "iotdb", port: 6667, user: "root", label: "Apache IoTDB", icon: "iotdb" },
   etcd: { type: "etcd", port: 2379, user: "", label: "etcd", icon: "etcd" },
+  mq: { type: "mq", port: 8080, user: "", label: "Apache Pulsar", icon: "pulsar", host: "127.0.0.1" },
   iris: { type: "iris", port: 1972, user: "_SYSTEM", label: "IRIS", icon: "iris" },
   influxdb: { type: "influxdb", port: 8086, user: "", label: "InfluxDB", icon: "InfluxDB" },
   custom_mysql: {
@@ -485,6 +532,104 @@ function profileForConfig(config: ConnectionConfig) {
 
 function selectedProfile() {
   return driverProfiles[selectedType.value] ?? driverProfiles.mysql;
+}
+
+function resetMqFields(config?: Partial<MqAdminConfig>) {
+  mqSystemKind.value = "pulsar";
+  mqAdminUrl.value = config?.adminUrl?.trim() || "http://127.0.0.1:8080";
+  mqTlsSkipVerify.value = !!config?.tlsSkipVerify;
+  mqPinnedVersion.value = pinnedVersionToSelection(config?.pinnedVersion);
+  const auth = (config?.auth || { kind: "none" }) as MqAuth;
+  mqAuthKind.value = auth.kind || "none";
+  mqToken.value = auth.token || "";
+  mqBasicUsername.value = auth.username || "";
+  mqBasicPassword.value = auth.password || "";
+  mqApiKeyHeader.value = auth.header || "Authorization";
+  mqApiKeyValue.value = auth.value || "";
+  mqOauthIssuerUrl.value = auth.issuerUrl || "";
+  mqOauthClientId.value = auth.clientId || "";
+  mqOauthClientSecret.value = auth.clientSecret || "";
+  mqOauthAudience.value = auth.audience || "";
+  mqOauthScope.value = auth.scope || "";
+  const tokenSigning = config?.tokenSigning;
+  mqTokenSigningMode.value = tokenSigning?.algorithm === "hs256" || tokenSigning?.algorithm === "rs256" ? tokenSigning.algorithm : "none";
+  mqTokenSigningKey.value = tokenSigning?.key || "";
+}
+
+function hydrateMqFields(value: unknown) {
+  if (!value || typeof value !== "object") {
+    resetMqFields();
+    return;
+  }
+  resetMqFields(value as Partial<MqAdminConfig>);
+}
+
+function requireMqField(value: string, message: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error(message);
+  return trimmed;
+}
+
+function buildMqAuth(): MqAuth {
+  switch (mqAuthKind.value) {
+    case "token":
+      return { kind: "token", token: requireMqField(mqToken.value, "Token auth requires a token") };
+    case "basic":
+      return {
+        kind: "basic",
+        username: requireMqField(mqBasicUsername.value, "Basic auth requires a username"),
+        password: mqBasicPassword.value,
+      };
+    case "apiKey":
+      return {
+        kind: "apiKey",
+        header: requireMqField(mqApiKeyHeader.value, "API key auth requires a header"),
+        value: requireMqField(mqApiKeyValue.value, "API key auth requires a value"),
+      };
+    case "oauth2":
+      return {
+        kind: "oauth2",
+        issuerUrl: requireMqField(mqOauthIssuerUrl.value, "OAuth2 auth requires an issuer URL"),
+        clientId: requireMqField(mqOauthClientId.value, "OAuth2 auth requires a client ID"),
+        clientSecret: requireMqField(mqOauthClientSecret.value, "OAuth2 auth requires a client secret"),
+        audience: mqOauthAudience.value.trim() || undefined,
+        scope: mqOauthScope.value.trim() || undefined,
+      };
+    default:
+      return { kind: "none" };
+  }
+}
+
+function buildMqTokenSigning() {
+  if (mqTokenSigningMode.value === "none") return undefined;
+  return {
+    algorithm: mqTokenSigningMode.value,
+    key: requireMqField(mqTokenSigningKey.value, "Broker token signing key is required"),
+  };
+}
+
+function buildMqAdminConfig(): MqAdminConfig {
+  return {
+    systemKind: "pulsar",
+    adminUrl: requireMqField(mqAdminUrl.value, "MQ Admin URL is required"),
+    auth: buildMqAuth(),
+    tlsSkipVerify: mqTlsSkipVerify.value || undefined,
+    pinnedVersion: selectionToPinnedVersion(mqPinnedVersion.value),
+    tokenSigning: buildMqTokenSigning(),
+  };
+}
+
+function applyMqAdminUrl(config: LegacyConnectionConfig, adminUrl: string) {
+  let parsed: URL;
+  try {
+    parsed = new URL(adminUrl);
+  } catch {
+    throw new Error("MQ Admin URL is invalid");
+  }
+  const port = Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 8080);
+  config.host = parsed.hostname;
+  config.port = port;
+  config.ssl = parsed.protocol === "https:";
 }
 
 function isCustomCompatibleProfile() {
@@ -523,6 +668,11 @@ function applyProfile(val: string, preserveConnectionFields = false) {
       form.value.jdbc_driver_paths = [];
       jdbcDriverPathsInput.value = "";
     }
+    if (profile.type === "mq") {
+      resetMqFields();
+      form.value.database = undefined;
+      form.value.connection_string = undefined;
+    }
   }
 }
 
@@ -537,7 +687,7 @@ function switchOceanbaseMode(mode: "mysql" | "oracle") {
   resetTestState();
 }
 
-function switchGbaseProfile(profile: "gbase" | "gbase8s") {
+function switchGbaseProfile(profile: "gbase8a" | "gbase8s") {
   applyProfile(profile, false);
   selectedType.value = "gbase";
   resetTestState();
@@ -567,6 +717,7 @@ watch(
         connect_timeout_secs: config.connect_timeout_secs || 5,
         query_timeout_secs: config.query_timeout_secs ?? 30,
         idle_timeout_secs: config.idle_timeout_secs ?? 60,
+        keepalive_interval_secs: config.keepalive_interval_secs ?? 0,
         ssl: config.ssl || false,
         ca_cert_path: config.ca_cert_path || "",
         client_cert_path: config.client_cert_path || "",
@@ -588,6 +739,11 @@ watch(
         read_only: config.read_only || false,
         visible_databases: config.visible_databases,
       };
+      if (config.db_type === "mq") {
+        hydrateMqFields(config.external_config);
+      } else {
+        resetMqFields();
+      }
       h2ConnectionMode.value = h2ConnectionModeForConfig(config);
       customColorInput.value = config.color || "";
       selectedTransportLayerId.value = form.value.transport_layers?.[0]?.id || null;
@@ -595,7 +751,7 @@ watch(
       if (profile === "oceanbase") {
         oceanbaseSubMode.value = config.driver_profile === "oceanbase-oracle" ? "oracle" : "mysql";
       }
-      if (profile === "gbase8s") {
+      if (profile === "gbase8a" || profile === "gbase8s") {
         selectedType.value = "gbase";
       }
       mongoUseUrl.value = !!config.connection_string;
@@ -609,6 +765,7 @@ watch(
       selectedTransportLayerId.value = null;
       selectedType.value = "mysql";
       customDriverName.value = "";
+      resetMqFields();
       oceanbaseSubMode.value = "mysql";
       h2ConnectionMode.value = "file";
       dialogStep.value = "select";
@@ -727,6 +884,7 @@ const iconTypeMap: Record<string, string> = {
   opengauss: "opengauss",
   gaussdb: "gaussdb",
   kwdb: "kwdb",
+  questdb: "questdb",
   kingbase: "kingbase",
   highgo: "highgo",
   yashandb: "yashandb",
@@ -734,12 +892,14 @@ const iconTypeMap: Record<string, string> = {
   doris: "doris",
   selectdb: "selectdb",
   starrocks: "starrocks",
+  manticoresearch: "manticoresearch",
   redshift: "redshift",
   cockroachdb: "cockroachdb",
   tdengine: "tdengine",
   xugu: "xugu",
   iotdb: "iotdb",
   etcd: "etcd",
+  mq: "mq",
   dm: "dm",
   h2: "h2",
   snowflake: "snowflake",
@@ -778,6 +938,7 @@ const dbOptions: DbOption[] = [
   { value: "clickhouse", label: "ClickHouse" },
   { value: "gaussdb", label: "GaussDB" },
   { value: "kwdb", label: "KWDB" },
+  { value: "questdb", label: "QuestDB" },
   { value: "tidb", label: "TiDB" },
   { value: "oceanbase", label: "OceanBase" },
   { value: "goldendb", label: "GoldenDB" },
@@ -816,9 +977,13 @@ const dbOptions: DbOption[] = [
   { value: "xugu", label: "虚谷 XuguDB" },
   { value: "iotdb", label: "Apache IoTDB" },
   { value: "etcd", label: "etcd" },
+  { value: "mq", label: "Apache Pulsar" },
   { value: "influxdb", label: "InfluxDB" },
   { value: "iris", label: "IRIS" },
   { value: "jdbc", label: "JDBC" },
+  { value: "manticoresearch", label: "Manticore Search" },
+  { value: "custom_mysql", label: "Custom (MySQL)" },
+  { value: "custom_postgres", label: "Custom (PostgreSQL)" },
 ];
 
 const dbCategories = computed<DbCategory[]>(() => [{ key: "all", title: "", options: dbOptions }]);
@@ -864,9 +1029,10 @@ const sqliteExtensionPaths = computed({
     form.value.url_params = setSqliteExtensionPaths(form.value.url_params, value);
   },
 });
-const tlsCapableDatabaseTypes = new Set<DatabaseType>(["mysql", "postgres", "redshift", "gaussdb", "kwdb", "opengauss", "redis", "etcd", "clickhouse", "elasticsearch", "influxdb"]);
+const tlsCapableDatabaseTypes = new Set<DatabaseType>(["mysql", "postgres", "redshift", "gaussdb", "kwdb", "opengauss", "questdb", "redis", "etcd", "clickhouse", "elasticsearch", "influxdb"]);
 const supportsTlsToggle = computed(() => tlsCapableDatabaseTypes.has(form.value.db_type));
 const supportsCaCertificatePath = computed(() => form.value.db_type === "clickhouse");
+const supportsGenericUrlParams = computed(() => form.value.db_type !== "manticoresearch");
 const bareMysqlProfiles = new Set(["doris", "starrocks", "selectdb", "oceanbase"]);
 const supportsMysqlTlsOptions = computed(() => form.value.db_type === "mysql" && !bareMysqlProfiles.has(selectedType.value));
 const mysqlTlsMode = computed({
@@ -935,6 +1101,7 @@ const etcdEndpointsLines = computed({
 });
 const canUseTransportLayers = computed(() => form.value.db_type !== "sqlite" && form.value.db_type !== "access" && !isH2FileMode.value);
 const shouldShowAgentDriverInstallHint = computed(() => showAgentDriverInstallHint(form.value.db_type, agentDrivers.value, form.value.driver_profile));
+const h2DriverMissing = computed(() => form.value.db_type === "h2" && isH2FileMode.value && agentDrivers.value.find((d) => d.db_type === "h2")?.installed !== true);
 const canChooseVisibleDatabases = computed(() => connectionCanChooseVisibleDatabases(form.value));
 const hasVisibleDatabaseFilter = computed(() => Array.isArray(form.value.visible_databases));
 const visibleDatabaseSummary = computed(() => {
@@ -964,6 +1131,7 @@ const testResultMessage = computed(() => {
   return testResult.value.ok ? t("connection.testSuccess") : testResult.value.message;
 });
 const hasRequiredConnectionTarget = computed(() => {
+  if (form.value.db_type === "mq") return !!mqAdminUrl.value.trim();
   if (isH2FileMode.value) return !!(form.value.host.trim() || h2FilePathFromJdbcUrl(form.value.connection_string));
   return !!(form.value.host || (mongoUseUrl.value && form.value.connection_string) || (form.value.db_type === "jdbc" && form.value.connection_string) || connectionUrlInput.value.trim());
 });
@@ -977,6 +1145,13 @@ const mongoAuthMechanism = computed({
   get: () => mongoUrlParam(form.value.url_params, "authMechanism") || "default",
   set: (value: string) => {
     form.value.url_params = setMongoUrlParam(form.value.url_params, "authMechanism", value === "default" ? "" : value);
+  },
+});
+const mongoDriverMode = computed({
+  get: () => (form.value.driver_profile === "mongodb-legacy" ? "legacy" : "auto"),
+  set: (value: string) => {
+    form.value.driver_profile = value === "legacy" ? "mongodb-legacy" : "mongodb";
+    form.value.driver_label = value === "legacy" ? "MongoDB (Legacy)" : "MongoDB";
   },
 });
 
@@ -1010,6 +1185,9 @@ async function testConnection() {
     const config = connectionConfigForSubmit(editingId.value || uuid());
     const msg = await api.testConnection(config);
     if (runId !== testRunId) return;
+    if (config.db_type === "mongodb" && /legacy driver/i.test(msg)) {
+      mongoDriverMode.value = "legacy";
+    }
     testResult.value = { ok: true, message: msg };
   } catch (e: any) {
     if (runId !== testRunId) return;
@@ -1072,12 +1250,33 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   config.query_timeout_secs = Number.isFinite(queryTimeout) && queryTimeout >= 0 ? queryTimeout : 30;
   const idleTimeout = Number(config.idle_timeout_secs);
   config.idle_timeout_secs = Number.isFinite(idleTimeout) && idleTimeout >= 0 ? idleTimeout : 60;
+  const keepaliveInterval = Number(config.keepalive_interval_secs);
+  config.keepalive_interval_secs = Number.isFinite(keepaliveInterval) && keepaliveInterval >= 0 ? keepaliveInterval : 0;
+  if (config.db_type === "manticoresearch") {
+    config.url_params = "";
+  }
   if (!config.one_time) config.one_time = undefined;
   if (!config.read_only) config.read_only = undefined;
+  if (config.db_type === "mq") {
+    const mqConfig = buildMqAdminConfig();
+    config.external_config = mqConfig;
+    applyMqAdminUrl(config, mqConfig.adminUrl);
+    config.username = "";
+    config.password = "";
+    config.database = undefined;
+    config.connection_string = undefined;
+    config.url_params = "";
+  } else {
+    config.external_config = undefined;
+  }
   if (config.db_type === "mongodb" && !mongoUseUrl.value) {
     config.connection_string = undefined;
   } else if (config.db_type === "mongodb") {
     config.connection_string = normalizeMongoConnectionString(config.connection_string?.trim() || "");
+  }
+  if (config.db_type === "mongodb" && config.driver_profile !== "mongodb-legacy") {
+    config.driver_profile = "mongodb";
+    config.driver_label = "MongoDB";
   }
   if (config.db_type !== "oracle") {
     config.sysdba = undefined;
@@ -1426,6 +1625,28 @@ function resetVisibleDatabaseDraftState() {
   visibleDatabaseShowSystem.value = false;
 }
 
+/** Silently load database names so the summary count shows a real total. */
+async function preloadVisibleDatabaseNames() {
+  if (!ensureConnectionHostResolvedFromUrl()) return;
+  if (visibleDatabaseNames.value.length > 0) return;
+  isLoadingVisibleDatabases.value = true;
+  const draftId = buildDraftVisibleDatabasesConnectionId(uuid());
+  const draftConfig = {
+    ...connectionConfigForSubmit(draftId),
+    id: draftId,
+    one_time: true,
+  };
+  try {
+    await api.connectDb(draftConfig);
+    visibleDatabaseNames.value = await loadVisibleDatabaseNames(draftId, draftConfig);
+  } catch {
+    // silently fail
+  } finally {
+    await api.disconnectDb(draftId).catch(() => undefined);
+    isLoadingVisibleDatabases.value = false;
+  }
+}
+
 async function openVisibleDatabasesPicker() {
   if (!ensureConnectionHostResolvedFromUrl()) return;
   if (!canChooseVisibleDatabases.value || isLoadingVisibleDatabases.value) return;
@@ -1524,6 +1745,7 @@ function resetForm() {
   selectedType.value = "mysql";
   customDriverName.value = "";
   mongoUseUrl.value = false;
+  resetMqFields();
   oceanbaseSubMode.value = "mysql";
   jdbcDriverPathsInput.value = "";
   selectedJdbcDriverPath.value = "";
@@ -1574,7 +1796,7 @@ function applyConnectionPrefill(draft: ConnectionDeepLinkDraft) {
     oceanbaseSubMode.value = "oracle";
     selectedType.value = "oceanbase";
   }
-  if (draft.driverProfile === "gbase8s") {
+  if (draft.driverProfile === "gbase8a" || draft.driverProfile === "gbase8s") {
     selectedType.value = "gbase";
   }
   customDriverName.value = isCustomCompatibleProfile() ? draft.driverLabel : "";
@@ -1606,6 +1828,12 @@ watch(
       void loadJdbcDrivers();
       void loadAgentDrivers();
     }
+    // Preload database names so the summary count is accurate right away.
+    void nextTick(() => {
+      if (canChooseVisibleDatabases.value && hasVisibleDatabaseFilter.value) {
+        void preloadVisibleDatabaseNames();
+      }
+    });
   },
   { immediate: true },
 );
@@ -1897,7 +2125,7 @@ async function browseDbFilePath() {
           ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }]
           : form.value.db_type === "h2"
             ? [{ name: "H2", extensions: ["db"] }]
-            : [{ name: "SQLite", extensions: ["db", "sqlite", "sqlite3"] }];
+            : [{ name: "SQLite", extensions: ["db", "db3", "sqlite", "sqlite3"] }];
     const selected = await open({
       title: "Select Database File",
       multiple: false,
@@ -1946,6 +2174,24 @@ async function createDuckDbFilePath() {
   if (!selected) return;
 
   const path = ensureDuckDbFileExtension(selected);
+  form.value.host = path;
+}
+
+function ensureSqliteFileExtension(path: string): string {
+  return /\.(db|db3|sqlite|sqlite3)$/i.test(path) ? path : `${path}.db`;
+}
+
+async function createSqliteFilePath() {
+  if (!isTauriRuntime()) return;
+  const { save } = await import("@tauri-apps/plugin-dialog");
+  const selected = await save({
+    title: t("connection.createSqliteFile"),
+    defaultPath: "database.db",
+    filters: [{ name: "SQLite", extensions: ["db", "db3", "sqlite", "sqlite3"] }],
+  });
+  if (!selected) return;
+
+  const path = ensureSqliteFileExtension(selected);
   form.value.host = path;
 }
 
@@ -2168,7 +2414,7 @@ function openExternalUrl(url: string) {
                 <div v-if="selectedType === 'gbase'" class="grid grid-cols-4 items-center gap-4">
                   <Label class="text-right text-xs">{{ t("connection.version") }}</Label>
                   <div class="col-span-3 flex gap-2">
-                    <Button size="sm" :variant="form.driver_profile === 'gbase8s' ? 'outline' : 'default'" @click="switchGbaseProfile('gbase')"> GBase </Button>
+                    <Button size="sm" :variant="form.driver_profile === 'gbase8s' ? 'outline' : 'default'" @click="switchGbaseProfile('gbase8a')"> GBase 8a </Button>
                     <Button size="sm" :variant="form.driver_profile === 'gbase8s' ? 'default' : 'outline'" @click="switchGbaseProfile('gbase8s')"> GBase 8s </Button>
                   </div>
                 </div>
@@ -2224,6 +2470,14 @@ function openExternalUrl(url: string) {
                   </div>
                 </div>
 
+                <div v-if="h2DriverMissing" class="grid grid-cols-4 items-center gap-4">
+                  <span />
+                  <p class="col-span-3 text-xs text-muted-foreground">
+                    {{ t("connection.driverInstallHintPrefix") }}<a class="underline cursor-pointer text-primary hover:text-primary/80" @click="emit('openDriverStore')">{{ t("toolbar.driverManager") }}</a
+                    >{{ t("connection.driverInstallHintSuffix") }}
+                  </p>
+                </div>
+
                 <!-- JDBC: optional external plugin -->
                 <template v-if="form.db_type === 'jdbc'">
                   <div class="grid grid-cols-4 items-center gap-4">
@@ -2236,7 +2490,7 @@ function openExternalUrl(url: string) {
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right">{{ t("connection.password") }}</Label>
-                    <Input v-model="form.password" type="password" class="col-span-3" />
+                    <PasswordInput v-model="form.password" class="col-span-3" />
                   </div>
                   <div class="grid grid-cols-4 items-start gap-4">
                     <Label class="text-right mt-2">{{ t("connection.jdbcDriverPaths") }}</Label>
@@ -2320,6 +2574,14 @@ function openExternalUrl(url: string) {
                           </TooltipTrigger>
                           <TooltipContent>{{ t("connection.createDuckDbFile") }}</TooltipContent>
                         </Tooltip>
+                        <Tooltip v-if="isDesktop && form.db_type === 'sqlite'">
+                          <TooltipTrigger as-child>
+                            <Button variant="outline" size="icon" class="h-9 w-9 shrink-0" @click="createSqliteFilePath">
+                              <FilePlus2 class="h-4 w-4" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent>{{ t("connection.createSqliteFile") }}</TooltipContent>
+                        </Tooltip>
                       </div>
                       <p v-if="supportsMemoryDatabasePath" class="text-xs text-muted-foreground">
                         {{ t("connection.memoryDatabasePathHint") }}
@@ -2357,9 +2619,127 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label class="text-right">{{ t("connection.password") }}{{ form.db_type === "access" ? "（可选）" : "" }}</Label>
-                      <Input v-model="form.password" type="password" class="col-span-3" />
+                      <PasswordInput v-model="form.password" class="col-span-3" />
                     </div>
                   </template>
+                </template>
+
+                <!-- Message Queue: admin URL and auth -->
+                <template v-else-if="form.db_type === 'mq'">
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">Admin URL</Label>
+                    <Input v-model="mqAdminUrl" class="col-span-3" placeholder="http://127.0.0.1:8080" />
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">System</Label>
+                    <div class="col-span-3 h-9 rounded-md border border-input bg-muted px-3 py-2 text-sm text-muted-foreground">Apache Pulsar</div>
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">Auth</Label>
+                    <div class="col-span-3 flex flex-wrap gap-2">
+                      <Button size="sm" :variant="mqAuthKind === 'none' ? 'default' : 'outline'" @click="mqAuthKind = 'none'">None</Button>
+                      <Button size="sm" :variant="mqAuthKind === 'token' ? 'default' : 'outline'" @click="mqAuthKind = 'token'">Token</Button>
+                      <Button size="sm" :variant="mqAuthKind === 'basic' ? 'default' : 'outline'" @click="mqAuthKind = 'basic'">Basic</Button>
+                      <Button size="sm" :variant="mqAuthKind === 'apiKey' ? 'default' : 'outline'" @click="mqAuthKind = 'apiKey'">API Key</Button>
+                      <Button size="sm" :variant="mqAuthKind === 'oauth2' ? 'default' : 'outline'" @click="mqAuthKind = 'oauth2'">OAuth2</Button>
+                    </div>
+                  </div>
+                  <template v-if="mqAuthKind === 'token'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Token</Label>
+                      <Input v-model="mqToken" type="password" class="col-span-3" />
+                    </div>
+                  </template>
+                  <template v-else-if="mqAuthKind === 'basic'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">{{ t("connection.user") }}</Label>
+                      <Input v-model="mqBasicUsername" class="col-span-3" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">{{ t("connection.password") }}</Label>
+                      <Input v-model="mqBasicPassword" type="password" class="col-span-3" />
+                    </div>
+                  </template>
+                  <template v-else-if="mqAuthKind === 'apiKey'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Header</Label>
+                      <Input v-model="mqApiKeyHeader" class="col-span-3" placeholder="Authorization" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Value</Label>
+                      <Input v-model="mqApiKeyValue" type="password" class="col-span-3" />
+                    </div>
+                  </template>
+                  <template v-else-if="mqAuthKind === 'oauth2'">
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Issuer URL</Label>
+                      <Input v-model="mqOauthIssuerUrl" class="col-span-3" placeholder="https://issuer.example.com/oauth/token" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Client ID</Label>
+                      <Input v-model="mqOauthClientId" class="col-span-3" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Client Secret</Label>
+                      <Input v-model="mqOauthClientSecret" type="password" class="col-span-3" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Audience</Label>
+                      <Input v-model="mqOauthAudience" class="col-span-3" />
+                    </div>
+                    <div class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right">Scope</Label>
+                      <Input v-model="mqOauthScope" class="col-span-3" />
+                    </div>
+                  </template>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right text-xs">TLS</Label>
+                    <label class="col-span-3 inline-flex items-center gap-2">
+                      <input type="checkbox" v-model="mqTlsSkipVerify" class="mr-0" />
+                      <span class="text-xs text-muted-foreground">Skip certificate verification</span>
+                    </label>
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">Pinned Version</Label>
+                    <Select v-model="mqPinnedVersion">
+                      <SelectTrigger class="col-span-3 h-9">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem v-for="option in MQ_PINNED_VERSION_OPTIONS" :key="option.value" :value="option.value">
+                          <div class="grid gap-0.5 text-left">
+                            <span>{{ option.label }}</span>
+                            <span class="text-xs text-muted-foreground">{{ option.description }}</span>
+                          </div>
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">Broker Token 签发</Label>
+                    <Select v-model="mqTokenSigningMode">
+                      <SelectTrigger class="col-span-3 h-9">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="none">不配置</SelectItem>
+                        <SelectItem value="hs256">HS256 SECRET</SelectItem>
+                        <SelectItem value="rs256">RS256 PRIVATE</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div v-if="mqTokenSigningMode !== 'none'" class="grid grid-cols-4 items-start gap-4">
+                    <Label class="pt-2 text-right">签发密钥</Label>
+                    <textarea
+                      v-model="mqTokenSigningKey"
+                      class="col-span-3 min-h-24 rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      :placeholder="mqTokenSigningMode === 'hs256' ? 'Broker SECRET' : '-----BEGIN PRIVATE KEY-----'"
+                    />
+                  </div>
+                  <div v-if="mqTokenSigningMode !== 'none'" class="grid grid-cols-4 items-start gap-4">
+                    <span />
+                    <p class="col-span-3 m-0 text-xs leading-5 text-muted-foreground">按 Broker 的 jwt.broker.token.mode 选择：SECRET 使用 HS256，PRIVATE 使用 RS256。密钥会走连接 secret 存储。</p>
+                  </div>
                 </template>
 
                 <!-- Redis: host, port, user, password, ssl -->
@@ -2403,7 +2783,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label class="text-right">{{ t("connection.redisSentinelPassword") }}</Label>
-                      <Input v-model="form.redis_sentinel_password" type="password" class="col-span-3" />
+                      <PasswordInput v-model="form.redis_sentinel_password" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label class="text-right text-xs">{{ t("connection.redisSentinelTls") }}</Label>
@@ -2430,7 +2810,7 @@ function openExternalUrl(url: string) {
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right">{{ t("connection.password") }}</Label>
-                    <Input v-model="form.password" type="password" class="col-span-3" :placeholder="t('connection.databasePlaceholder')" />
+                    <PasswordInput v-model="form.password" class="col-span-3" :placeholder="t('connection.databasePlaceholder')" />
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right text-xs">{{ t("connection.redisKeySeparator") }}</Label>
@@ -2465,12 +2845,27 @@ function openExternalUrl(url: string) {
                   </div>
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right">{{ t("connection.password") }}</Label>
-                    <Input v-model="form.password" type="password" class="col-span-3" />
+                    <PasswordInput v-model="form.password" class="col-span-3" />
                   </div>
                 </template>
 
                 <!-- MongoDB: URL or form -->
                 <template v-else-if="form.db_type === 'mongodb'">
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right text-xs">{{ t("connection.driverMode") }}</Label>
+                    <div class="col-span-3 flex items-center gap-2">
+                      <Button size="sm" :variant="mongoDriverMode === 'legacy' ? 'outline' : 'default'" @click="mongoDriverMode = 'auto'">{{ t("connection.mongoDriverAuto") }}</Button>
+                      <Button size="sm" :variant="mongoDriverMode === 'legacy' ? 'default' : 'outline'" @click="mongoDriverMode = 'legacy'">{{ t("connection.mongoDriverLegacy") }}</Button>
+                      <Tooltip>
+                        <TooltipTrigger as-child>
+                          <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
+                        </TooltipTrigger>
+                        <TooltipContent side="top" align="center" class="max-w-[320px] text-xs leading-relaxed">
+                          {{ t("connection.mongoLegacyHint") }}
+                        </TooltipContent>
+                      </Tooltip>
+                    </div>
+                  </div>
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right text-xs">{{ t("connection.mode") }}</Label>
                     <div class="col-span-3 flex gap-2">
@@ -2492,13 +2887,13 @@ function openExternalUrl(url: string) {
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label class="text-right">{{ t("connection.host") }}</Label>
                       <Input v-model="form.host" class="col-span-2" />
-                      <Input v-model.number="form.port" type="number" class="col-span-1" :disabled="form.ssl" />
+                      <Input v-model.number="form.port" type="number" class="col-span-1" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <span />
                       <label class="col-span-3 flex items-center gap-2 text-sm">
                         <input type="checkbox" v-model="form.ssl" class="mr-0" />
-                        <span>SRV (MongoDB Atlas)</span>
+                        <span>{{ t("connection.sslEnable") }}</span>
                       </label>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
@@ -2507,7 +2902,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label class="text-right">{{ t("connection.password") }}</Label>
-                      <Input v-model="form.password" type="password" class="col-span-3" />
+                      <PasswordInput v-model="form.password" class="col-span-3" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label class="text-right">{{ t("connection.defaultDatabase") }}</Label>
@@ -2534,13 +2929,35 @@ function openExternalUrl(url: string) {
                       <Label class="text-right">{{ t("connection.urlParams") }}</Label>
                       <Input v-model="form.url_params" class="col-span-3" placeholder="authSource=admin&authMechanism=SCRAM-SHA-1" />
                     </div>
-                    <div class="grid grid-cols-4 items-start gap-4">
-                      <span />
-                      <p class="col-span-3 text-xs text-muted-foreground">
-                        {{ t("connection.mongoLegacyHint") }}
-                      </p>
-                    </div>
                   </template>
+                </template>
+
+                <!-- Turso: simplified form (URL + Token) -->
+                <template v-else-if="form.db_type === 'turso'">
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">{{ t("connection.host") }}</Label>
+                    <Input v-model="form.host" class="col-span-3" placeholder="your-database.turso.io 或 libsql://your-database.turso.io" />
+                  </div>
+
+                  <div class="grid grid-cols-4 items-start gap-4">
+                    <span />
+                    <p class="col-span-3 text-xs text-muted-foreground">支持 libsql:// 或 https:// 协议，也可以只填主机名（自动使用 HTTPS）</p>
+                  </div>
+
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">Auth Token</Label>
+                    <PasswordInput v-model="form.password" class="col-span-3" placeholder="eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9..." />
+                  </div>
+
+                  <div class="grid grid-cols-4 items-start gap-4">
+                    <span />
+                    <p class="col-span-3 text-xs text-muted-foreground">使用 <code class="px-1 py-0.5 rounded bg-muted text-xs">turso db tokens create &lt;database-name&gt;</code> 创建 token</p>
+                  </div>
+
+                  <div class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right">{{ t("connection.urlParams") }}</Label>
+                    <Input v-model="form.url_params" class="col-span-3" placeholder="authToken=xxx（可选，优先使用上面的 Token 字段）" />
+                  </div>
                 </template>
 
                 <!-- MySQL / PostgreSQL: host, port, user, password, database -->
@@ -2551,6 +2968,11 @@ function openExternalUrl(url: string) {
                     <Input v-model.number="form.port" type="number" class="col-span-1" />
                   </div>
 
+                  <div v-if="form.driver_profile === 'gbase8s'" class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right text-xs">{{ t("connection.gbaseServer") }}</Label>
+                    <Input v-model="form.gbase_server" class="col-span-3" placeholder="gbase01" />
+                  </div>
+
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right">{{ t("connection.user") }}</Label>
                     <Input v-model="form.username" class="col-span-3" />
@@ -2558,7 +2980,7 @@ function openExternalUrl(url: string) {
 
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right">{{ t("connection.password") }}</Label>
-                    <Input v-model="form.password" type="password" class="col-span-3" />
+                    <PasswordInput v-model="form.password" class="col-span-3" />
                   </div>
 
                   <div class="grid grid-cols-4 items-center gap-4">
@@ -2606,7 +3028,7 @@ function openExternalUrl(url: string) {
                     </label>
                   </div>
 
-                  <div class="grid grid-cols-4 items-center gap-4">
+                  <div v-if="supportsGenericUrlParams" class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right">{{ t("connection.urlParams") }}</Label>
                     <Input
                       v-model="form.url_params"
@@ -2900,6 +3322,13 @@ function openExternalUrl(url: string) {
                   <Input v-model.number="form.idle_timeout_secs" type="number" min="0" max="600" step="1" class="col-span-3" />
                 </div>
                 <div class="grid grid-cols-4 items-center gap-4">
+                  <Label class="text-right text-xs">{{ t("connection.keepaliveInterval") }}</Label>
+                  <div class="col-span-3 flex items-center gap-2">
+                    <Switch v-model="keepaliveEnabled" />
+                    <Input v-model.number="form.keepalive_interval_secs" type="number" min="1" max="3600" step="1" class="flex-1" :disabled="!keepaliveEnabled" />
+                  </div>
+                </div>
+                <div class="grid grid-cols-4 items-center gap-4">
                   <Label class="text-right text-xs">{{ t("connection.readOnly") }}</Label>
                   <label class="col-span-3 flex items-center gap-2 cursor-pointer">
                     <input type="checkbox" v-model="form.read_only" class="mr-0" />
@@ -3007,7 +3436,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label class="text-right text-xs">{{ t("connection.sshPassword") }}</Label>
-                      <Input v-model="selectedSshLayer.password" type="password" class="col-span-3" :placeholder="t('connection.sshPasswordPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
+                      <PasswordInput v-model="selectedSshLayer.password" class="col-span-3" :placeholder="t('connection.sshPasswordPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label class="text-right text-xs">{{ t("connection.sshKeyPath") }}</Label>
@@ -3025,7 +3454,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label class="text-right text-xs">{{ t("connection.sshKeyPassphrase") }}</Label>
-                      <Input v-model="selectedSshLayer.key_passphrase" type="password" class="col-span-3" :placeholder="t('connection.sshKeyPassphrasePlaceholder')" :disabled="selectedSshLayer.enabled === false" />
+                      <PasswordInput v-model="selectedSshLayer.key_passphrase" class="col-span-3" :placeholder="t('connection.sshKeyPassphrasePlaceholder')" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <span />
@@ -3070,7 +3499,7 @@ function openExternalUrl(url: string) {
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label class="text-right text-xs">{{ t("connection.proxyPassword") }}</Label>
-                      <Input v-model="selectedProxyLayer.password" type="password" class="col-span-3" :placeholder="t('connection.proxyPasswordPlaceholder')" :disabled="selectedProxyLayer.enabled === false" />
+                      <PasswordInput v-model="selectedProxyLayer.password" class="col-span-3" :placeholder="t('connection.proxyPasswordPlaceholder')" :disabled="selectedProxyLayer.enabled === false" />
                     </div>
                   </template>
                 </template>

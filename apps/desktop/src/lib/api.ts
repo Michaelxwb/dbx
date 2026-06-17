@@ -97,6 +97,7 @@ export const deleteSavedSqlFile = forward("deleteSavedSqlFile");
 export const savedSqlStorageDir = forward("savedSqlStorageDir");
 export const openSavedSqlStorageDir = forward("openSavedSqlStorageDir");
 export const revealPathInFileManager = forward("revealPathInFileManager");
+export const backupSqliteDatabase = forward("backupSqliteDatabase");
 export const syncSavedSqlDirectory = forward("syncSavedSqlDirectory");
 
 // Schema
@@ -155,6 +156,7 @@ export const buildDropSchemaSql = forward("buildDropSchemaSql");
 export const buildDuplicateTableStructureSql = forward("buildDuplicateTableStructureSql");
 export const buildExecutableObjectSourceStatements = forward("buildExecutableObjectSourceStatements");
 export const buildExecutableObjectSourceSql = forward("buildExecutableObjectSourceSql");
+export const buildEditableObjectSource = forward("buildEditableObjectSource");
 export const buildRoutineRenameObjectSourceStatements = forward("buildRoutineRenameObjectSourceStatements");
 export const buildViewDdlSql = forward("buildViewDdlSql");
 export const buildTableStructureChangeSql = forward("buildTableStructureChangeSql");
@@ -239,6 +241,7 @@ export const cancelTableExport = forward("cancelTableExport");
 // Redis
 export const redisListDatabases = forward("redisListDatabases");
 export const redisScanKeys = forward("redisScanKeys");
+export const redisScanKeysBatch = forward("redisScanKeysBatch");
 export const redisScanValues = forward("redisScanValues");
 export const redisGetValue = forward("redisGetValue");
 export const redisSetString = forward("redisSetString");
@@ -260,12 +263,60 @@ export const redisDeleteKeys = forward("redisDeleteKeys");
 export const redisFlushDb = forward("redisFlushDb");
 export const redisExecuteCommand = forward("redisExecuteCommand");
 export const redisLoadMore = forward("redisLoadMore");
+export const redisPubSubPublish = forward("redisPubSubPublish");
+
+export function redisPubSubConnect(connectionId: string): WebSocket {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return new WebSocket(`${protocol}//${window.location.host}/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}`);
+}
 
 // etcd
 export const etcdListPrefix = forward("etcdListPrefix");
 export const etcdGet = forward("etcdGet");
 export const etcdPut = forward("etcdPut");
 export const etcdDelete = forward("etcdDelete");
+
+// Message Queue
+export const mqTestConnection = forward("mqTestConnection");
+export const mqListTenants = forward("mqListTenants");
+export const mqGetTenant = forward("mqGetTenant");
+export const mqCreateTenant = forward("mqCreateTenant");
+export const mqUpdateTenant = forward("mqUpdateTenant");
+export const mqDeleteTenant = forward("mqDeleteTenant");
+export const mqListNamespaces = forward("mqListNamespaces");
+export const mqCreateNamespace = forward("mqCreateNamespace");
+export const mqDeleteNamespace = forward("mqDeleteNamespace");
+export const mqGetNamespacePolicies = forward("mqGetNamespacePolicies");
+export const mqListTopics = forward("mqListTopics");
+export const mqCreateTopic = forward("mqCreateTopic");
+export const mqDeleteTopic = forward("mqDeleteTopic");
+export const mqUpdatePartitions = forward("mqUpdatePartitions");
+export const mqGetTopicStats = forward("mqGetTopicStats");
+export const mqGetTopicInternalStats = forward("mqGetTopicInternalStats");
+export const mqListSubscriptions = forward("mqListSubscriptions");
+export const mqCreateSubscription = forward("mqCreateSubscription");
+export const mqDeleteSubscription = forward("mqDeleteSubscription");
+export const mqSkipMessages = forward("mqSkipMessages");
+export const mqResetCursor = forward("mqResetCursor");
+export const mqClearBacklog = forward("mqClearBacklog");
+export const mqPeekMessages = forward("mqPeekMessages");
+export const mqExpireMessages = forward("mqExpireMessages");
+export const mqListProducers = forward("mqListProducers");
+export const mqListConsumers = forward("mqListConsumers");
+export const mqUnloadTopic = forward("mqUnloadTopic");
+export const mqSetPublishRate = forward("mqSetPublishRate");
+export const mqSetDispatchRate = forward("mqSetDispatchRate");
+export const mqSetSubscribeRate = forward("mqSetSubscribeRate");
+export const mqSetBacklogQuota = forward("mqSetBacklogQuota");
+export const mqSetRetention = forward("mqSetRetention");
+export const mqGetEffectivePolicies = forward("mqGetEffectivePolicies");
+export const mqGrantPermission = forward("mqGrantPermission");
+export const mqRevokePermission = forward("mqRevokePermission");
+export const mqListPermissions = forward("mqListPermissions");
+export const mqIssueToken = forward("mqIssueToken");
+export const mqListTokenRecords = forward("mqListTokenRecords");
+export const mqGetBacklog = forward("mqGetBacklog");
+export const mqRawRequest = forward("mqRawRequest");
 
 // MongoDB
 export const mongoListDatabases = forward("mongoListDatabases");
@@ -293,6 +344,7 @@ export const deleteHistoryEntry = forward("deleteHistoryEntry");
 
 // Updates
 export const checkMcpServerStatus = forward("checkMcpServerStatus");
+export const installMcpServer = forward("installMcpServer");
 export const checkForUpdates = forward("checkForUpdates");
 export const getSystemProxyUrl = forward("getSystemProxyUrl");
 export const getAppVersion = forward("getAppVersion");

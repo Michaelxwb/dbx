@@ -376,6 +376,10 @@ export async function revealPathInFileManager(_path: string): Promise<void> {
   throw new Error("Reveal in file manager is only available in the desktop app.");
 }
 
+export async function backupSqliteDatabase(_connectionId: string, _destinationPath: string): Promise<void> {
+  throw new Error("SQLite backup is only available in the desktop app.");
+}
+
 export async function syncSavedSqlDirectory(_request: SavedSqlSyncRequest): Promise<void> {
   throw new Error("SQL directory sync is only available in the desktop app.");
 }
@@ -541,7 +545,8 @@ export async function executeInTransaction(connectionId: string, database: strin
 }
 
 export async function cancelQuery(executionId: string): Promise<boolean> {
-  return post("/api/query/cancel", { executionId });
+  const result = await post<boolean | { cancelled?: boolean }>("/api/query/cancel", { executionId });
+  return typeof result === "boolean" ? result : result.cancelled === true;
 }
 
 export async function analyzeSqlReferences(sql: string, dialect?: string): Promise<SqlReferenceAnalysis> {
@@ -648,6 +653,10 @@ export async function buildExecutableObjectSourceStatements(input: BuildEditable
 
 export async function buildExecutableObjectSourceSql(input: BuildEditableObjectSourceSqlInput): Promise<string> {
   return post("/api/query/build-executable-object-source-sql", { input });
+}
+
+export async function buildEditableObjectSource(input: BuildEditableObjectSourceSqlInput): Promise<string> {
+  return post("/api/query/build-editable-object-source", { input });
 }
 
 export async function buildRoutineRenameObjectSourceStatements(input: BuildRoutineRenameObjectSourceInput): Promise<string[]> {
@@ -800,7 +809,7 @@ export async function aiAgentStream(sessionId: string, request: AiCompletionRequ
   const res = await fetch("/api/ai/agent-stream", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, request, connection_id: connectionId, database, db_type: dbType, mode: mode || "ask" }),
+    body: JSON.stringify({ sessionId, request, connectionId, database, dbType, mode: mode || "ask" }),
     signal,
   });
   if (!res.ok) throw new Error(await res.text());
@@ -1265,6 +1274,10 @@ export async function redisScanKeys(connectionId: string, db: number, cursor: nu
   return post("/api/redis/scan-keys", { connectionId, db, cursor, pattern, count });
 }
 
+export async function redisScanKeysBatch(connectionId: string, db: number, cursor: number, pattern: string, count: number, maxIterations: number): Promise<RedisScanResult> {
+  return post("/api/redis/scan-keys-batch", { connectionId, db, cursor, pattern, count, maxIterations });
+}
+
 export async function redisScanValues(connectionId: string, db: number, cursor: number, pattern: string, query: string, count: number, includeKeyMatches = false): Promise<RedisScanResult> {
   return post("/api/redis/scan-values", { connectionId, db, cursor, pattern, query, includeKeyMatches, count });
 }
@@ -1349,6 +1362,10 @@ export async function redisLoadMore(connectionId: string, db: number, keyRaw: st
   return post("/api/redis/load-more", { connectionId, db, keyRaw, keyType, cursor, count });
 }
 
+export async function redisPubSubPublish(connectionId: string, db: number, channel: string, message: string): Promise<{ subscribers: number }> {
+  return post("/api/redis/pubsub/publish", { connectionId, db, channel, message });
+}
+
 // ---------------------------------------------------------------------------
 // etcd
 // ---------------------------------------------------------------------------
@@ -1385,16 +1402,16 @@ export async function elasticsearchListIndices(connectionId: string): Promise<st
   return mongoListCollections(connectionId, "default");
 }
 
-export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, sort?: string): Promise<MongoDocumentResult> {
-  return post("/api/mongo/find-documents", { connectionId, database, collection, skip, limit, filter, sort });
+export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
+  return post("/api/mongo/find-documents", { connectionId, database, collection, skip, limit, filter, sort, executionId });
 }
 
-export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, sort?: string): Promise<MongoDocumentResult> {
-  return post("/api/document-store/find-documents", { connectionId, database, collection, skip, limit, filter, sort });
+export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
+  return post("/api/document-store/find-documents", { connectionId, database, collection, skip, limit, filter, sort, executionId });
 }
 
-export async function mongoAggregateDocuments(connectionId: string, database: string, collection: string, pipelineJson: string, maxRows?: number): Promise<MongoDocumentResult> {
-  return post("/api/mongo/aggregate-documents", { connectionId, database, collection, pipelineJson, maxRows });
+export async function mongoAggregateDocuments(connectionId: string, database: string, collection: string, pipelineJson: string, maxRows?: number, executionId?: string): Promise<MongoDocumentResult> {
+  return post("/api/mongo/aggregate-documents", { connectionId, database, collection, pipelineJson, maxRows, executionId });
 }
 
 export async function mongoInsertDocument(connectionId: string, database: string, collection: string, docJson: string): Promise<string> {
@@ -1473,6 +1490,10 @@ export async function checkMcpServerStatus(): Promise<import("./tauri").McpServe
   };
 }
 
+export async function installMcpServer(): Promise<string> {
+  throw new Error("MCP Server installation is only available in the desktop app.");
+}
+
 export async function getSystemProxyUrl(): Promise<string | null> {
   return null;
 }
@@ -1495,5 +1516,7 @@ export async function loadSidebarLayout(): Promise<SidebarLayout | null> {
 }
 
 export async function refreshConnections(): Promise<void> {
-  // Web mode doesn't maintain persistent connection pools 鈥?no-op
+  // Web mode doesn't maintain persistent connection pools - no-op
 }
+
+export * from "./mq-http";

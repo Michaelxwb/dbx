@@ -68,6 +68,13 @@ pub struct RedisCommandResult {
     pub value: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubSubMessage {
+    pub channel: String,
+    pub pattern: Option<String>,
+    pub payload: String,
+}
+
 pub enum RedisConnection {
     Direct(Mutex<redis::aio::MultiplexedConnection>),
     Cluster(RedisClusterPool),
@@ -454,6 +461,54 @@ pub async fn connect_direct_node(
         redis::Client::open(connection_info(&endpoint.host, endpoint.port, tls, insecure, username, password, 0))
             .map_err(|e| format!("Redis connection failed: {e}"))?;
     connect_client(client).await
+}
+
+pub async fn connect_pubsub(
+    config: &ConnectionConfig,
+    host: &str,
+    port: u16,
+    timeout: std::time::Duration,
+) -> Result<redis::aio::PubSub, String> {
+    let mut last_error = None;
+    for auth in redis_auth_candidates(&config.username, &config.password) {
+        let client = redis::Client::open(connection_info(
+            host,
+            port,
+            config.ssl,
+            config.redis_tls_insecure(),
+            &auth.username,
+            &auth.password,
+            redis_database_index(config),
+        ))
+        .map_err(|e| format!("Redis connection failed: {e}"))?;
+        match tokio::time::timeout(timeout, client.get_async_pubsub()).await {
+            Ok(Ok(pubsub)) => return Ok(pubsub),
+            Ok(Err(err)) => {
+                let err_str = err.to_string();
+                if last_error.is_none() || is_redis_auth_error(&err_str) {
+                    let should_retry = is_redis_auth_error(&err_str);
+                    last_error = Some(err_str);
+                    if !should_retry {
+                        break;
+                    }
+                } else {
+                    return Err(err_str);
+                }
+            }
+            Err(_) => {
+                last_error = Some(format!("Redis PubSub connection timed out ({}s)", timeout.as_secs()));
+                break;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "Redis PubSub connection failed".to_string()))
+}
+
+pub async fn publish_message<C>(con: &mut C, channel: &str, message: &str) -> Result<u64, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    redis::cmd("PUBLISH").arg(channel).arg(message).query_async(con).await.map_err(|e| e.to_string())
 }
 
 pub async fn list_databases<C>(con: &mut C) -> Result<Vec<RedisDatabaseInfo>, String>
@@ -861,10 +916,19 @@ pub fn redis_command_raw_to_json(value: RedisRawValue) -> serde_json::Value {
             "kind": format!("{kind:?}"),
             "data": redis_command_raw_to_json(RedisRawValue::Array(data)),
         }),
-        RedisRawValue::BulkString(bytes) => serde_json::Value::String(redis_bytes_to_display(&bytes)),
+        RedisRawValue::BulkString(bytes) => {
+            let text = redis_bytes_to_display(&bytes);
+            let trimmed = text.trim();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    return super::json_value_for_js(json);
+                }
+            }
+            serde_json::Value::String(text)
+        }
         RedisRawValue::SimpleString(value) => serde_json::Value::String(value),
         RedisRawValue::Okay => serde_json::Value::String("OK".to_string()),
-        RedisRawValue::Int(value) => serde_json::Value::Number(value.into()),
+        RedisRawValue::Int(value) => super::safe_i64_to_json(value),
         RedisRawValue::Double(value) => {
             serde_json::Number::from_f64(value).map_or(serde_json::Value::Null, serde_json::Value::Number)
         }
@@ -884,10 +948,10 @@ pub fn is_redis_json_type(key_type: &str) -> bool {
 pub fn redis_json_raw_to_json(value: RedisRawValue) -> Result<serde_json::Value, String> {
     match redis_raw_to_json(value) {
         serde_json::Value::Null => Ok(serde_json::Value::Null),
-        serde_json::Value::String(text) => {
-            serde_json::from_str(&text).map_err(|e| format!("Invalid RedisJSON value: {e}"))
-        }
-        other => Ok(other),
+        serde_json::Value::String(text) => serde_json::from_str(&text)
+            .map(super::json_value_for_js)
+            .map_err(|e| format!("Invalid RedisJSON value: {e}")),
+        other => Ok(super::json_value_for_js(other)),
     }
 }
 
@@ -917,6 +981,15 @@ where
     redis::cmd("FLUSHDB").query_async::<()>(con).await.map_err(|e| e.to_string())
 }
 
+/// Extract a string reference from a `RedisRawValue` if it is a BulkString or SimpleString.
+fn redis_raw_value_as_str(v: &RedisRawValue) -> Option<&str> {
+    match v {
+        RedisRawValue::BulkString(bytes) => std::str::from_utf8(bytes).ok(),
+        RedisRawValue::SimpleString(s) => Some(s.as_str()),
+        _ => None,
+    }
+}
+
 pub async fn execute_command<C>(
     con: &mut C,
     command_text: &str,
@@ -938,6 +1011,36 @@ where
     }
     let raw: RedisRawValue = cmd.query_async(con).await.map_err(|e| e.to_string())?;
 
+    // Special handling for INFO command in cluster mode.
+    // redis-rs ClusterConnection routes INFO to all primaries and
+    // aggregates the results as a Map(node_addr → full_info_text).
+
+    // We detect this pattern and return it as an array of
+    // [node_addr, info_text] pairs, which the frontend renders
+    // as a two-column (index → node_addr, value → info_text) table.
+    if command == "INFO" {
+        if let RedisRawValue::Map(entries) = &raw {
+            // Cluster-aggregated INFO has multi-line values starting with "# "
+            // (e.g. "# Server", "# Memory", "# Clients").
+            // This distinguishes it from a RESP3 standalone INFO map where values
+            // are single field values (e.g. "redis_version", "os") or nested maps.
+            let is_cluster_aggregation =
+                entries.iter().any(|(_, v)| redis_raw_value_as_str(v).is_some_and(|s| s.starts_with("# ")));
+
+            if is_cluster_aggregation {
+                let pairs: Vec<serde_json::Value> = entries
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        let addr = redis_raw_value_as_str(key)?;
+                        let info = redis_raw_value_as_str(value)?;
+                        Some(serde_json::json!([addr, info]))
+                    })
+                    .collect();
+                return Ok(RedisCommandResult { command, safety, value: serde_json::Value::Array(pairs) });
+            }
+        }
+    }
+
     Ok(RedisCommandResult { command, safety, value: redis_command_raw_to_json(raw) })
 }
 
@@ -945,41 +1048,72 @@ pub async fn scan_keys_page<C>(con: &mut C, cursor: u64, pattern: &str, count: u
 where
     C: ConnectionLike + Send + Sync + Unpin,
 {
-    let raw: RedisRawValue = redis::cmd("SCAN")
-        .arg(cursor)
-        .arg("MATCH")
-        .arg(pattern)
-        .arg("COUNT")
-        .arg(count)
-        .query_async(con)
-        .await
-        .map_err(|e| e.to_string())?;
+    scan_keys_batch(con, cursor, pattern, count, 1).await
+}
 
-    let (next_cursor, keys) = parse_scan_keys(raw)?;
-    let total_keys: u64 = redis::cmd("DBSIZE").query_async(con).await.unwrap_or(0);
-    if keys.is_empty() {
-        return Ok(RedisScanResult { cursor: next_cursor, keys: Vec::new(), total_keys });
+/// Batch-scan keys with server-side multi-SCAN support.
+///
+/// Performs up to `max_iterations` SCAN→TYPE cycles in a single call,
+/// dramatically reducing frontend↔backend roundtrips when fetching many keys.
+/// DBSIZE is only called on the first iteration (cursor == 0).
+pub async fn scan_keys_batch<C>(
+    con: &mut C,
+    cursor: u64,
+    pattern: &str,
+    count: usize,
+    max_iterations: usize,
+) -> Result<RedisScanResult, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let iterations = max_iterations.max(1);
+    let total_keys: u64 = if cursor == 0 { redis::cmd("DBSIZE").query_async(con).await.unwrap_or(0) } else { 0 };
+
+    let mut all_keys: Vec<RedisKeyInfo> = Vec::new();
+    let mut current_cursor = cursor;
+
+    for _ in 0..iterations {
+        let raw: RedisRawValue = redis::cmd("SCAN")
+            .arg(current_cursor)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(count)
+            .query_async(con)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let (next_cursor, keys) = parse_scan_keys(raw)?;
+
+        if !keys.is_empty() {
+            let mut pipe = redis::pipe();
+            for key in &keys {
+                pipe.cmd("TYPE").arg(key);
+            }
+            let key_types: Vec<String> = pipe.query_async(con).await.unwrap_or_default();
+
+            for (index, key) in keys.iter().enumerate() {
+                let key_type = key_types.get(index).cloned().unwrap_or_else(|| "unknown".to_string());
+                all_keys.push(RedisKeyInfo {
+                    key_display: redis_key_bytes_to_display(key),
+                    key_raw: redis_key_bytes_to_raw(key),
+                    key_type,
+                    ttl: -2,
+                    size: 0,
+                    value_preview: redis_key_value_preview(
+                        key_types.get(index).map(String::as_str).unwrap_or("unknown"),
+                    ),
+                });
+            }
+        }
+
+        if next_cursor == 0 {
+            return Ok(RedisScanResult { cursor: 0, keys: all_keys, total_keys });
+        }
+        current_cursor = next_cursor;
     }
 
-    let mut pipe = redis::pipe();
-    for key in &keys {
-        pipe.cmd("TYPE").arg(key);
-    }
-    let key_types: Vec<String> = pipe.query_async(con).await.unwrap_or_default();
-
-    let mut result = Vec::with_capacity(keys.len());
-    for (index, key) in keys.iter().enumerate() {
-        let key_type = key_types.get(index).cloned().unwrap_or_else(|| "unknown".to_string());
-        result.push(RedisKeyInfo {
-            key_display: redis_key_bytes_to_display(key),
-            key_raw: redis_key_bytes_to_raw(key),
-            key_type,
-            ttl: -2,
-            size: 0,
-            value_preview: redis_key_value_preview(key_types.get(index).map(String::as_str).unwrap_or("unknown")),
-        });
-    }
-    Ok(RedisScanResult { cursor: next_cursor, keys: result, total_keys })
+    Ok(RedisScanResult { cursor: current_cursor, keys: all_keys, total_keys })
 }
 
 pub async fn scan_values_page<C>(
@@ -993,7 +1127,8 @@ pub async fn scan_values_page<C>(
 where
     C: ConnectionLike + Send + Sync + Unpin,
 {
-    let total_keys: u64 = redis::cmd("DBSIZE").query_async(con).await.unwrap_or(0);
+    // Only call DBSIZE on the first page (cursor == 0) to avoid redundant work.
+    let total_keys: u64 = if cursor == 0 { redis::cmd("DBSIZE").query_async(con).await.unwrap_or(0) } else { 0 };
     if query.trim().is_empty() {
         return Ok(RedisScanResult { cursor, keys: Vec::new(), total_keys });
     }
@@ -1907,6 +2042,32 @@ mod tests {
     }
 
     #[test]
+    fn converts_command_unsafe_int64_to_string_for_js() {
+        let raw = RedisRawValue::Int(2_326_645_729_978_441_729);
+
+        assert_eq!(redis_command_raw_to_json(raw), serde_json::json!("2326645729978441729"));
+    }
+
+    #[test]
+    fn converts_bulkstring_json_with_unsafe_int64_for_js() {
+        let raw = RedisRawValue::BulkString(br#"{"uid":2321205972557213697,"name":"test"}"#.to_vec());
+
+        assert_eq!(redis_command_raw_to_json(raw), serde_json::json!({"uid": "2321205972557213697", "name": "test"}));
+    }
+
+    #[test]
+    fn keeps_plain_bulkstring_as_is() {
+        let raw = RedisRawValue::BulkString(b"hello world".to_vec());
+        assert_eq!(redis_command_raw_to_json(raw), serde_json::json!("hello world"));
+    }
+
+    #[test]
+    fn keeps_string_like_number_as_string() {
+        let raw = RedisRawValue::BulkString(b"42".to_vec());
+        assert_eq!(redis_command_raw_to_json(raw), serde_json::json!("42"));
+    }
+
+    #[test]
     fn recognizes_redis_json_module_key_types() {
         assert!(is_redis_json_type("ReJSON-RL"));
         assert!(is_redis_json_type("json"));
@@ -1974,6 +2135,7 @@ mod tests {
             connect_timeout_secs: crate::models::connection::default_connect_timeout_secs(),
             query_timeout_secs: crate::models::connection::default_query_timeout_secs(),
             idle_timeout_secs: crate::models::connection::default_idle_timeout_secs(),
+            keepalive_interval_secs: crate::models::connection::default_keepalive_interval_secs(),
             ssl: false,
             ca_cert_path: String::new(),
             client_cert_path: String::new(),
@@ -1990,6 +2152,7 @@ mod tests {
             redis_cluster_nodes: String::new(),
             redis_key_separator: crate::models::connection::default_redis_key_separator(),
             etcd_endpoints: String::new(),
+            gbase_server: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
@@ -2052,6 +2215,19 @@ mod tests {
                 "id": 1,
                 "embedding": [0.1, 0.2],
                 "meta": { "source": "test" }
+            })
+        );
+    }
+
+    #[test]
+    fn parses_redis_json_unsafe_int64_as_string_for_js() {
+        let raw = bulk(r#"{"id":2326645729978441729,"nested":[1,2326645729978441728]}"#);
+
+        assert_eq!(
+            redis_json_raw_to_json(raw).unwrap(),
+            serde_json::json!({
+                "id": "2326645729978441729",
+                "nested": [1, "2326645729978441728"]
             })
         );
     }

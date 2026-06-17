@@ -13,6 +13,7 @@ export type DatabaseType =
   | "elasticsearch"
   | "doris"
   | "starrocks"
+  | "manticoresearch"
   | "databend"
   | "redshift"
   | "dameng"
@@ -31,6 +32,7 @@ export type DatabaseType =
   | "exasol"
   | "opengauss"
   | "oceanbase-oracle"
+  | "questdb"
   | "gbase"
   | "access"
   | "h2"
@@ -50,7 +52,8 @@ export type DatabaseType =
   | "etcd"
   | "iris"
   | "influxdb"
-  | "jdbc";
+  | "jdbc"
+  | "mq";
 
 export interface SqlSnippet {
   id: string;
@@ -78,6 +81,7 @@ export interface ConnectionConfig {
   connect_timeout_secs?: number;
   query_timeout_secs?: number;
   idle_timeout_secs?: number;
+  keepalive_interval_secs?: number;
   ssl?: boolean;
   ca_cert_path?: string;
   client_cert_path?: string;
@@ -96,6 +100,8 @@ export interface ConnectionConfig {
   redis_cluster_nodes?: string;
   redis_key_separator?: string;
   etcd_endpoints?: string;
+  gbase_server?: string;
+  external_config?: unknown;
   one_time?: boolean;
   read_only?: boolean;
 }
@@ -207,7 +213,7 @@ export interface TableInfo {
   parent_name?: string | null;
 }
 
-export type DatabaseObjectType = "TABLE" | "VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
+export type DatabaseObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
 
 export interface ObjectInfo {
   name: string;
@@ -220,7 +226,7 @@ export interface ObjectInfo {
   parent_name?: string | null;
 }
 
-export type ObjectSourceKind = "VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
+export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "SEQUENCE" | "PACKAGE" | "PACKAGE_BODY";
 
 export interface ObjectSource {
   name: string;
@@ -322,6 +328,38 @@ export interface QueryResult {
   has_more?: boolean;
 }
 
+export interface QueryResultRun {
+  id: string;
+  title: string;
+  sequence: number;
+  sql: string;
+  createdAt: number;
+  result?: QueryResult;
+  results?: QueryResult[];
+  activeResultIndex?: number;
+  resultBaseSql?: string;
+  resultSortedSql?: string;
+  resultSortColumn?: string;
+  resultSortColumnIndex?: number;
+  resultSortDirection?: "asc" | "desc";
+  orderByInput?: string;
+  resultPageSql?: string;
+  resultPageLimit?: number;
+  resultPageOffset?: number;
+  resultCountSql?: string;
+  resultTotalRowCount?: number;
+  resultTotalRowCountLoading?: boolean;
+  resultSessionId?: string;
+  resultAccessedAt?: number;
+  resultCacheKey?: string;
+  resultCacheState?: "memory" | "disk" | "missing";
+  resultEvicted?: boolean;
+  queryAnalysis?: QueryTab["queryAnalysis"];
+  querySourceColumns?: QueryTab["querySourceColumns"];
+  queryEditabilityReason?: QueryTab["queryEditabilityReason"];
+  tableMeta?: QueryTab["tableMeta"];
+}
+
 export interface SqlTextSpan {
   start_line: number;
   start_column: number;
@@ -354,6 +392,7 @@ export type TreeNodeType =
   | "schema"
   | "table"
   | "view"
+  | "materialized_view"
   | "procedure"
   | "function"
   | "sequence"
@@ -365,6 +404,7 @@ export type TreeNodeType =
   | "group-triggers"
   | "group-tables"
   | "group-views"
+  | "group-materialized-views"
   | "group-procedures"
   | "group-functions"
   | "group-sequences"
@@ -381,6 +421,7 @@ export type TreeNodeType =
   | "fkey"
   | "trigger"
   | "redis-db"
+  | "mq-tenant"
   | "etcd-root"
   | "mongo-db"
   | "mongo-collection"
@@ -409,6 +450,7 @@ export interface TreeNode {
   pinned?: boolean;
   connectionId?: string;
   database?: string;
+  mqTenant?: string;
   schema?: string;
   tableName?: string;
   comment?: string | null;
@@ -425,6 +467,8 @@ export interface TreeNode {
     pageSize: number;
   };
 }
+
+export type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
 
 export interface QueryTab {
   id: string;
@@ -457,6 +501,8 @@ export interface QueryTab {
   result?: QueryResult;
   results?: QueryResult[];
   activeResultIndex?: number;
+  resultRuns?: QueryResultRun[];
+  activeResultRunId?: string;
   explainPlan?: import("@/lib/explainPlan").ParsedExplainPlan;
   explainError?: string;
   explainSql?: string;
@@ -475,7 +521,8 @@ export interface QueryTab {
   executionId?: string;
   isExplaining?: boolean;
   explainExecutionId?: string;
-  mode: "data" | "query" | "redis" | "mongo" | "etcd" | "objects" | "structure" | "users";
+  mode: "data" | "query" | "redis" | "mongo" | "etcd" | "mq" | "objects" | "structure" | "users";
+  mqTenant?: string;
   structureTableName?: string;
   objectBrowser?: {
     schema?: string;
@@ -493,6 +540,7 @@ export interface QueryTab {
     columns: ColumnInfo[];
     primaryKeys: string[];
   };
+  tableInfoTab?: TableInfoTab;
   queryAnalysis?: {
     schema?: string;
     schemaQuoted?: boolean;

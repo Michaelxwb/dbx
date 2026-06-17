@@ -9,9 +9,12 @@ pub mod history;
 pub mod jdbc;
 pub mod layout;
 pub mod mongo;
+#[cfg(feature = "mq-admin")]
+pub mod mq;
 pub mod plugins;
 pub mod query;
 pub mod redis;
+pub mod redis_pubsub_ws;
 pub mod saved_sql;
 pub mod schema;
 pub mod schema_cache;

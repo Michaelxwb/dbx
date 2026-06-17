@@ -23,7 +23,7 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
     let where_clause = if predicate.is_empty() { String::new() } else { format!(" WHERE ({predicate})") };
     let row_id_alias =
         if options.include_row_id && database_type == Some(DatabaseType::Oracle) { Some("t") } else { None };
-    let default_order_alias = if database_type == Some(DatabaseType::Jdbc) { Some("dbx_t") } else { row_id_alias };
+    let default_order_alias = if database_type == Some(DatabaseType::Jdbc) { None } else { row_id_alias };
     let default_order_by = if database_type == Some(DatabaseType::InfluxDb) {
         // InfluxQL only allows sorting of timestamp column
         Some("time DESC".to_string())
@@ -58,14 +58,17 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
     };
     let table_alias = if options.include_row_id && database_type.is_some_and(uses_fetch_first) {
         format!("{table} t")
-    } else if database_type == Some(DatabaseType::Jdbc) && default_order_by.is_some() {
-        format!("{table} dbx_t")
     } else {
         table
     };
 
     if database_type == Some(DatabaseType::Iris) {
         return format!("SELECT TOP {limit} {select_columns} FROM {table_alias}{where_clause}{order}");
+    }
+
+    if database_type == Some(DatabaseType::Informix) {
+        let row_limit = informix_row_limit_clause(limit, options.offset.unwrap_or(0));
+        return format!("SELECT {row_limit} {select_columns} FROM {table_alias}{where_clause}{order}");
     }
 
     if database_type == Some(DatabaseType::Db2) && options.offset.is_some_and(|offset| offset > 0) {
@@ -105,8 +108,24 @@ pub fn build_table_data_select_sql(options: TableDataSelectSqlOptions) -> String
         );
     }
 
+    if database_type == Some(DatabaseType::Questdb) {
+        return build_questdb_table_select_sql(
+            &table_alias,
+            &where_clause,
+            &order,
+            &options.columns,
+            limit,
+            options.offset.unwrap_or(0),
+        );
+    }
+
     let offset =
         options.offset.filter(|offset| *offset > 0).map(|offset| format!(" OFFSET {offset}")).unwrap_or_default();
+    // JDBC connections rely on Statement.setMaxRows() for row limiting instead of
+    // SQL-level LIMIT, which is not universally supported across all JDBC drivers.
+    if database_type == Some(DatabaseType::Jdbc) {
+        return format!("SELECT {select_columns} FROM {table_alias}{where_clause}{order};");
+    }
     format!("SELECT {select_columns} FROM {table_alias}{where_clause}{order} LIMIT {limit}{offset};")
 }
 
@@ -142,6 +161,10 @@ pub fn build_table_select_sql(options: TableSelectSqlOptions<'_>) -> String {
         return format!("SELECT TOP {limit} {select_columns} FROM {table}{order_by}");
     }
 
+    if database_type == Some(DatabaseType::Informix) {
+        return format!("SELECT FIRST {limit} {select_columns} FROM {table}{order_by}");
+    }
+
     if database_type.is_some_and(uses_fetch_first) {
         return format!("SELECT {select_columns} FROM {table}{order_by} FETCH FIRST {limit} ROWS ONLY");
     }
@@ -150,7 +173,20 @@ pub fn build_table_select_sql(options: TableSelectSqlOptions<'_>) -> String {
         return format!("SELECT TOP ({limit}) {select_columns} FROM {table}{order_by}");
     }
 
+    // JDBC connections rely on Statement.setMaxRows() for row limiting.
+    if database_type == Some(DatabaseType::Jdbc) {
+        return format!("SELECT {select_columns} FROM {table}{order_by};");
+    }
+
     format!("SELECT {select_columns} FROM {table}{order_by} LIMIT {limit};")
+}
+
+fn informix_row_limit_clause(limit: usize, offset: usize) -> String {
+    if offset > 0 {
+        format!("SKIP {offset} FIRST {limit}")
+    } else {
+        format!("FIRST {limit}")
+    }
 }
 
 pub(super) fn is_oracle_row_id(database_type: Option<DatabaseType>, name: &str) -> bool {
@@ -314,4 +350,28 @@ pub(super) fn build_neo4j_table_select_sql(options: &TableDataSelectSqlOptions, 
     let order = order_by.map(|order_by| format!(" ORDER BY {order_by}")).unwrap_or_default();
     let skip = options.offset.filter(|offset| *offset > 0).map(|offset| format!(" SKIP {offset}")).unwrap_or_default();
     format!("MATCH (n:{label}){where_clause} RETURN {returns}{order}{skip} LIMIT {limit};")
+}
+
+pub(super) fn build_questdb_table_select_sql(
+    table: &str,
+    where_clause: &str,
+    order_by: &str,
+    columns: &[String],
+    limit: usize,
+    offset: usize,
+) -> String {
+    let columns_sql = if columns.is_empty() {
+        "*".to_string()
+    } else {
+        columns
+            .iter()
+            .map(|column| quote_table_identifier(Some(DatabaseType::Questdb), column))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if offset == 0 {
+        return format!("SELECT {columns_sql} FROM {table}{where_clause}{order_by} LIMIT {limit}");
+    }
+    let upper_bound = offset + limit;
+    format!("SELECT {columns_sql} FROM {table}{where_clause}{order_by} LIMIT {offset}, {upper_bound}")
 }

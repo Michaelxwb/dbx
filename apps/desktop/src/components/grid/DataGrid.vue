@@ -62,6 +62,7 @@ import {
   TableProperties,
 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
+import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
@@ -77,7 +78,7 @@ import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ImagePreviewDialog from "@/components/grid/ImagePreviewDialog.vue";
 import TemporalCellEditor from "@/components/grid/TemporalCellEditor.vue";
 import EnumCellEditor from "@/components/grid/EnumCellEditor.vue";
-import type { QueryResult, ColumnInfo, DatabaseType, ForeignKeyInfo, IndexInfo, TriggerInfo } from "@/types/database";
+import type { QueryResult, ColumnInfo, DatabaseType, ForeignKeyInfo, IndexInfo, TriggerInfo, TableInfoTab } from "@/types/database";
 import * as api from "@/lib/api";
 import { coerceDataGridCellValue, dataGridCellDisplayText, dataGridCellEditorText } from "@/lib/dataGridCellCoercion";
 import { createColumnDrafts } from "@/lib/tableStructureEditorState";
@@ -115,6 +116,7 @@ import { dataGridHeaderContentWidth, scrollbarGutterWidth } from "@/lib/dataGrid
 import { canGoNextDataGridPage } from "@/lib/dataGridPagination";
 import { CANVAS_DATA_GRID_ROW_HEIGHT, drawCanvasDataGrid } from "@/lib/canvasDataGridRenderer";
 import { dataGridSaveActionMode, dataGridSaveToolbarState } from "@/lib/dataGridSaveUi";
+import { EDITOR_FONT_FAMILY_CSS_VAR } from "@/lib/editorThemes";
 import { appendColumnValueFilterCondition, buildColumnValueFilterCondition, combineWhereInputs, filterModeNeedsValue, parseFilterValue } from "@/lib/dataGridColumnFilter";
 import { clampSearchSplitWidth } from "@/lib/dataGridSearchSplit";
 import { MAX_RESULT_PAGE_SIZE, MIN_RESULT_PAGE_SIZE, normalizeResultPageSize, resultPageSizeMenuOptions } from "@/lib/paginationPageSize";
@@ -134,6 +136,7 @@ import { useTheme } from "@/composables/useTheme";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { nextDataGridSortState, type DataGridSortDirection } from "@/lib/dataGridSort";
 import { getTableMetadataCapabilities } from "@/lib/tableMetadataCapabilities";
+import { forgetDataGridConditionHistory, loadDataGridConditionHistory, rememberDataGridConditionHistory } from "@/lib/dataGridConditionHistory";
 
 const SqlPreviewPanel = defineAsyncComponent(() => import("@/components/editor/SqlPreviewPanel.vue"));
 
@@ -150,6 +153,11 @@ interface PreparedCopyValue {
   loading: boolean;
   ready: boolean;
 }
+
+type ConditionSuggestion = {
+  value: string;
+  kind: "column" | "history";
+};
 
 const props = defineProps<{
   result: QueryResult;
@@ -172,6 +180,7 @@ const props = defineProps<{
     columns: ColumnInfo[];
     primaryKeys: string[];
   };
+  tableInfoTab?: TableInfoTab;
   pageOffset?: number;
   pageLimit?: number;
   countSql?: string;
@@ -275,6 +284,8 @@ const showColumnCommentsInHeader = computed(() => settingsStore.editorSettings.s
 const showColumnTypesInHeader = computed(() => settingsStore.editorSettings.showColumnTypesInHeader);
 const compactColumnHeaderActions = computed(() => settingsStore.editorSettings.compactColumnHeaderActions);
 const dataGridRenderMode = computed(() => settingsStore.editorSettings.dataGridRenderMode);
+const infiniteScrollEnabled = computed(() => settingsStore.editorSettings.infiniteScroll);
+const infiniteScrollMaxRows = computed(() => settingsStore.editorSettings.infiniteScrollMaxRows);
 
 function headerColumnComment(column: string): string {
   if (!showColumnCommentsInHeader.value) return "";
@@ -378,14 +389,14 @@ const searchInputRef = ref<HTMLInputElement>();
 const measureRef = ref<HTMLSpanElement>();
 const suggestionLeft = ref(0);
 
-const whereSuggestions = ref<string[]>([]);
+const whereSuggestions = ref<ConditionSuggestion[]>([]);
 const whereSuggestionIndex = ref(-1);
 const whereFilterInputRef = ref<HTMLInputElement>();
 const whereMeasureRef = ref<HTMLSpanElement>();
 const whereSuggestionLeft = ref(0);
 const whereSuggestionPosition = ref({ left: 0, top: 0 });
 
-const orderBySuggestions = ref<string[]>([]);
+const orderBySuggestions = ref<ConditionSuggestion[]>([]);
 const orderBySuggestionIndex = ref(-1);
 const orderByInputRef = ref<HTMLInputElement>();
 const orderByMeasureRef = ref<HTMLSpanElement>();
@@ -396,6 +407,12 @@ const orderByInput = ref(props.initialOrderByInput ?? "");
 const hasOrderByInput = computed(() => orderByInput.value.trim().length > 0);
 const whereFilterInput = ref(props.initialWhereInput ?? "");
 const hasWhereFilterInput = computed(() => whereFilterInput.value.trim().length > 0);
+const conditionHistoryScope = computed(() => ({
+  connectionId: props.connectionId,
+  database: props.database,
+  schema: props.tableMeta?.schema ?? props.schema,
+  tableName: props.tableMeta?.tableName,
+}));
 const searchSplitContainerRef = ref<HTMLDivElement>();
 const searchSplitWhereWidth = ref<number | null>(null);
 const isResizingSearchSplit = ref(false);
@@ -1195,11 +1212,18 @@ function acceptWhereSuggestion() {
   const idx = whereSuggestionIndex.value;
   if (idx < 0 || idx >= whereSuggestions.value.length) return;
   const sug = whereSuggestions.value[idx];
+  if (sug.kind === "history") {
+    whereFilterInput.value = sug.value;
+    whereSuggestions.value = [];
+    whereSuggestionIndex.value = -1;
+    whereFilterInputRef.value?.focus();
+    return;
+  }
   const lastWordMatch = whereFilterInput.value.match(/([^\s,()><=!&|]+)$/);
   if (lastWordMatch) {
     const lastWord = lastWordMatch[1];
     const prefix = whereFilterInput.value.slice(0, -lastWord.length);
-    whereFilterInput.value = prefix + sug;
+    whereFilterInput.value = prefix + sug.value;
   }
   whereSuggestions.value = [];
   whereSuggestionIndex.value = -1;
@@ -1216,20 +1240,39 @@ function navigateWhereSuggestion(delta: number) {
   whereSuggestionIndex.value = Math.min(Math.max(whereSuggestionIndex.value + delta, 0), whereSuggestions.value.length - 1);
 }
 
+function showWhereHistorySuggestions() {
+  const history = loadDataGridConditionHistory("where", conditionHistoryScope.value, whereFilterInput.value);
+  whereSuggestions.value = history.map((value) => ({ value, kind: "history" }));
+  whereSuggestionIndex.value = whereSuggestions.value.length ? 0 : -1;
+  if (whereSuggestions.value.length) updateWhereSuggestionPosition();
+}
+
+function deleteWhereHistorySuggestion(value: string) {
+  const history = forgetDataGridConditionHistory("where", conditionHistoryScope.value, value);
+  const query = whereFilterInput.value;
+  const filtered = query.trim() ? loadDataGridConditionHistory("where", conditionHistoryScope.value, query) : history;
+  whereSuggestions.value = filtered.map((item) => ({ value: item, kind: "history" }));
+  whereSuggestionIndex.value = whereSuggestions.value.length ? Math.min(whereSuggestionIndex.value, whereSuggestions.value.length - 1) : -1;
+}
+
 watch(whereFilterInput, (val) => {
   emit("update:whereInput", currentWhereInput() ?? "");
   persistStructuredFilterState();
   whereSuggestions.value = [];
   if (!props.tableMeta?.columns?.length) return;
   const trimmed = val.trim();
-  if (trimmed.length === 0) return;
+  if (trimmed.length === 0) {
+    showWhereHistorySuggestions();
+    return;
+  }
   const lastToken = trimmed.split(/[\s,()><=!&|]+/).pop() || "";
   if (lastToken.length > 0) {
     const tl = lastToken.toLowerCase();
     whereSuggestions.value = props.tableMeta.columns
       .map((c) => c.name)
       .filter((n) => n.toLowerCase().startsWith(tl) && n.toLowerCase() !== tl)
-      .slice(0, 8);
+      .slice(0, 8)
+      .map((value) => ({ value, kind: "column" }));
     whereSuggestionIndex.value = 0;
     updateWhereSuggestionPosition();
   }
@@ -1317,11 +1360,18 @@ function acceptOrderBySuggestion() {
   const idx = orderBySuggestionIndex.value;
   if (idx < 0 || idx >= orderBySuggestions.value.length) return;
   const sug = orderBySuggestions.value[idx];
+  if (sug.kind === "history") {
+    orderByInput.value = sug.value;
+    orderBySuggestions.value = [];
+    orderBySuggestionIndex.value = -1;
+    orderByInputRef.value?.focus();
+    return;
+  }
   const lastWordMatch = orderByInput.value.match(/([^\s,()]+)$/);
   if (lastWordMatch) {
     const lastWord = lastWordMatch[1];
     const prefix = orderByInput.value.slice(0, -lastWord.length);
-    orderByInput.value = prefix + sug;
+    orderByInput.value = prefix + sug.value;
   }
   orderBySuggestions.value = [];
   orderBySuggestionIndex.value = -1;
@@ -1338,19 +1388,38 @@ function navigateOrderBySuggestion(delta: number) {
   orderBySuggestionIndex.value = Math.min(Math.max(orderBySuggestionIndex.value + delta, 0), orderBySuggestions.value.length - 1);
 }
 
+function showOrderByHistorySuggestions() {
+  const history = loadDataGridConditionHistory("orderBy", conditionHistoryScope.value, orderByInput.value);
+  orderBySuggestions.value = history.map((value) => ({ value, kind: "history" }));
+  orderBySuggestionIndex.value = orderBySuggestions.value.length ? 0 : -1;
+  if (orderBySuggestions.value.length) updateOrderBySuggestionPosition();
+}
+
+function deleteOrderByHistorySuggestion(value: string) {
+  const history = forgetDataGridConditionHistory("orderBy", conditionHistoryScope.value, value);
+  const query = orderByInput.value;
+  const filtered = query.trim() ? loadDataGridConditionHistory("orderBy", conditionHistoryScope.value, query) : history;
+  orderBySuggestions.value = filtered.map((item) => ({ value: item, kind: "history" }));
+  orderBySuggestionIndex.value = orderBySuggestions.value.length ? Math.min(orderBySuggestionIndex.value, orderBySuggestions.value.length - 1) : -1;
+}
+
 watch(orderByInput, (val) => {
   emit("update:orderByInput", val);
   orderBySuggestions.value = [];
   if (!props.tableMeta?.columns?.length) return;
   const trimmed = val.trim();
-  if (trimmed.length === 0) return;
+  if (trimmed.length === 0) {
+    showOrderByHistorySuggestions();
+    return;
+  }
   const lastToken = trimmed.split(/[\s,()]+/).pop() || "";
   if (lastToken.length > 0 && !["asc", "desc"].includes(lastToken.toLowerCase())) {
     const tl = lastToken.toLowerCase();
     orderBySuggestions.value = props.tableMeta.columns
       .map((c) => c.name)
       .filter((n) => n.toLowerCase().startsWith(tl) && n.toLowerCase() !== tl)
-      .slice(0, 8);
+      .slice(0, 8)
+      .map((value) => ({ value, kind: "column" }));
     orderBySuggestionIndex.value = 0;
     updateOrderBySuggestionPosition();
   }
@@ -1395,13 +1464,22 @@ const gridRef = ref<HTMLDivElement>();
 const headerRef = ref<HTMLDivElement>();
 const gridScrollbarGutter = ref(0);
 const gridHorizontalScrollbarTrackRef = ref<HTMLDivElement>();
+const gridVerticalScrollbarTrackRef = ref<HTMLDivElement>();
 const hasGridHorizontalOverflow = ref(false);
+const hasGridVerticalOverflow = ref(false);
 const gridHorizontalScrollbarThumbLeftPercent = ref(0);
 const gridHorizontalScrollbarThumbWidthPercent = ref(100);
+const gridVerticalScrollbarThumbTopPercent = ref(0);
+const gridVerticalScrollbarThumbHeightPercent = ref(100);
 const gridHorizontalScrollbarDragging = ref(false);
+const gridVerticalScrollbarDragging = ref(false);
 let gridHorizontalScrollbarFrame = 0;
 let gridHorizontalScrollbarResizeObserver: ResizeObserver | null = null;
 let gridHorizontalScrollbarDragState: {
+  trackRect: DOMRect;
+  thumbOffsetPx: number;
+} | null = null;
+let gridVerticalScrollbarDragState: {
   trackRect: DOMRect;
   thumbOffsetPx: number;
 } | null = null;
@@ -1545,6 +1623,7 @@ const gridStyle = computed(() => ({
   ...columnVars.value,
   "--header-total-w": dataGridHeaderContentWidth("var(--total-w)", gridScrollbarGutter.value),
   "--grid-scrollbar-gutter": `${gridScrollbarGutter.value}px`,
+  [EDITOR_FONT_FAMILY_CSS_VAR]: settingsStore.editorSettings.fontFamily,
 }));
 const gridHorizontalScrollLeft = ref(0);
 const gridViewportWidth = ref(0);
@@ -1562,6 +1641,7 @@ function updateGridHorizontalViewport(element: HTMLElement) {
   gridHorizontalScrollLeft.value = element.scrollLeft;
   gridViewportWidth.value = element.clientWidth;
   updateGridHorizontalScrollbar(element);
+  updateGridVerticalScrollbar(element);
 }
 
 function gridScrollerElement(): HTMLElement | null {
@@ -1586,11 +1666,30 @@ function updateGridHorizontalScrollbar(element: HTMLElement | null = gridScrolle
   gridHorizontalScrollbarThumbLeftPercent.value = maxScrollLeft > 0 ? (element.scrollLeft / maxScrollLeft) * thumbTravel : 0;
 }
 
+function updateGridVerticalScrollbar(element: HTMLElement | null = gridScrollerElement()) {
+  if (!element) {
+    hasGridVerticalOverflow.value = false;
+    gridVerticalScrollbarThumbTopPercent.value = 0;
+    gridVerticalScrollbarThumbHeightPercent.value = 100;
+    return;
+  }
+
+  const maxScrollTop = Math.max(0, element.scrollHeight - element.clientHeight);
+  hasGridVerticalOverflow.value = maxScrollTop > 1;
+
+  const rawThumbHeight = element.scrollHeight > 0 ? (element.clientHeight / element.scrollHeight) * 100 : 100;
+  const thumbHeight = Math.min(100, Math.max(6, rawThumbHeight));
+  const thumbTravel = Math.max(0, 100 - thumbHeight);
+  gridVerticalScrollbarThumbHeightPercent.value = thumbHeight;
+  gridVerticalScrollbarThumbTopPercent.value = maxScrollTop > 0 ? (element.scrollTop / maxScrollTop) * thumbTravel : 0;
+}
+
 function scheduleGridHorizontalScrollbarUpdate() {
   if (gridHorizontalScrollbarFrame) return;
   const update = () => {
     gridHorizontalScrollbarFrame = 0;
     updateGridHorizontalScrollbar();
+    updateGridVerticalScrollbar();
   };
   if (typeof requestAnimationFrame === "function") {
     gridHorizontalScrollbarFrame = requestAnimationFrame(update);
@@ -1648,6 +1747,16 @@ function stopGridHorizontalScrollbarDrag() {
   document.body.style.userSelect = "";
 }
 
+function stopGridVerticalScrollbarDrag() {
+  if (!gridVerticalScrollbarDragState) return;
+  gridVerticalScrollbarDragState = null;
+  gridVerticalScrollbarDragging.value = false;
+  window.removeEventListener("pointermove", onGridVerticalScrollbarPointerMove, true);
+  window.removeEventListener("pointerup", stopGridVerticalScrollbarDrag, true);
+  window.removeEventListener("pointercancel", stopGridVerticalScrollbarDrag, true);
+  document.body.style.userSelect = "";
+}
+
 function startGridHorizontalScrollbarDrag(event: PointerEvent) {
   const scroller = gridScrollerElement();
   const track = gridHorizontalScrollbarTrackRef.value;
@@ -1672,9 +1781,60 @@ function startGridHorizontalScrollbarDrag(event: PointerEvent) {
   applyGridHorizontalScrollbarDrag(event.clientX);
 }
 
+function applyGridVerticalScrollbarDrag(clientY: number) {
+  const scroller = gridScrollerElement();
+  const dragState = gridVerticalScrollbarDragState;
+  if (!scroller || !dragState) return;
+
+  const maxScrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+  if (maxScrollTop <= 1) return;
+
+  const thumbHeightPx = dragState.trackRect.height * (gridVerticalScrollbarThumbHeightPercent.value / 100);
+  const maxThumbTopPx = Math.max(1, dragState.trackRect.height - thumbHeightPx);
+  const thumbTopPx = Math.min(maxThumbTopPx, Math.max(0, clientY - dragState.trackRect.top - dragState.thumbOffsetPx));
+  scroller.scrollTop = (thumbTopPx / maxThumbTopPx) * maxScrollTop;
+  updateGridVerticalScrollbar(scroller);
+  if (useCanvasGridRows.value) syncCanvasViewport();
+}
+
+function onGridVerticalScrollbarPointerMove(event: PointerEvent) {
+  if (!gridVerticalScrollbarDragState) return;
+  event.preventDefault();
+  applyGridVerticalScrollbarDrag(event.clientY);
+}
+
+function startGridVerticalScrollbarDrag(event: PointerEvent) {
+  const scroller = gridScrollerElement();
+  const track = gridVerticalScrollbarTrackRef.value;
+  if (!scroller || !track || !hasGridVerticalOverflow.value) return;
+
+  const trackRect = track.getBoundingClientRect();
+  const thumbTopPx = trackRect.height * (gridVerticalScrollbarThumbTopPercent.value / 100);
+  const thumbHeightPx = trackRect.height * (gridVerticalScrollbarThumbHeightPercent.value / 100);
+  const pointerY = event.clientY - trackRect.top;
+  const pointerInsideThumb = pointerY >= thumbTopPx && pointerY <= thumbTopPx + thumbHeightPx;
+
+  gridVerticalScrollbarDragState = {
+    trackRect,
+    thumbOffsetPx: pointerInsideThumb ? pointerY - thumbTopPx : thumbHeightPx / 2,
+  };
+  gridVerticalScrollbarDragging.value = true;
+  document.body.style.userSelect = "none";
+  window.addEventListener("pointermove", onGridVerticalScrollbarPointerMove, true);
+  window.addEventListener("pointerup", stopGridVerticalScrollbarDrag, true);
+  window.addEventListener("pointercancel", stopGridVerticalScrollbarDrag, true);
+  event.preventDefault();
+  applyGridVerticalScrollbarDrag(event.clientY);
+}
+
 const gridHorizontalScrollbarThumbStyle = computed<CSSProperties>(() => ({
   width: `${gridHorizontalScrollbarThumbWidthPercent.value}%`,
   left: `${gridHorizontalScrollbarThumbLeftPercent.value}%`,
+}));
+
+const gridVerticalScrollbarThumbStyle = computed<CSSProperties>(() => ({
+  height: `${gridVerticalScrollbarThumbHeightPercent.value}%`,
+  top: `${gridVerticalScrollbarThumbTopPercent.value}%`,
 }));
 
 function updateGridScrollbarGutter(element: HTMLElement) {
@@ -1790,7 +1950,10 @@ function markGridScrolling() {
 function onScrollerScroll(e: Event) {
   syncHeaderScroll(e);
   const target = e.target;
-  recordScrollPosition(target instanceof HTMLElement ? { top: target.scrollTop, left: target.scrollLeft } : undefined);
+  if (target instanceof HTMLElement) {
+    recordScrollPosition({ top: target.scrollTop, left: target.scrollLeft });
+    checkInfiniteScroll(target);
+  }
   markGridScrolling();
 }
 
@@ -1838,6 +2001,11 @@ const pageSize = ref(normalizeResultPageSize(settingsStore.editorSettings.pageSi
 const currentPage = ref(1);
 const pageSizeOptions = computed(() => resultPageSizeMenuOptions(pageSize.value));
 const customPageSizeInput = ref(String(pageSize.value));
+const infiniteScrollLoading = ref(false);
+const isInfiniteScrollPaginating = ref(false);
+let lastInfiniteScrollPage = 0;
+let infiniteScrollCheckScheduled = false;
+let infiniteScrollAllLoaded = false;
 watch(pageSize, (value) => {
   customPageSizeInput.value = String(value);
 });
@@ -1848,14 +2016,41 @@ watch(
   },
 );
 watch(
+  () => infiniteScrollEnabled.value,
+  (enabled, prevEnabled) => {
+    // Switched between paginated and infinite scroll: reset to first page
+    if (enabled !== prevEnabled) {
+      resetInfiniteScrollState();
+      emit("paginate", 0, pageSize.value, currentWhereInput(), currentOrderBy());
+    }
+  },
+);
+watch(
   () => [props.pageOffset, props.pageLimit],
   ([offset, limit]) => {
     if (typeof offset !== "number" || typeof limit !== "number" || limit <= 0) return;
+    // Skip resetting pagination state during infinite scroll pagination
+    if (isInfiniteScrollPaginating.value) return;
     const normalizedLimit = normalizeResultPageSize(limit);
     pageSize.value = normalizedLimit;
     currentPage.value = Math.floor(offset / normalizedLimit) + 1;
   },
   { immediate: true },
+);
+// Clear infinite-scroll loading when the parent finishes loading new data
+watch(
+  () => props.loading,
+  (loading, prevLoading) => {
+    if (prevLoading && !loading && infiniteScrollLoading.value) {
+      infiniteScrollLoading.value = false;
+      isInfiniteScrollPaginating.value = false;
+      // Detect if the backend returned no new data for this page
+      const expectedRows = currentPage.value * pageSize.value;
+      if (props.result.rows.length < expectedRows) {
+        infiniteScrollAllLoaded = true;
+      }
+    }
+  },
 );
 const manualTotalRowCount = ref<number | undefined>(undefined);
 const manualTotalRowCountLoading = ref(false);
@@ -1949,6 +2144,8 @@ watch(
   () => [props.countSql ?? "", props.tableMeta?.schema ?? "", props.tableMeta?.tableName ?? "", currentWhereInput() ?? "", props.database ?? "", props.connectionId ?? "", props.result],
   () => {
     manualTotalRowCount.value = undefined;
+    // Reset infinite-scroll allLoaded when query context changes
+    infiniteScrollAllLoaded = false;
   },
 );
 
@@ -1978,6 +2175,7 @@ watch(
 function firstPage() {
   if (currentPage.value <= 1) return;
   currentPage.value = 1;
+  lastInfiniteScrollPage = 0;
   resetGridVerticalScroll(true);
   emit("paginate", 0, pageSize.value, currentWhereInput(), currentOrderBy());
 }
@@ -1993,11 +2191,50 @@ function nextPage() {
   resetGridVerticalScroll(true);
   emit("paginate", (currentPage.value - 1) * pageSize.value, pageSize.value, currentWhereInput(), currentOrderBy());
 }
+
+function infiniteScrollNextPage() {
+  if (infiniteScrollLoading.value || props.loading) return;
+  const nextPageNum = currentPage.value + 1;
+  const cumulativeLimit = nextPageNum * pageSize.value;
+  if (cumulativeLimit > infiniteScrollMaxRows.value) return;
+  // Stop if we already know all data is loaded
+  if (infiniteScrollAllLoaded) return;
+  // Skip if we already have this many rows loaded (e.g. cached data)
+  if (props.result.rows.length >= cumulativeLimit) {
+    currentPage.value = nextPageNum;
+    return;
+  }
+  infiniteScrollLoading.value = true;
+  isInfiniteScrollPaginating.value = true;
+  currentPage.value = nextPageNum;
+  // Load cumulative data (all rows up to current page) to append instead of replace
+  emit("paginate", 0, cumulativeLimit, currentWhereInput(), currentOrderBy());
+}
+function checkInfiniteScroll(scroller: HTMLElement) {
+  if (!infiniteScrollEnabled.value || infiniteScrollLoading.value || props.loading) return;
+  if (infiniteScrollAllLoaded) return;
+  if (infiniteScrollCheckScheduled) return;
+  infiniteScrollCheckScheduled = true;
+  requestAnimationFrame(() => {
+    infiniteScrollCheckScheduled = false;
+    const { scrollTop, scrollHeight, clientHeight } = scroller;
+    const threshold = 100;
+    const distanceToBottom = scrollHeight - scrollTop - clientHeight;
+    // Only trigger when near bottom AND page has changed since last trigger
+    if (distanceToBottom < threshold && currentPage.value !== lastInfiniteScrollPage) {
+      lastInfiniteScrollPage = currentPage.value;
+      infiniteScrollNextPage();
+    }
+  });
+}
+
 function changePageSize(size: number) {
   const normalizedSize = normalizeResultPageSize(size);
   pageSize.value = normalizedSize;
   settingsStore.updateEditorSettings({ pageSize: normalizedSize });
   currentPage.value = 1;
+  lastInfiniteScrollPage = 0;
+  infiniteScrollAllLoaded = false;
   resetGridVerticalScroll(true);
   emit("paginate", 0, normalizedSize, currentWhereInput(), currentOrderBy());
 }
@@ -2007,6 +2244,7 @@ function applyCustomPageSize() {
 }
 
 async function lastPage() {
+  if (infiniteScrollEnabled.value) return;
   if (hasKnownTotalRowCount.value) {
     const total = displayedTotalRowCount.value ?? 0;
     if (total <= 0) return;
@@ -2301,12 +2539,25 @@ function canDeleteRowItem(item: RowItem | undefined): boolean {
   return !!props.editable && !!item && !item.isDeleted && (item.isNew || canEditExistingRows.value);
 }
 
+function resetInfiniteScrollState() {
+  currentPage.value = 1;
+  lastInfiniteScrollPage = 0;
+  infiniteScrollAllLoaded = false;
+  isInfiniteScrollPaginating.value = false;
+  infiniteScrollLoading.value = false;
+  resetGridVerticalScroll(true);
+}
+
 async function onToolbarRefresh() {
   if (transactionActive.value) {
     discardChanges();
   }
+  // Reset infinite scroll state on refresh
+  if (infiniteScrollEnabled.value) {
+    resetInfiniteScrollState();
+  }
   preserveTransposeOnNextResult.value = showTranspose.value;
-  emit("reload", props.sql, searchText.value, currentWhereInput(), currentOrderBy(), pageSize.value, (currentPage.value - 1) * pageSize.value);
+  emit("reload", props.sql, searchText.value, currentWhereInput(), currentOrderBy(), pageSize.value, 0);
 }
 
 async function onToolbarCommit() {
@@ -2316,7 +2567,11 @@ async function onToolbarCommit() {
 function onToolbarRollback() {
   preserveTransposeOnNextResult.value = showTranspose.value;
   discardChanges();
-  emit("reload", props.sql, searchText.value, currentWhereInput(), currentOrderBy(), pageSize.value, (currentPage.value - 1) * pageSize.value);
+  // Reset infinite scroll state on rollback
+  if (infiniteScrollEnabled.value) {
+    resetInfiniteScrollState();
+  }
+  emit("reload", props.sql, searchText.value, currentWhereInput(), currentOrderBy(), pageSize.value, 0);
 }
 
 function addRow() {
@@ -3246,6 +3501,7 @@ async function applyOrderBySearch() {
   if (!props.onExecuteSql) return;
   const orderByClause = orderByInput.value.trim() || undefined;
   emit("update:orderByInput", orderByInput.value);
+  if (orderByClause) rememberDataGridConditionHistory("orderBy", conditionHistoryScope.value, orderByClause);
   isApplyingWhere.value = true;
   saveError.value = "";
   currentPage.value = 1;
@@ -3276,10 +3532,12 @@ async function applyOrderBySearch() {
 
 async function applyWhereFilter() {
   if (!props.onExecuteSql) return;
+  const whereInput = currentWhereInput();
+  if (whereInput) rememberDataGridConditionHistory("where", conditionHistoryScope.value, whereInput);
   isApplyingWhere.value = true;
   saveError.value = "";
   currentPage.value = 1;
-  emit("update:whereInput", currentWhereInput() ?? "");
+  emit("update:whereInput", whereInput ?? "");
   try {
     const tableMeta = await waitForTableMeta();
     if (!tableMeta) return;
@@ -3291,7 +3549,7 @@ async function applyWhereFilter() {
       primaryKeys: tableMeta.primaryKeys,
       orderBy: orderByInput.value.trim() || (sortCol.value ? `${queryColumnRef(sortCol.value)} ${sortDir.value.toUpperCase()}` : undefined),
       limit: pageSize.value,
-      whereInput: currentWhereInput(),
+      whereInput,
       includeRowId: usesSyntheticRowIdKey(props.databaseType, tableMeta.primaryKeys),
     });
     await props.onExecuteSql(sql);
@@ -3424,7 +3682,7 @@ const canvasSurfaceWidth = computed(() => {
   if (vw <= 0) return total;
   return Math.min(vw, total);
 });
-const canvasRenderStyleKey = computed(() => `${settingsStore.editorSettings.theme}:${settingsStore.editorSettings.uiScale}:${canvasBackingPixelRatio.value}:${isDark.value}`);
+const canvasRenderStyleKey = computed(() => `${settingsStore.editorSettings.theme}:${settingsStore.editorSettings.uiScale}:${canvasBackingPixelRatio.value}:${isDark.value}:${settingsStore.editorSettings.fontFamily}`);
 const CANVAS_MOUSE_WHEEL_SCROLL_MULTIPLIER = 1.5;
 const CANVAS_TRACKPAD_DELTA_THRESHOLD = 40;
 let canvasResizeObserver: ResizeObserver | null = null;
@@ -3582,12 +3840,14 @@ function onCanvasScroll(event: Event) {
   if (gridHorizontalScrollLeft.value !== scrollLeft || gridViewportWidth.value !== viewportWidth) {
     updateGridHorizontalViewport(scroller);
   }
+  updateGridVerticalScrollbar(scroller);
   const gutter = scrollbarGutterWidth(scroller);
   if (gridScrollbarGutter.value !== gutter) gridScrollbarGutter.value = gutter;
   if (headerRef.value && headerRef.value.scrollLeft !== scrollLeft) headerRef.value.scrollLeft = scrollLeft;
   recordScrollPosition({ top: scrollTop, left: scrollLeft });
   markGridScrolling();
   scheduleCanvasDraw();
+  checkInfiniteScroll(scroller);
 }
 
 function canvasWheelDeltaToPixels(delta: number, deltaMode: number, pageSize: number): number {
@@ -3763,12 +4023,6 @@ const canvasEditingCell = computed(() => {
   return { rowIndex, visibleColIdx, actualColIdx: editing.col, rect };
 });
 
-const canvasEditingCellIsNumeric = computed(() => {
-  const cell = canvasEditingCell.value;
-  if (!cell) return false;
-  return typeof displayItemAt(cell.rowIndex)?.data[cell.actualColIdx] === "number";
-});
-
 const canvasSingleSelectedCell = computed(() => {
   const range = selectedRange.value;
   if (!range || range.startRow !== range.endRow || range.startCol !== range.endCol) return null;
@@ -3933,6 +4187,7 @@ onUnmounted(() => {
   pauseCanvasGridWork();
   gridHorizontalScrollbarResizeObserver?.disconnect();
   stopGridHorizontalScrollbarDrag();
+  stopGridVerticalScrollbarDrag();
   if (gridHorizontalScrollbarFrame && typeof cancelAnimationFrame === "function") {
     cancelAnimationFrame(gridHorizontalScrollbarFrame);
   }
@@ -5202,7 +5457,6 @@ async function prefetchCopyStatements() {
 
 const sqlOneLiner = computed(() => props.sql?.replace(/\s+/g, " ").trim() || "");
 
-type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
 type TableInfoTabItem = { id: TableInfoTab; label: string; icon: Component; count?: number };
 
 const TABLE_INFO_DRAWER_MIN_WIDTH = 240;
@@ -5349,6 +5603,14 @@ async function selectTableInfoTab(tab: TableInfoTab) {
   else if (nextTab === "foreignKeys") await fetchForeignKeys();
   else if (nextTab === "triggers") await fetchTriggers();
 }
+
+watch(
+  () => [props.tableInfoTab, props.connectionId, props.database, props.tableMeta?.schema, props.tableMeta?.tableName] as const,
+  ([tab]) => {
+    if (tab) void selectTableInfoTab(tab);
+  },
+  { immediate: true },
+);
 
 async function fetchDdl() {
   if (!props.connectionId || !props.tableMeta) return;
@@ -5651,6 +5913,10 @@ defineExpose({
   canToggleAllNullColumns,
   toggleAllNullColumns,
   openCellDetailSearch,
+  exportCsv,
+  exportJson,
+  exportSql,
+  exportXlsx,
 });
 
 // ---- CustomContextMenu ----
@@ -6054,17 +6320,21 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                     class="flex-1 h-5 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60"
                     placeholder=""
                     @keydown="onWhereFilterKeydown"
+                    @focus="showWhereHistorySuggestions"
                     @click="updateWhereSuggestionPosition"
                     @blur="dismissWhereSuggestions"
                   />
+                  <button class="text-muted-foreground hover:text-foreground shrink-0" type="button" @mousedown.prevent="showWhereHistorySuggestions">
+                    <ChevronDown class="w-3 h-3" />
+                  </button>
                   <span ref="whereMeasureRef" class="invisible absolute left-0 top-0 text-xs whitespace-pre pointer-events-none" aria-hidden="true" />
                   <!-- WHERE suggestion dropdown -->
                   <Teleport to="body">
                     <div v-if="whereSuggestions.length > 0" class="fixed z-50 min-w-[180px] rounded-md border bg-popover text-popover-foreground shadow-md" :style="whereSuggestionStyle">
                       <div
                         v-for="(sug, idx) in whereSuggestions"
-                        :key="sug"
-                        class="flex items-center px-3 py-1.5 text-xs cursor-pointer"
+                        :key="`${sug.kind}:${sug.value}`"
+                        class="flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer"
                         :class="idx === whereSuggestionIndex ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/50'"
                         @mousedown.prevent="
                           whereSuggestionIndex = idx;
@@ -6073,7 +6343,10 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                         @mouseenter="whereSuggestionIndex = idx"
                       >
                         <Search class="w-3 h-3 mr-2 text-muted-foreground shrink-0" />
-                        <span>{{ sug }}</span>
+                        <span class="min-w-0 flex-1 truncate">{{ sug.value }}</span>
+                        <button v-if="sug.kind === 'history'" class="rounded p-0.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive" type="button" @mousedown.stop.prevent="deleteWhereHistorySuggestion(sug.value)">
+                          <X class="h-3 w-3" />
+                        </button>
                       </div>
                     </div>
                   </Teleport>
@@ -6108,17 +6381,21 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                     class="flex-1 h-5 min-w-0 text-xs bg-transparent outline-none placeholder:text-muted-foreground/60"
                     placeholder=""
                     @keydown="onOrderByKeydown"
+                    @focus="showOrderByHistorySuggestions"
                     @click="updateOrderBySuggestionPosition"
                     @blur="dismissOrderBySuggestions"
                   />
+                  <button class="text-muted-foreground hover:text-foreground shrink-0" type="button" @mousedown.prevent="showOrderByHistorySuggestions">
+                    <ChevronDown class="w-3 h-3" />
+                  </button>
                   <span ref="orderByMeasureRef" class="invisible absolute left-0 top-0 text-xs whitespace-pre pointer-events-none" aria-hidden="true" />
                   <!-- ORDER BY suggestion dropdown -->
                   <Teleport to="body">
                     <div v-if="orderBySuggestions.length > 0" class="fixed z-50 min-w-[180px] rounded-md border bg-popover text-popover-foreground shadow-md" :style="orderBySuggestionStyle">
                       <div
                         v-for="(sug, idx) in orderBySuggestions"
-                        :key="sug"
-                        class="flex items-center px-3 py-1.5 text-xs cursor-pointer"
+                        :key="`${sug.kind}:${sug.value}`"
+                        class="flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer"
                         :class="idx === orderBySuggestionIndex ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/50'"
                         @mousedown.prevent="
                           orderBySuggestionIndex = idx;
@@ -6127,7 +6404,10 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                         @mouseenter="orderBySuggestionIndex = idx"
                       >
                         <Search class="w-3 h-3 mr-2 text-muted-foreground shrink-0" />
-                        <span>{{ sug }}</span>
+                        <span class="min-w-0 flex-1 truncate">{{ sug.value }}</span>
+                        <button v-if="sug.kind === 'history'" class="rounded p-0.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive" type="button" @mousedown.stop.prevent="deleteOrderByHistorySuggestion(sug.value)">
+                          <X class="h-3 w-3" />
+                        </button>
                       </div>
                     </div>
                   </Teleport>
@@ -6720,11 +7000,11 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                 </div>
               </div>
 
-              <div v-else-if="useCanvasGridRows" ref="scrollerRef" class="data-grid-scroller canvas-grid-scroller flex-1 overflow-auto overscroll-none bg-background" :class="{ 'is-scrolling': isScrolling }" @scroll="onCanvasScroll" @wheel="onCanvasWheel">
+              <div v-else-if="useCanvasGridRows" ref="scrollerRef" class="data-grid-scroller canvas-grid-scroller flex-1 overflow-auto overscroll-none bg-background relative" :class="{ 'is-scrolling': isScrolling }" @scroll="onCanvasScroll" @wheel="onCanvasWheel">
                 <div class="relative" :style="{ width: `${totalWidth}px`, height: `${canvasContentHeight}px` }">
                   <canvas
                     ref="canvasRef"
-                    class="canvas-grid-surface sticky left-0 top-0 z-0 block text-xs font-sans font-normal"
+                    class="canvas-grid-surface dbx-data-grid-font-family sticky left-0 top-0 z-0 block text-[12.5px]/[1rem] font-normal"
                     :style="{ width: `${canvasSurfaceWidth}px`, height: `${canvasViewportHeight}px` }"
                     @mousemove="onCanvasMouseMove"
                     @mouseleave="onCanvasMouseLeave"
@@ -6732,8 +7012,8 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                     @contextmenu="onCanvasContext"
                     @dblclick="onCanvasDblClick"
                   />
-                  <div ref="canvasOverlayRef" class="canvas-grid-overlay sticky left-0 top-0 z-10 overflow-hidden" :style="canvasOverlayStyle">
-                    <div v-if="canvasEditingCell" class="absolute pointer-events-auto z-20" :class="{ 'tabular-nums': canvasEditingCellIsNumeric }" :style="canvasEditingCellStyle" @mousedown.stop @click.stop>
+                  <div ref="canvasOverlayRef" class="canvas-grid-overlay dbx-data-grid-font-family sticky left-0 top-0 z-10 overflow-hidden" :style="canvasOverlayStyle">
+                    <div v-if="canvasEditingCell" class="absolute pointer-events-auto z-20 tabular-nums" :style="canvasEditingCellStyle" @mousedown.stop @click.stop>
                       <TemporalCellEditor v-if="temporalEditorKindForColumn(canvasEditingCell.actualColIdx)" v-model="editValue" :kind="temporalEditorKindForColumn(canvasEditingCell.actualColIdx)!" @cancel="cancelEdit" @commit="commitGridEdit" />
                       <EnumCellEditor
                         v-else-if="isEnumGridColumn(canvasEditingCell.actualColIdx)"
@@ -6749,7 +7029,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                         autocapitalize="off"
                         autocorrect="off"
                         spellcheck="false"
-                        class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 text-xs leading-[22px] outline-none z-10"
+                        class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 text-[12.5px] leading-[22px] outline-none z-10"
                         @blur="commitEditFromBlur"
                         @click.stop
                         @keydown.stop="onEditKeydown"
@@ -6784,10 +7064,26 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                     </div>
                   </div>
                 </div>
+                <!-- Infinite scroll loading indicator for Canvas -->
+                <div v-if="infiniteScrollEnabled && infiniteScrollLoading" class="absolute bottom-0 left-0 right-0 flex items-center justify-center py-2 text-xs text-muted-foreground bg-background/80 backdrop-blur-sm z-10">
+                  <Loader2 class="w-3 h-3 animate-spin mr-1" />
+                  {{ t("grid.loadingMore") }}
+                </div>
               </div>
 
               <!-- Virtual scrolled rows -->
-              <RecycleScroller v-else-if="hasVisibleRows" ref="scrollerRef" class="data-grid-scroller flex-1 overflow-x-auto overscroll-none" :class="{ 'is-scrolling': isScrolling }" :items="displayItems" :item-size="26" :buffer="600" :skip-hover="true" key-field="id" @scroll="onScrollerScroll">
+              <RecycleScroller
+                v-else-if="hasVisibleRows"
+                ref="scrollerRef"
+                class="data-grid-scroller dbx-data-grid-font-family flex-1 overflow-x-auto overscroll-none text-[12.5px]"
+                :class="{ 'is-scrolling': isScrolling }"
+                :items="displayItems"
+                :item-size="26"
+                :buffer="600"
+                :skip-hover="true"
+                key-field="id"
+                @scroll="onScrollerScroll"
+              >
                 <template #default="{ item }">
                   <div
                     class="flex text-xs border-b border-border"
@@ -6819,7 +7115,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                     <div
                       v-for="col in renderedGridColumns"
                       :key="col.actualColIdx"
-                      class="group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none flex items-center"
+                      class="group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none flex items-center tabular-nums text-[12.5px]"
                       :style="renderedColumnStyle(col.visibleColIdx)"
                       :class="{
                         'text-muted-foreground italic': isNull(item.data[col.actualColIdx]),
@@ -6830,7 +7126,6 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                         'row-cell-selected-dirty': rowCellsUseSelectionVisual(item.id) && !cellIsSelected(item.displayIndex, col.visibleColIdx) && item.isDirtyCol[col.actualColIdx],
                         'bg-yellow-200/60 dark:bg-yellow-500/20': cellIsSearchMatch(item.displayIndex, col.actualColIdx),
                         'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': cellIsCurrentMatch(item.displayIndex, col.actualColIdx),
-                        'tabular-nums': typeof item.data[col.actualColIdx] === 'number',
                         'cursor-text hover:bg-accent/50': !isScrolling && canEditCellItem(item, col.actualColIdx),
                         'line-through': item.isDeleted,
                       }"
@@ -6850,7 +7145,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                           autocapitalize="off"
                           autocorrect="off"
                           spellcheck="false"
-                          class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 text-xs leading-[22px] outline-none z-10"
+                          class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 text-[12.5px] leading-[22px] outline-none z-10"
                           @blur="commitEditFromBlur"
                           @click.stop
                           @keydown.stop="onEditKeydown"
@@ -6887,8 +7182,16 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                   </div>
                 </template>
               </RecycleScroller>
+              <!-- Infinite scroll loading indicator for RecycleScroller -->
+              <div v-if="infiniteScrollEnabled && infiniteScrollLoading && !loading" class="flex items-center justify-center py-2 text-xs text-muted-foreground">
+                <Loader2 class="w-3 h-3 animate-spin mr-1" />
+                {{ t("grid.loadingMore") }}
+              </div>
               <div v-if="hasGridHorizontalOverflow" ref="gridHorizontalScrollbarTrackRef" class="data-grid-horizontal-scrollbar" :class="{ 'data-grid-horizontal-scrollbar--dragging': gridHorizontalScrollbarDragging }" @pointerdown="startGridHorizontalScrollbarDrag">
                 <div class="data-grid-horizontal-scrollbar__thumb" :style="gridHorizontalScrollbarThumbStyle" />
+              </div>
+              <div v-if="hasGridVerticalOverflow" ref="gridVerticalScrollbarTrackRef" class="data-grid-vertical-scrollbar" :class="{ 'data-grid-vertical-scrollbar--dragging': gridVerticalScrollbarDragging }" @pointerdown="startGridVerticalScrollbarDrag">
+                <div class="data-grid-vertical-scrollbar__thumb" :style="gridVerticalScrollbarThumbStyle" />
               </div>
               <div v-if="loading" class="absolute inset-0 z-20 bg-background/50 flex items-center justify-center">
                 <div class="flex items-center gap-2 px-3 py-1.5 rounded-md bg-background border shadow-sm text-xs text-muted-foreground">
@@ -7256,15 +7559,13 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
         </div>
       </div>
     </CustomContextMenu>
-    <div v-if="!hasData" class="flex-1 flex items-center justify-center text-muted-foreground text-sm">
+    <QueryLoadingState v-if="!hasData && loading" class="flex-1 min-h-0" />
+    <div v-else-if="!hasData" class="flex-1 flex items-center justify-center text-muted-foreground text-sm">
       {{ t("grid.querySuccess") }}
     </div>
 
     <!-- Error bar -->
-    <div v-if="saveError" class="px-3 py-1.5 border-t bg-destructive/10 text-destructive text-xs shrink-0 flex items-center gap-2">
-      <span class="flex-1">{{ saveError }}</span>
-      <button class="hover:underline" @click="saveError = ''">{{ t("grid.dismiss") }}</button>
-    </div>
+    <ErrorBanner v-if="saveError" :message="saveError" copy-mode="label" dismissible @dismiss="saveError = ''" />
 
     <!-- Bottom status bar -->
     <div v-if="!isErrorResult" class="grid grid-cols-[minmax(0,1fr)_minmax(0,38%)_minmax(0,1fr)] items-center gap-2 px-3 py-1 border-t text-xs text-muted-foreground bg-muted/30 shrink-0">
@@ -7304,52 +7605,59 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
 
       <div class="flex min-w-0 items-center justify-end gap-1">
         <Loader2 v-if="loading" class="w-3 h-3 animate-spin text-muted-foreground" />
-        <LightDropdown
-          :model-value="String(pageSize)"
-          :items="pageSizeMenuItems"
-          :trigger-label="`${pageSize}${t('grid.rowsPerPageShort')}`"
-          trigger-class="inline-flex h-5 items-center justify-center rounded-md px-1.5 text-xs hover:bg-accent hover:text-accent-foreground"
-          content-class="w-36"
-          :highlight-selected="false"
-          check-position="none"
-          align="end"
-          @update:model-value="selectPageSizeMenuItem"
-        >
-          <div class="bg-border -mx-1 my-1 h-px" />
-          <div class="text-muted-foreground px-1.5 py-1 text-xs">{{ t("grid.customRowsPerPage") }}</div>
-          <div class="flex items-center gap-1 px-1.5 pb-1" @click.stop @keydown.stop>
-            <Input
-              v-model="customPageSizeInput"
-              type="number"
-              inputmode="numeric"
-              :min="MIN_RESULT_PAGE_SIZE"
-              :max="MAX_RESULT_PAGE_SIZE"
-              class="h-6 w-20 px-1.5 text-xs tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-              @keydown.enter.prevent.stop="applyCustomPageSize"
-            />
-            <Tooltip>
-              <TooltipTrigger as-child>
-                <Button variant="outline" size="icon" class="h-6 w-6 shrink-0" :aria-label="t('grid.applyPageSize')" @click.stop="applyCustomPageSize">
-                  <Check class="h-3 w-3" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">{{ t("grid.applyPageSize") }}</TooltipContent>
-            </Tooltip>
-          </div>
-        </LightDropdown>
-        <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="currentPage <= 1" @click="firstPage">
-          <ChevronsLeft class="h-3 w-3" />
-        </Button>
-        <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="currentPage <= 1" @click="prevPage">
-          <ChevronLeft class="h-3 w-3" />
-        </Button>
-        <span>{{ currentPage }}</span>
-        <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="!canGoNextPage" @click="nextPage">
-          <ChevronRight class="h-3 w-3" />
-        </Button>
-        <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="!canJumpLastPage" @click="lastPage">
-          <ChevronsRight class="h-3 w-3" />
-        </Button>
+        <template v-if="infiniteScrollEnabled">
+          <span v-if="infiniteScrollAllLoaded" class="text-xs text-muted-foreground shrink-0">
+            {{ t("grid.allLoaded") }}
+          </span>
+        </template>
+        <template v-if="!infiniteScrollEnabled">
+          <LightDropdown
+            :model-value="String(pageSize)"
+            :items="pageSizeMenuItems"
+            :trigger-label="`${pageSize}${t('grid.rowsPerPageShort')}`"
+            trigger-class="inline-flex h-5 items-center justify-center rounded-md px-1.5 text-xs hover:bg-accent hover:text-accent-foreground"
+            content-class="w-36"
+            :highlight-selected="false"
+            check-position="none"
+            align="end"
+            @update:model-value="selectPageSizeMenuItem"
+          >
+            <div class="bg-border -mx-1 my-1 h-px" />
+            <div class="text-muted-foreground px-1.5 py-1 text-xs">{{ t("grid.customRowsPerPage") }}</div>
+            <div class="flex items-center gap-1 px-1.5 pb-1" @click.stop @keydown.stop>
+              <Input
+                v-model="customPageSizeInput"
+                type="number"
+                inputmode="numeric"
+                :min="MIN_RESULT_PAGE_SIZE"
+                :max="MAX_RESULT_PAGE_SIZE"
+                class="h-6 w-20 px-1.5 text-xs tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                @keydown.enter.prevent.stop="applyCustomPageSize"
+              />
+              <Tooltip>
+                <TooltipTrigger as-child>
+                  <Button variant="outline" size="icon" class="h-6 w-6 shrink-0" :aria-label="t('grid.applyPageSize')" @click.stop="applyCustomPageSize">
+                    <Check class="h-3 w-3" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom">{{ t("grid.applyPageSize") }}</TooltipContent>
+              </Tooltip>
+            </div>
+          </LightDropdown>
+          <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="currentPage <= 1" @click="firstPage">
+            <ChevronsLeft class="h-3 w-3" />
+          </Button>
+          <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="currentPage <= 1" @click="prevPage">
+            <ChevronLeft class="h-3 w-3" />
+          </Button>
+          <span>{{ currentPage }}</span>
+          <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="!canGoNextPage" @click="nextPage">
+            <ChevronRight class="h-3 w-3" />
+          </Button>
+          <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="!canJumpLastPage" @click="lastPage">
+            <ChevronsRight class="h-3 w-3" />
+          </Button>
+        </template>
         <LightDropdown
           model-value=""
           :items="exportMenuItems"
@@ -7689,6 +7997,9 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
   --data-grid-row-number-deleted-bg: rgb(255 244 244);
   --data-grid-row-number-active-bg: rgb(232 232 232);
   --data-grid-row-number-selected-bg: rgb(226 226 226);
+  --data-grid-scrollbar-thumb: color-mix(in oklch, var(--foreground) 30%, transparent);
+  --data-grid-scrollbar-thumb-hover: color-mix(in oklch, var(--foreground) 48%, transparent);
+  --data-grid-scrollbar-track: transparent;
 }
 
 :global(.dark) [data-grid-root] {
@@ -7782,7 +8093,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
   top: 4px;
   height: 2px;
   border-radius: 999px;
-  background: color-mix(in oklch, var(--foreground) 7%, transparent);
+  background: var(--data-grid-scrollbar-track);
 }
 
 .data-grid-horizontal-scrollbar__thumb {
@@ -7791,7 +8102,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
   height: 4px;
   min-width: 24px;
   border-radius: 999px;
-  background: color-mix(in oklch, var(--foreground) 24%, transparent);
+  background: var(--data-grid-scrollbar-thumb);
   transition:
     height 120ms ease,
     background-color 120ms ease,
@@ -7802,16 +8113,51 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
 .data-grid-horizontal-scrollbar--dragging .data-grid-horizontal-scrollbar__thumb {
   top: 2px;
   height: 6px;
-  background: color-mix(in oklch, var(--foreground) 42%, transparent);
+  background: var(--data-grid-scrollbar-thumb-hover);
+}
+
+.data-grid-vertical-scrollbar {
+  position: absolute;
+  top: 10px;
+  right: 2px;
+  bottom: 14px;
+  z-index: 30;
+  width: 10px;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.data-grid-vertical-scrollbar__thumb {
+  position: absolute;
+  left: 3px;
+  width: 4px;
+  min-height: 24px;
+  border-radius: 999px;
+  background: var(--data-grid-scrollbar-thumb);
+  transition:
+    background-color 120ms ease,
+    left 120ms ease,
+    width 120ms ease;
+}
+
+.data-grid-vertical-scrollbar:hover .data-grid-vertical-scrollbar__thumb,
+.data-grid-vertical-scrollbar--dragging .data-grid-vertical-scrollbar__thumb {
+  left: 2px;
+  width: 6px;
+  background: var(--data-grid-scrollbar-thumb-hover);
 }
 
 .canvas-grid-surface {
   cursor: cell;
-  font-family: inherit;
-  font-size: 0.75rem;
+  font-family: var(--dbx-data-grid-font-family);
+  font-size: 12.5px;
   font-weight: 400;
   line-height: 1rem;
   outline: none;
+}
+
+.cell-edit-input {
+  font-family: inherit;
 }
 
 .canvas-grid-overlay {

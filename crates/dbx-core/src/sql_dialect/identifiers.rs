@@ -1,6 +1,6 @@
 use crate::models::connection::DatabaseType;
 
-use super::capabilities::{is_schema_aware, is_simple_informix_identifier, is_simple_jdbc_identifier};
+use super::capabilities::{is_schema_aware, is_simple_informix_identifier};
 
 pub fn qualified_table_name(database_type: Option<DatabaseType>, schema: Option<&str>, table_name: &str) -> String {
     if database_type == Some(DatabaseType::Iotdb) {
@@ -30,17 +30,21 @@ pub fn qualified_table_name(database_type: Option<DatabaseType>, schema: Option<
 pub fn quote_table_identifier(database_type: Option<DatabaseType>, name: &str) -> String {
     match database_type {
         Some(DatabaseType::Iotdb) => name.to_string(),
-        Some(DatabaseType::Jdbc) if is_simple_jdbc_identifier(name) => name.to_string(),
-        Some(DatabaseType::Jdbc) => format!("`{}`", name.replace('`', "``")),
+        // JDBC connections use the driver-reported identifier quote string
+        // (DatabaseMetaData.getIdentifierQuoteString()) inside the JDBC agent,
+        // so the Rust layer passes identifiers through unquoted.
+        Some(DatabaseType::Jdbc) => name.to_string(),
         Some(
             DatabaseType::Mysql
             | DatabaseType::Goldendb
             | DatabaseType::StarRocks
+            | DatabaseType::ManticoreSearch
             | DatabaseType::Hive
             | DatabaseType::Databend
             | DatabaseType::Tdengine
             | DatabaseType::Access
-            | DatabaseType::Bigquery,
+            | DatabaseType::Bigquery
+            | DatabaseType::Questdb,
         ) => {
             format!("`{}`", name.replace('`', "``"))
         }
@@ -68,7 +72,8 @@ pub(crate) fn quote_transfer_identifier(name: &str, database_type: &DatabaseType
         | DatabaseType::ClickHouse
         | DatabaseType::Doris
         | DatabaseType::StarRocks
-        | DatabaseType::Hive => format!("`{}`", name.replace('`', "``")),
+        | DatabaseType::Hive
+        | DatabaseType::Questdb => format!("`{}`", name.replace('`', "``")),
         DatabaseType::SqlServer => format!("[{}]", name.replace(']', "]]")),
         _ => format!("\"{}\"", name.replace('\"', "\"\"")),
     }
@@ -76,7 +81,8 @@ pub(crate) fn quote_transfer_identifier(name: &str, database_type: &DatabaseType
 
 pub(crate) fn qualified_transfer_table(table_name: &str, schema: &str, database_type: &DatabaseType) -> String {
     let table = quote_transfer_identifier(table_name, database_type);
-    if schema.is_empty() || matches!(database_type, DatabaseType::Mysql | DatabaseType::MongoDb) {
+    if schema.is_empty() || matches!(database_type, DatabaseType::Mysql | DatabaseType::MongoDb | DatabaseType::Questdb)
+    {
         table
     } else {
         format!("{}.{}", quote_transfer_identifier(schema, database_type), table)

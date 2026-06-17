@@ -1,3 +1,4 @@
+#[cfg(not(windows))]
 use std::env;
 use std::path::Path;
 use std::process::Command;
@@ -9,6 +10,8 @@ const MCP_PACKAGE_NAME: &str = "@dbx-app/mcp-server";
 const MCP_LATEST_URL: &str = "https://registry.npmjs.org/@dbx-app%2fmcp-server/latest";
 const MCP_INSTALL_COMMAND: &str = "npm install -g @dbx-app/mcp-server@latest --registry=https://registry.npmjs.org";
 const SHELL_COMMAND_MARKER: &str = "__DBX_MCP_COMMAND_OUTPUT_START__";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, Serialize)]
 pub struct McpServerStatus {
@@ -60,6 +63,26 @@ pub async fn check_mcp_server_status() -> Result<McpServerStatus, String> {
         update_command: MCP_INSTALL_COMMAND.to_string(),
         error,
     })
+}
+
+#[tauri::command]
+pub async fn install_mcp_server() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let output = command_output(
+            "npm",
+            &["install", "-g", "@dbx-app/mcp-server@latest", "--registry=https://registry.npmjs.org"],
+        )?;
+
+        if !output.success {
+            let error_msg = if !output.stderr.is_empty() { output.stderr } else { output.stdout };
+            return Err(format!("Installation failed: {}", error_msg));
+        }
+
+        let version = installed_mcp_version().unwrap_or_else(|| "unknown".to_string());
+        Ok(format!("Successfully installed @dbx-app/mcp-server@{}", version))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 async fn fetch_latest_mcp_version() -> Result<String, String> {
@@ -151,7 +174,14 @@ fn command_output(command: &str, args: &[&str]) -> Result<CommandOutput, String>
 }
 
 fn run_command(command: &str, args: &[&str]) -> Result<CommandOutput, String> {
-    let output = Command::new(command).args(args).output().map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(command);
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd.output().map_err(|e| e.to_string())?;
     Ok(CommandOutput {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
@@ -247,6 +277,7 @@ fn default_user_shell() -> String {
     }
 }
 
+#[cfg(not(windows))]
 fn shell_command_script(command: &str, args: &[&str]) -> String {
     let mut words = Vec::with_capacity(args.len() + 1);
     words.push(shell_quote(command));
@@ -254,6 +285,7 @@ fn shell_command_script(command: &str, args: &[&str]) -> String {
     format!("printf '%s\\n' {}; {}", shell_quote(SHELL_COMMAND_MARKER), words.join(" "))
 }
 
+#[cfg(not(windows))]
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -270,10 +302,13 @@ fn stdout_after_shell_marker(stdout: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        bash_login_script, shell_command_script, shell_quote, stdout_after_shell_marker, SHELL_COMMAND_MARKER,
-    };
+    #[cfg(not(windows))]
+    use super::bash_login_script;
+    #[cfg(not(windows))]
+    use super::{shell_command_script, shell_quote};
+    use super::{stdout_after_shell_marker, SHELL_COMMAND_MARKER};
 
+    #[cfg(not(windows))]
     #[test]
     fn shell_quote_handles_empty_and_single_quotes() {
         assert_eq!(shell_quote(""), "''");
@@ -281,6 +316,7 @@ mod tests {
         assert_eq!(shell_quote("can't"), "'can'\"'\"'t'");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn shell_command_script_marks_command_output_after_startup_noise() {
         let script = shell_command_script("npm", &["list", "-g", "@dbx-app/mcp-server", "--json"]);
@@ -289,6 +325,7 @@ mod tests {
         assert!(script.contains("'@dbx-app/mcp-server'"));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn bash_login_script_sources_profile_and_rc_files() {
         let script = bash_login_script("node --version");

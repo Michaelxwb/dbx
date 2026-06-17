@@ -30,6 +30,7 @@ pub fn is_schema_aware(database_type: DatabaseType) -> bool {
             | DatabaseType::Hive
             | DatabaseType::Db2
             | DatabaseType::Tdengine
+            | DatabaseType::Xugu
             | DatabaseType::DuckDb
             | DatabaseType::Iris
     )
@@ -40,15 +41,6 @@ pub fn uses_fetch_first(database_type: DatabaseType) -> bool {
 }
 
 pub(super) fn is_simple_informix_identifier(name: &str) -> bool {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    (first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '$')
-}
-
-pub(super) fn is_simple_jdbc_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;

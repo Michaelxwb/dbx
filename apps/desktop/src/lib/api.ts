@@ -102,12 +102,17 @@ export const syncSavedSqlDirectory = forward("syncSavedSqlDirectory");
 
 // Schema
 export const listDatabases = forward("listDatabases");
+export const listSqlServerLinkedServers = forward("listSqlServerLinkedServers");
+export const listSqlServerLinkedServerCatalogs = forward("listSqlServerLinkedServerCatalogs");
+export const listSqlServerLinkedServerSchemas = forward("listSqlServerLinkedServerSchemas");
+export const listSqlServerLinkedServerTables = forward("listSqlServerLinkedServerTables");
 export const saveSchemaCache = forward("saveSchemaCache");
 export const loadSchemaCache = forward("loadSchemaCache");
 export const deleteSchemaCachePrefix = forward("deleteSchemaCachePrefix");
 export const listSchemas = forward("listSchemas");
 export const listTables = forward("listTables");
 export const listObjects = forward("listObjects");
+export const listObjectStatistics = forward("listObjectStatistics");
 export const listCompletionObjects = forward("listCompletionObjects");
 export const getObjectSource = forward("getObjectSource");
 export const getColumns = forward("getColumns");
@@ -221,6 +226,7 @@ export const readExternalSqlFile = forward("readExternalSqlFile");
 // Data Transfer
 export const startTransfer = forward("startTransfer");
 export const cancelTransfer = forward("cancelTransfer");
+export const sortTablesByFkDependency = forward("sortTablesByFkDependency");
 
 // Table File Import
 export const previewTableImportFile = forward("previewTableImportFile");
@@ -233,6 +239,7 @@ export const cancelDatabaseExport = forward("cancelDatabaseExport");
 export const exportQueryResultCsv = forward("exportQueryResultCsv");
 export const exportTableDataCsv = forward("exportTableDataCsv");
 export const exportQueryResultXlsx = forward("exportQueryResultXlsx");
+export const exportQueryResultsXlsx = forward("exportQueryResultsXlsx");
 export const exportQueryResultJson = forward("exportQueryResultJson");
 export const exportQueryResultMarkdown = forward("exportQueryResultMarkdown");
 export const startTableExport = forward("startTableExport");
@@ -333,6 +340,7 @@ export const mongoDeleteDocuments = forward("mongoDeleteDocuments");
 
 // Elasticsearch
 export const elasticsearchListIndices = forward("elasticsearchListIndices");
+export const vectorListCollections = forward("vectorListCollections");
 
 // History
 export const saveHistory = forward("saveHistory");
@@ -405,6 +413,7 @@ export type {
   TransferRequest,
   TransferProgress,
   TransferMode,
+  TransferTableNameCase,
   TableImportMode,
   TableImportStatus,
   TableImportColumnMapping,

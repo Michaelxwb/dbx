@@ -808,7 +808,7 @@ fn agent_java_args(jar_path: &str) -> Vec<String> {
     .map(str::to_string)
     .collect::<Vec<_>>();
 
-    if agent_jar_path_matches_key(jar_path, "kingbase") {
+    if agent_jar_path_matches_key(jar_path, "kingbase") || agent_jar_path_matches_key(jar_path, "informix") {
         args.push("-Djava.net.preferIPv4Stack=true".to_string());
     }
 
@@ -977,6 +977,13 @@ mod tests {
     #[test]
     fn agent_java_args_prefer_ipv4_for_kingbase() {
         let args = agent_java_args("/tmp/dbx/drivers/kingbase/agent.jar");
+
+        assert!(args.iter().any(|arg| arg == "-Djava.net.preferIPv4Stack=true"));
+    }
+
+    #[test]
+    fn agent_java_args_prefer_ipv4_for_informix() {
+        let args = agent_java_args("/tmp/dbx/drivers/informix/agent.jar");
 
         assert!(args.iter().any(|arg| arg == "-Djava.net.preferIPv4Stack=true"));
     }
@@ -1236,9 +1243,11 @@ mod tests {
             vec!["protocolVersion", "agentProtocolVersion", "capabilities"]
         );
         assert_eq!(
-            string_array(&contract["capabilities"]),
+            string_array(&contract["allCapabilities"]),
             AgentCapability::ALL.iter().map(|method| method.as_str()).collect::<Vec<_>>()
         );
+        assert_eq!(string_array(&contract["capabilities"]), default_sql_capabilities());
+        assert_eq!(string_array(&contract["defaultSqlCapabilities"]), default_sql_capabilities());
         assert_eq!(
             string_array(&contract["commonMethods"]),
             AgentMethod::ALL.iter().map(|method| method.as_str()).collect::<Vec<_>>()
@@ -1290,5 +1299,20 @@ mod tests {
 
     fn string_array(value: &serde_json::Value) -> Vec<&str> {
         value.as_array().unwrap().iter().map(|item| item.as_str().unwrap()).collect()
+    }
+
+    fn default_sql_capabilities() -> Vec<&'static str> {
+        [
+            AgentCapability::Connect,
+            AgentCapability::TestConnection,
+            AgentCapability::Metadata,
+            AgentCapability::Query,
+            AgentCapability::PagedQuery,
+            AgentCapability::Transaction,
+            AgentCapability::Ddl,
+        ]
+        .iter()
+        .map(|capability| capability.as_str())
+        .collect()
     }
 }

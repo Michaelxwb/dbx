@@ -1,8 +1,10 @@
 ﻿import type {
   ConnectionConfig,
   DatabaseInfo,
+  LinkedServerInfo,
   TableInfo,
   ObjectInfo,
+  ObjectStatistics,
   ObjectSource,
   ObjectSourceKind,
   ColumnInfo,
@@ -90,10 +92,23 @@ import type { DatabaseNameSqlOptions, DropTableChildObjectSqlOptions, DropObject
 import type { BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions } from "@/lib/databaseExport";
 import type { DataCompareFromTablesOptions, DataCompareFromTablesPreparation, DataCompareSyncPlan, DataCompareSyncPlanOptions, DataComparePreparation, DataComparePreparationOptions } from "@/lib/dataCompare";
 import type { DataGridSavePreparation } from "./tauri";
+import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/safeStorage";
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+const DESKTOP_SETTINGS_STORAGE_KEY = "dbx-desktop-settings";
+const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
+  show_tray_icon: true,
+  icon_theme: "default",
+  debug_logging_enabled: false,
+  saved_sql_sync_dir: null,
+  driver_store_dir: null,
+  plugin_store_dir: null,
+  agent_store_dir: null,
+  sidebar_table_page_size: 1000,
+};
 
 async function post<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, {
@@ -392,6 +407,22 @@ export async function listDatabases(connectionId: string): Promise<DatabaseInfo[
   return get(`/api/schema/databases?${qs({ connection_id: connectionId })}`);
 }
 
+export async function listSqlServerLinkedServers(connectionId: string): Promise<LinkedServerInfo[]> {
+  return get(`/api/schema/sqlserver/linked-servers?${qs({ connection_id: connectionId })}`);
+}
+
+export async function listSqlServerLinkedServerCatalogs(connectionId: string, server: string): Promise<DatabaseInfo[]> {
+  return get(`/api/schema/sqlserver/linked-server-catalogs?${qs({ connection_id: connectionId, server })}`);
+}
+
+export async function listSqlServerLinkedServerSchemas(connectionId: string, server: string, catalog: string): Promise<string[]> {
+  return get(`/api/schema/sqlserver/linked-server-schemas?${qs({ connection_id: connectionId, server, catalog })}`);
+}
+
+export async function listSqlServerLinkedServerTables(connectionId: string, server: string, catalog: string, schema: string, filter?: string, limit?: number, offset?: number): Promise<TableInfo[]> {
+  return get(`/api/schema/sqlserver/linked-server-tables?${qs({ connection_id: connectionId, server, catalog, schema, filter, limit, offset })}`);
+}
+
 export async function saveSchemaCache(cacheKey: string, payload: unknown): Promise<void> {
   return post("/api/schema/cache", { cacheKey, payload });
 }
@@ -408,8 +439,8 @@ export async function listSchemas(connectionId: string, database: string): Promi
   return get(`/api/schema/schemas?${qs({ connection_id: connectionId, database })}`);
 }
 
-export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number): Promise<TableInfo[]> {
-  return get(`/api/schema/tables?${qs({ connection_id: connectionId, database, schema, filter, limit, offset })}`);
+export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number, objectTypes?: SidebarObjectKind[]): Promise<TableInfo[]> {
+  return get(`/api/schema/tables?${qs({ connection_id: connectionId, database, schema, filter, limit, offset, object_types: objectTypes?.join(",") })}`);
 }
 
 export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[]): Promise<ObjectInfo[]> {
@@ -421,6 +452,10 @@ export async function listObjects(connectionId: string, database: string, schema
       object_types: objectTypes?.join(","),
     })}`,
   );
+}
+
+export async function listObjectStatistics(connectionId: string, database: string, schema: string): Promise<ObjectStatistics[]> {
+  return get(`/api/schema/object-statistics?${qs({ connection_id: connectionId, database, schema })}`);
 }
 
 export async function listCompletionObjects(connectionId: string, database: string, schema: string): Promise<ObjectInfo[]> {
@@ -447,8 +482,8 @@ export async function listTriggers(connectionId: string, database: string, schem
   return get(`/api/schema/triggers?${qs({ connection_id: connectionId, database, schema, table })}`);
 }
 
-export async function getTableDdl(connectionId: string, database: string, schema: string, table: string): Promise<string> {
-  return get(`/api/schema/ddl?${qs({ connection_id: connectionId, database, schema, table })}`);
+export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind): Promise<string> {
+  return get(`/api/schema/ddl?${qs({ connection_id: connectionId, database, schema, table, object_type: objectType })}`);
 }
 
 export async function prepareSchemaDiff(options: SchemaDiffPreparationOptions): Promise<SchemaDiffPreparation> {
@@ -860,11 +895,16 @@ export async function loadAiConfig(): Promise<AiConfig | null> {
 }
 
 export async function loadDesktopSettings(): Promise<DesktopSettings> {
-  return { show_tray_icon: true, icon_theme: "default", debug_logging_enabled: false, saved_sql_sync_dir: null, driver_store_dir: null, plugin_store_dir: null, agent_store_dir: null };
+  try {
+    const raw = safeLocalStorageGet(DESKTOP_SETTINGS_STORAGE_KEY);
+    return raw ? { ...DEFAULT_DESKTOP_SETTINGS, ...(JSON.parse(raw) as Partial<DesktopSettings>) } : { ...DEFAULT_DESKTOP_SETTINGS };
+  } catch {
+    return { ...DEFAULT_DESKTOP_SETTINGS };
+  }
 }
 
-export async function saveDesktopSettings(_settings: DesktopSettings): Promise<void> {
-  return;
+export async function saveDesktopSettings(settings: DesktopSettings): Promise<void> {
+  safeLocalStorageSet(DESKTOP_SETTINGS_STORAGE_KEY, JSON.stringify({ ...DEFAULT_DESKTOP_SETTINGS, ...settings }));
 }
 
 export interface DriverStoreMigrationResult {
@@ -927,28 +967,28 @@ export interface WebDavPasswordStatus {
   hasSavedPassword: boolean;
 }
 
-export async function webdavSyncTest(_config: WebDavConfig): Promise<void> {
-  throw new Error("WebDAV sync is only available in the desktop app.");
+export async function webdavSyncTest(config: WebDavConfig): Promise<void> {
+  return post("/api/cloud-sync/webdav/test", { config });
 }
 
-export async function webdavPasswordStatus(_config: WebDavConfig): Promise<WebDavPasswordStatus> {
-  return { hasSavedPassword: false };
+export async function webdavPasswordStatus(config: WebDavConfig): Promise<WebDavPasswordStatus> {
+  return post("/api/cloud-sync/webdav/password-status", { config });
 }
 
-export async function saveWebdavSavedPassword(_config: WebDavConfig, _password: string): Promise<void> {
-  throw new Error("WebDAV sync is only available in the desktop app.");
+export async function saveWebdavSavedPassword(config: WebDavConfig, password: string): Promise<void> {
+  return post("/api/cloud-sync/webdav/save-password", { config, password });
 }
 
-export async function forgetWebdavSavedPassword(_config: WebDavConfig): Promise<void> {
-  throw new Error("WebDAV sync is only available in the desktop app.");
+export async function forgetWebdavSavedPassword(config: WebDavConfig): Promise<void> {
+  return post("/api/cloud-sync/webdav/forget-password", { config });
 }
 
-export async function webdavSyncUpload(_config: WebDavConfig, _editorSettings?: unknown, _secretsPassphrase?: string): Promise<WebDavSyncSummary> {
-  throw new Error("WebDAV sync is only available in the desktop app.");
+export async function webdavSyncUpload(config: WebDavConfig, editorSettings?: unknown, secretsPassphrase?: string): Promise<WebDavSyncSummary> {
+  return post("/api/cloud-sync/webdav/upload", { config, editorSettings, secretsPassphrase });
 }
 
-export async function webdavSyncDownload(_config: WebDavConfig, _secretsPassphrase?: string): Promise<WebDavDownloadResult> {
-  throw new Error("WebDAV sync is only available in the desktop app.");
+export async function webdavSyncDownload(config: WebDavConfig, secretsPassphrase?: string): Promise<WebDavDownloadResult> {
+  return post("/api/cloud-sync/webdav/download", { config, secretsPassphrase });
 }
 
 export async function loadPinnedTreeNodeIds(): Promise<string[]> {
@@ -1056,6 +1096,18 @@ export async function cancelTransfer(transferId: string): Promise<void> {
   return post("/api/transfer/cancel", { transferId });
 }
 
+export interface SortTablesByFkOptions {
+  connectionId: string;
+  database: string;
+  schema: string;
+  tables: string[];
+  parentsFirst: boolean;
+}
+
+export async function sortTablesByFkDependency(options: SortTablesByFkOptions): Promise<string[]> {
+  return post("/api/transfer/sort-tables-by-fk", options);
+}
+
 // ---------------------------------------------------------------------------
 // Table File Import
 // ---------------------------------------------------------------------------
@@ -1132,6 +1184,11 @@ export async function exportDatabaseSql(request: DatabaseExportRequest, onProgre
       onProgress(progress);
       if (progress.status === "Done" || progress.status === "Error" || progress.status === "Cancelled") {
         es.close();
+        if (progress.status === "Done") {
+          // Trigger browser download; filename is decided by the server's
+          // Content-Disposition header.
+          downloadDatabaseExportFile(request.exportId);
+        }
         resolve();
       }
     };
@@ -1140,6 +1197,12 @@ export async function exportDatabaseSql(request: DatabaseExportRequest, onProgre
       reject(new Error("Export SSE connection failed"));
     };
   });
+}
+
+function downloadDatabaseExportFile(exportId: string): void {
+  const a = document.createElement("a");
+  a.href = `/api/export/database/download/${exportId}`;
+  a.click();
 }
 
 export async function cancelDatabaseExport(exportId: string): Promise<void> {
@@ -1240,6 +1303,21 @@ export async function exportQueryResultXlsx(filePath: string, sheetName: string 
     columns,
     rows,
   });
+  const fileName = filePath.split(/[\\/]/).pop() || "export.xlsx";
+  const blob = new Blob([new Uint8Array(workbook)], {
+    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+export async function exportQueryResultsXlsx(filePath: string, worksheets: readonly { sheetName?: string; columns: string[]; rows: readonly (readonly XlsxCellValue[])[] }[]): Promise<void> {
+  const { buildXlsxWorkbookMulti } = await import("./xlsxExport");
+  const workbook = buildXlsxWorkbookMulti(worksheets);
   const fileName = filePath.split(/[\\/]/).pop() || "export.xlsx";
   const blob = new Blob([new Uint8Array(workbook)], {
     type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1399,6 +1477,10 @@ export async function mongoListCollections(connectionId: string, database: strin
 }
 
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
+  return mongoListCollections(connectionId, "default");
+}
+
+export async function vectorListCollections(connectionId: string): Promise<string[]> {
   return mongoListCollections(connectionId, "default");
 }
 

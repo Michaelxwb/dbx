@@ -14,6 +14,8 @@ import { useTabScroll } from "@/composables/useTabScroll";
 import { useTabDrag } from "@/composables/useTabDrag";
 import { connectionColor, isConnectionReadonly, tabDisplayTitle, tabTooltipLines } from "@/lib/tabPresentation";
 import { hexToRgba } from "@/lib/color";
+import { copyToClipboard } from "@/lib/clipboard";
+import { useToast } from "@/composables/useToast";
 import type { QueryTab } from "@/types/database";
 
 const props = defineProps<{
@@ -30,6 +32,7 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
+const { toast } = useToast();
 const tabDrag = useTabDrag((draggedId, targetId, position) => {
   queryStore.reorderTab(draggedId, targetId, position);
 });
@@ -91,6 +94,18 @@ function getTabMenuItems(tab: QueryTab): ContextMenuItem[] {
       action: () => queryStore.duplicateTab(tab.id),
       icon: Copy,
       visible: canRenameTab(tab),
+    },
+    {
+      label: t("contextMenu.copyName"),
+      action: async () => {
+        try {
+          await copyToClipboard(tabDisplayTitle(tab, t));
+          toast(t("connection.copied"), 2000);
+        } catch (e: any) {
+          toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
+        }
+      },
+      icon: Copy,
     },
     { label: "", separator: true },
     {
@@ -201,7 +216,7 @@ function tabColorStyle(tab: QueryTab) {
 }
 
 function tabIconClass(tab: QueryTab) {
-  if (tab.mode === "data" || tab.mode === "mongo" || tab.mode === "redis" || tab.mode === "objects" || tab.mode === "structure") return "text-emerald-600 dark:text-emerald-400";
+  if (tab.mode === "data" || tab.mode === "mongo" || tab.mode === "vector" || tab.mode === "redis" || tab.mode === "objects" || tab.mode === "structure") return "text-emerald-600 dark:text-emerald-400";
   return "text-blue-600 dark:text-blue-400";
 }
 
@@ -219,6 +234,7 @@ const openTabMenuItems = computed(() =>
 
 function tabMenuIcon(tab: QueryTab) {
   if (tab.mode === "data" || tab.mode === "mongo" || tab.mode === "redis") return Table2;
+  if (tab.mode === "vector") return TableProperties;
   if (tab.mode === "etcd") return KeyRound;
   if (tab.mode === "objects") return TableProperties;
   if (tab.mode === "structure") return PencilRuler;
@@ -311,6 +327,7 @@ function activateTab(tabId: string) {
                 >
                   <span class="shrink-0" :class="tabIconClass(tab)">
                     <Table2 v-if="tab.mode === 'data' || tab.mode === 'mongo' || tab.mode === 'redis'" class="h-3.5 w-3.5" />
+                    <TableProperties v-else-if="tab.mode === 'vector'" class="h-3.5 w-3.5" />
                     <KeyRound v-else-if="tab.mode === 'etcd'" class="h-3.5 w-3.5" />
                     <TableProperties v-else-if="tab.mode === 'objects'" class="h-3.5 w-3.5" />
                     <PencilRuler v-else-if="tab.mode === 'structure'" class="h-3.5 w-3.5" />

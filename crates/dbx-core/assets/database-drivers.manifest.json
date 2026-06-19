@@ -321,6 +321,64 @@
       }
     },
     {
+      "dbType": "qdrant",
+      "label": "Qdrant",
+      "runtimeMode": "native",
+      "mcpMode": "bridge",
+      "singleConnectionPool": false,
+      "metadataConnectionScoped": false,
+      "skipTcpProbe": false,
+      "defaultPort": 6333,
+      "supportLevel": "browse",
+      "capabilities": {
+        "queryExecution": true,
+        "metadataBrowse": true,
+        "objectBrowser": false,
+        "objectSource": false,
+        "schemaSearch": false,
+        "diagram": false,
+        "tableDataEdit": false,
+        "tableStructureEdit": false,
+        "tableImport": false,
+        "dataTransfer": false,
+        "sqlFileExecution": false,
+        "databaseCreate": false,
+        "fieldLineage": false,
+        "sqlExplain": false,
+        "userAdmin": false,
+        "driverManagement": false
+      }
+    },
+    {
+      "dbType": "milvus",
+      "label": "Milvus",
+      "runtimeMode": "native",
+      "mcpMode": "bridge",
+      "singleConnectionPool": false,
+      "metadataConnectionScoped": false,
+      "skipTcpProbe": false,
+      "defaultPort": 19530,
+      "supportLevel": "browse",
+      "capabilities": {
+        "queryExecution": true,
+        "metadataBrowse": true,
+        "objectBrowser": false,
+        "objectSource": false,
+        "schemaSearch": false,
+        "diagram": false,
+        "tableDataEdit": false,
+        "tableStructureEdit": false,
+        "tableImport": false,
+        "dataTransfer": false,
+        "sqlFileExecution": false,
+        "databaseCreate": false,
+        "fieldLineage": false,
+        "sqlExplain": false,
+        "userAdmin": false,
+        "driverManagement": false
+      }
+    },
+    {
       "dbType": "doris",
       "label": "Doris",
       "runtimeMode": "native",
@@ -939,7 +997,7 @@
         "fieldLineage": false,
         "sqlExplain": true,
         "userAdmin": false,
-        "driverManagement": true
+        "driverManagement": false
       }
     },
     {
@@ -1474,8 +1532,8 @@
       "supportLevel": "connect",
       "capabilities": {
         "queryExecution": false,
-        "metadataBrowse": false,
-        "objectBrowser": false,
+        "metadataBrowse": true,
+        "objectBrowser": true,
         "objectSource": false,
         "schemaSearch": false,
         "diagram": false,

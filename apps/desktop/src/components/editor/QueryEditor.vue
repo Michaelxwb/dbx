@@ -1062,6 +1062,7 @@ async function provideSqlCompletions(currentState: import("@codemirror/state").E
         snippets: settingsStore.editorSettings.snippets,
         dialect: props.dialect,
         databaseType: props.databaseType,
+        keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
       });
       return buildCompletionResult(items, position - completionContext.prefix.length, getSqlCompletionResultValidFor(fullDoc, position));
     }
@@ -1079,6 +1080,7 @@ async function provideSqlCompletions(currentState: import("@codemirror/state").E
         snippets: settingsStore.editorSettings.snippets,
         dialect: props.dialect,
         databaseType: props.databaseType,
+        keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
       });
       return buildCompletionResult(items, position - completionContext.prefix.length, getSqlCompletionResultValidFor(fullDoc, position));
     }
@@ -1222,6 +1224,7 @@ function buildLocalSqlCompletionResult(completionContext: ReturnType<typeof getS
     snippets: settingsStore.editorSettings.snippets,
     dialect: props.dialect,
     databaseType: props.databaseType,
+    keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
   });
 
   return buildCompletionResult(items, position - completionContext.prefix.length, getSqlCompletionResultValidFor(fullDoc, position));
@@ -1508,6 +1511,7 @@ async function performAsyncCompletionWithResult(epoch: number, completionContext
     snippets: settingsStore.editorSettings.snippets,
     dialect: props.dialect,
     databaseType: props.databaseType,
+    keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
   });
 
   return buildCompletionResult(items, position - completionContext.prefix.length, getSqlCompletionResultValidFor(fullDoc, position));
@@ -1705,7 +1709,16 @@ onMounted(async () => {
       highlightActiveLineGutter(),
       highlightSpecialChars(),
       history(),
-      foldGutter(),
+      foldGutter({
+        markerDOM(open: boolean) {
+          const span = document.createElement("span");
+          span.className = "cm-foldMarker-svg";
+          span.innerHTML = open
+            ? '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M4.5 6.5l3.5 3.5 3.5-3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
+            : '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M6.5 4.5l3.5 3.5-3.5 3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+          return span;
+        },
+      }),
       drawSelection(),
       trimmedSelectionLayer(),
       selectionMatchOccurrences(),
@@ -2248,5 +2261,27 @@ defineExpose({ openSearch, openReplace, scrollCursorIntoView });
 .query-editor--table-navigation-hover :deep(.cm-content),
 .query-editor--table-navigation-hover :deep(.cm-line) {
   cursor: pointer;
+}
+
+:deep(.cm-foldMarker-svg) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  width: 16px;
+  height: 16px;
+  color: var(--muted-foreground);
+  opacity: 0.65;
+  transition: opacity 0.15s;
+}
+
+:deep(.cm-foldMarker-svg:hover) {
+  opacity: 0.95;
+}
+
+:deep(.cm-foldMarker-svg svg) {
+  display: block;
+  width: 16px;
+  height: 16px;
 }
 </style>

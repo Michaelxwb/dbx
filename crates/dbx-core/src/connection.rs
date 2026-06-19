@@ -67,6 +67,7 @@ pub enum PoolKind {
     ClickHouse(db::clickhouse_driver::ChClient),
     SqlServer(Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>),
     Elasticsearch(db::elasticsearch_driver::EsClient),
+    VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
     Agent(Arc<tokio::sync::Mutex<db::agent_driver::AgentDriverClient>>),
     ExternalTabular(ExternalTabularHandle),
@@ -489,7 +490,9 @@ impl AppState {
             }
             DatabaseType::Redis => {
                 let con = if db_config.uses_redis_cluster() {
-                    db::redis_driver::RedisConnection::Cluster(db::redis_driver::connect_cluster(&db_config).await?)
+                    db::redis_driver::RedisConnection::Cluster(
+                        self.connect_redis_cluster(connection_id, &db_config).await?,
+                    )
                 } else if db_config.uses_redis_sentinel() {
                     db::redis_driver::RedisConnection::Direct(tokio::sync::Mutex::new(
                         db::redis_driver::connect_sentinel(&db_config).await?,
@@ -598,6 +601,23 @@ impl AppState {
                 );
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
                 PoolKind::Elasticsearch(client)
+            }
+            DatabaseType::Qdrant | DatabaseType::Milvus => {
+                let kind = match db_config.db_type {
+                    DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
+                    DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
+                    _ => unreachable!(),
+                };
+                let client = db::vector_driver::VectorClient::new(
+                    kind,
+                    &url,
+                    Some(&db_config.username),
+                    Some(&db_config.password),
+                    db_config.ssl,
+                    connect_timeout,
+                );
+                db::vector_driver::test_connection(&client, connect_timeout).await?;
+                PoolKind::VectorDb(client)
             }
             DatabaseType::InfluxDb => {
                 let username = if db_config.username.is_empty() { None } else { Some(db_config.username.clone()) };
@@ -799,6 +819,63 @@ impl AppState {
         .await?;
 
         Ok(("127.0.0.1".to_string(), local_port))
+    }
+
+    pub async fn connect_redis_cluster(
+        &self,
+        connection_id: &str,
+        config: &ConnectionConfig,
+    ) -> Result<db::redis_driver::RedisClusterPool, String> {
+        let transport_layers = config.effective_transport_layers();
+        if transport_layers.is_empty() {
+            return db::redis_driver::connect_cluster(config).await;
+        }
+
+        let result = async {
+            let seed_nodes = db::redis_driver::redis_cluster_seed_nodes(config)?;
+            let seed_routes = self.redis_cluster_node_routes(connection_id, &transport_layers, &seed_nodes).await?;
+            let (auth, slot_ranges) =
+                db::redis_driver::discover_cluster_slot_ranges_from_routes(config, &seed_routes).await?;
+            let master_nodes = db::redis_driver::unique_master_nodes(&slot_ranges);
+            let node_routes = self.redis_cluster_node_routes(connection_id, &transport_layers, &master_nodes).await?;
+
+            db::redis_driver::connect_routed_cluster(config, seed_routes, slot_ranges, node_routes, auth).await
+        }
+        .await;
+
+        if result.is_err() {
+            let redis_cluster_prefix = redis_cluster_transport_prefix(connection_id);
+            self.tunnels.stop_tunnels_with_prefix(&redis_cluster_prefix).await;
+            self.proxy_tunnels.stop_tunnels_with_prefix(&redis_cluster_prefix).await;
+        }
+
+        result
+    }
+
+    async fn redis_cluster_node_routes(
+        &self,
+        connection_id: &str,
+        transport_layers: &[crate::models::connection::TransportLayerConfig],
+        nodes: &[db::redis_driver::RedisNodeEndpoint],
+    ) -> Result<Vec<db::redis_driver::RedisNodeRoute>, String> {
+        let mut routes = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            let tunnel_id = redis_cluster_transport_id(connection_id, node);
+            let local_port = db::transport_layer_tunnel::start_transport_layers(
+                &tunnel_id,
+                transport_layers,
+                &node.host,
+                node.port,
+                &self.tunnels,
+                &self.proxy_tunnels,
+            )
+            .await?;
+            routes.push(db::redis_driver::RedisNodeRoute {
+                advertised: node.clone(),
+                connect: db::redis_driver::RedisNodeEndpoint { host: "127.0.0.1".to_string(), port: local_port },
+            });
+        }
+        Ok(routes)
     }
 
     #[cfg(feature = "mq-admin")]
@@ -1076,6 +1153,9 @@ impl AppState {
     }
 
     async fn reset_connection_transport_layers(&self, connection_id: &str, layer_count: usize) {
+        let redis_cluster_prefix = redis_cluster_transport_prefix(connection_id);
+        self.tunnels.stop_tunnels_with_prefix(&redis_cluster_prefix).await;
+        self.proxy_tunnels.stop_tunnels_with_prefix(&redis_cluster_prefix).await;
         db::transport_layer_tunnel::stop_transport_layers(
             connection_id,
             layer_count,
@@ -1161,6 +1241,11 @@ impl AppState {
         close_removed_pools_in_background(removed);
     }
 
+    pub async fn remove_external_driver_pools(&self, driver_id: &str) {
+        let removed = self.drain_external_driver_pools(driver_id).await;
+        close_removed_pools(removed).await;
+    }
+
     async fn drain_connection_pools(&self, connection_id: &str) -> Vec<(String, PoolKind)> {
         let pool_prefix = format!("{connection_id}:");
         let keys_to_remove: Vec<String> = self
@@ -1186,6 +1271,30 @@ impl AppState {
         removed
     }
 
+    async fn drain_external_driver_pools(&self, driver_id: &str) -> Vec<(String, PoolKind)> {
+        let keys_to_remove: Vec<String> = self
+            .connections
+            .read()
+            .await
+            .iter()
+            .filter_map(|(key, pool)| match pool {
+                PoolKind::ExternalDriver { driver_id: pool_driver_id, .. } if pool_driver_id == driver_id => {
+                    Some(key.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        self.stop_keepalive_tasks(&keys_to_remove).await;
+        let mut conns = self.connections.write().await;
+        let mut removed = Vec::with_capacity(keys_to_remove.len());
+        for key in keys_to_remove {
+            if let Some(pool) = conns.remove(&key) {
+                removed.push((key, pool));
+            }
+        }
+        removed
+    }
+
     async fn uses_forwarded_transport(&self, connection_id: &str) -> bool {
         let configs = self.configs.read().await;
         configs.get(connection_id).is_some_and(|config| config.has_effective_transport_layers())
@@ -1201,6 +1310,7 @@ enum KeepaliveTarget {
     ClickHouse(db::clickhouse_driver::ChClient),
     SqlServer(Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>),
     Elasticsearch(db::elasticsearch_driver::EsClient),
+    VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
 }
 
@@ -1217,6 +1327,7 @@ fn keepalive_target_from_pool(pool: &PoolKind, config: &ConnectionConfig) -> Opt
         PoolKind::ClickHouse(client) => Some(KeepaliveTarget::ClickHouse(client.clone())),
         PoolKind::SqlServer(client) => Some(KeepaliveTarget::SqlServer(client.clone())),
         PoolKind::Elasticsearch(client) => Some(KeepaliveTarget::Elasticsearch(client.clone())),
+        PoolKind::VectorDb(client) => Some(KeepaliveTarget::VectorDb(client.clone())),
         PoolKind::InfluxDb(client) => Some(KeepaliveTarget::InfluxDb(client.clone())),
         _ => None,
     }
@@ -1243,6 +1354,7 @@ async fn ping_keepalive_target(target: &mut KeepaliveTarget, timeout: Duration) 
             db::sqlserver::test_connection(&mut client).await
         }
         KeepaliveTarget::Elasticsearch(client) => db::elasticsearch_driver::test_connection(client, timeout).await,
+        KeepaliveTarget::VectorDb(client) => db::vector_driver::test_connection(client, timeout).await,
         KeepaliveTarget::InfluxDb(client) => db::influxdb_driver::test_connection(client, timeout).await,
     }
 }
@@ -1288,6 +1400,19 @@ fn parse_mq_admin_host_port(config: &ConnectionConfig) -> Option<(String, u16)> 
 
 fn normalize_client_session_id(client_session_id: Option<&str>) -> Option<String> {
     client_session_id.map(str::trim).filter(|session| !session.is_empty()).map(|session| session.replace(':', "_"))
+}
+
+fn redis_cluster_transport_prefix(connection_id: &str) -> String {
+    format!("{connection_id}:redis-cluster:")
+}
+
+fn redis_cluster_transport_id(connection_id: &str, endpoint: &db::redis_driver::RedisNodeEndpoint) -> String {
+    format!(
+        "{}{host}:{port}",
+        redis_cluster_transport_prefix(connection_id),
+        host = endpoint.host,
+        port = endpoint.port
+    )
 }
 
 fn session_scoped_pool_key(base_pool_key: String, client_session_id: Option<&str>) -> String {
@@ -1348,13 +1473,16 @@ pub async fn close_pool_kind(pool: PoolKind) {
         PoolKind::ClickHouse(_) => {}
         PoolKind::SqlServer(_) => {}
         PoolKind::Elasticsearch(_) => {}
+        PoolKind::VectorDb(_) => {}
         PoolKind::InfluxDb(_) => {}
         PoolKind::Agent(client) => {
             let mut client = client.lock().await;
             let _ = client.disconnect().await;
         }
         PoolKind::ExternalTabular(_) => {}
-        PoolKind::ExternalDriver { .. } => {}
+        PoolKind::ExternalDriver { session, .. } => {
+            session.shutdown().await;
+        }
         PoolKind::MessageQueue => {}
     }
 }
@@ -1404,7 +1532,8 @@ fn base_pool_key_for(
 ) -> String {
     let is_single_connection_pool = db_type.as_ref().is_some_and(|db_type| {
         let is_single = database_capabilities::is_single_connection_pool(db_type)
-            || (include_elasticsearch_single_pool && *db_type == DatabaseType::Elasticsearch);
+            || (include_elasticsearch_single_pool
+                && matches!(db_type, DatabaseType::Elasticsearch | DatabaseType::Qdrant | DatabaseType::Milvus));
         is_single && (!database_capabilities::is_agent_type(db_type) || shares_database_pool_with_connection(db_type))
     });
 
@@ -1569,14 +1698,14 @@ fn uses_tcp_probe(config: &ConnectionConfig, host: &str, port: u16) -> bool {
     if database_capabilities::skips_tcp_probe(&config.db_type) {
         return false;
     }
-    if is_original_hostname_endpoint(config, host, port) {
+    if is_original_endpoint(config, host, port) {
         return false;
     }
     true
 }
 
-fn is_original_hostname_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> bool {
-    host == config.host && port == config.port && host.parse::<std::net::IpAddr>().is_err()
+fn is_original_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> bool {
+    host == config.host && port == config.port
 }
 
 async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &db::mysql::MySqlPool) -> MysqlMode {
@@ -1669,6 +1798,7 @@ mod tests {
             redis_key_separator: default_redis_key_separator(),
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
+            informix_server: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
@@ -2325,17 +2455,18 @@ mod tests {
     }
 
     #[test]
-    fn mysql_hostname_connections_skip_tcp_probe() {
+    fn mysql_direct_connections_skip_tcp_probe() {
         let mut config = mysql_config(Some("app"));
         config.host = "mysql.example.com".to_string();
 
         assert!(!uses_tcp_probe(&config, "mysql.example.com", 3306));
-        assert!(uses_tcp_probe(&config, "192.0.2.10", 3306));
+        config.host = "192.0.2.10".to_string();
+        assert!(!uses_tcp_probe(&config, "192.0.2.10", 3306));
         assert!(uses_tcp_probe(&config, "127.0.0.1", 53306));
     }
 
     #[test]
-    fn native_hostname_connections_skip_tcp_probe() {
+    fn native_direct_connections_skip_tcp_probe() {
         for db_type in [
             DatabaseType::Postgres,
             DatabaseType::Redshift,
@@ -2350,7 +2481,8 @@ mod tests {
             config.host = "db.example.com".to_string();
 
             assert!(!uses_tcp_probe(&config, "db.example.com", config.port), "{db_type:?} hostname");
-            assert!(uses_tcp_probe(&config, "192.0.2.10", config.port), "{db_type:?} ip");
+            config.host = "192.0.2.10".to_string();
+            assert!(!uses_tcp_probe(&config, "192.0.2.10", config.port), "{db_type:?} ip");
             assert!(uses_tcp_probe(&config, "127.0.0.1", 54000), "{db_type:?} forwarded");
         }
     }
@@ -2715,8 +2847,9 @@ mod tests {
 
         let schemas = schema::list_schemas_core(&state, "kwdb-live", &database).await.unwrap();
         assert!(schemas.iter().any(|schema| schema == test_schema));
-        let tables =
-            schema::list_tables_core(&state, "kwdb-live", &database, test_schema, None, None, None).await.unwrap();
+        let tables = schema::list_tables_core(&state, "kwdb-live", &database, test_schema, None, None, None, None)
+            .await
+            .unwrap();
         assert!(tables.iter().any(|table| table.name == "devices" && table.table_type == "BASE TABLE"));
         let columns = schema::get_columns_core(&state, "kwdb-live", &database, test_schema, "devices").await.unwrap();
         let id_column = columns.iter().find(|column| column.name == "id").expect("id column should be listed");

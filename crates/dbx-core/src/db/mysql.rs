@@ -13,7 +13,8 @@ use std::time::Instant;
 use crate::models::connection::DatabaseType;
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
-    ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, ObjectInfo, QueryResult, TableInfo, TriggerInfo,
+    ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, ObjectInfo, ObjectStatistics, QueryResult, TableInfo,
+    TriggerInfo,
 };
 
 use super::file_validator::validate_file_path;
@@ -100,6 +101,17 @@ fn get_opt_i32(row: &mysql_async::Row, name: &str) -> Option<i32> {
             row_get::<Vec<u8>, _>(row, name)
                 .and_then(|b| String::from_utf8(b).ok())
                 .and_then(|v| numeric_metadata_str_to_i32(Some(v)))
+        })
+}
+
+fn get_opt_i64(row: &mysql_async::Row, name: &str) -> Option<i64> {
+    row_get::<i64, _>(row, name)
+        .or_else(|| row_get::<u64, _>(row, name).and_then(|value| i64::try_from(value).ok()))
+        .or_else(|| row_get::<String, _>(row, name).and_then(|value| value.parse::<i64>().ok()))
+        .or_else(|| {
+            row_get::<Vec<u8>, _>(row, name)
+                .and_then(|b| String::from_utf8(b).ok())
+                .and_then(|value| value.parse::<i64>().ok())
         })
 }
 
@@ -992,7 +1004,9 @@ pub async fn list_tables(pool: &MySqlPool, database: &str) -> Result<Vec<TableIn
             (!name.is_empty()).then_some(TableInfo {
                 name,
                 table_type: get_str_by_name(row, "TABLE_TYPE"),
-                comment: get_opt_str(row, "TABLE_COMMENT").filter(|s| !s.is_empty()),
+                comment: get_opt_str(row, "TABLE_COMMENT")
+                    .map(|s| fix_potential_double_encoding(&s))
+                    .filter(|s| !s.is_empty()),
                 parent_schema: None,
                 parent_name: None,
             })
@@ -1029,7 +1043,9 @@ async fn list_table_status_show(pool: &MySqlPool, database: &str) -> Result<Hash
             (
                 get_str_by_name(row, "Name"),
                 TableStatusMeta {
-                    comment: get_opt_metadata_string(row, "Comment").filter(|s| !s.is_empty()),
+                    comment: get_opt_metadata_string(row, "Comment")
+                        .map(|s| fix_potential_double_encoding(&s))
+                        .filter(|s| !s.is_empty()),
                     created_at: get_opt_metadata_string(row, "Create_time"),
                     updated_at: get_opt_metadata_string(row, "Update_time"),
                 },
@@ -1152,7 +1168,9 @@ fn row_to_object(row: &mysql_async::Row, database: &str) -> ObjectInfo {
         name: get_str_by_name(row, "object_name"),
         object_type: get_str_by_name(row, "object_type"),
         schema: Some(database.to_string()),
-        comment: get_opt_str(row, "object_comment").filter(|s| !s.is_empty()),
+        comment: get_opt_str(row, "object_comment")
+            .map(|s| fix_potential_double_encoding(&s))
+            .filter(|s| !s.is_empty()),
         created_at: get_opt_str(row, "created_at"),
         updated_at: get_opt_str(row, "updated_at"),
         parent_schema: get_opt_str(row, "parent_schema"),
@@ -1187,6 +1205,31 @@ pub async fn list_objects(pool: &MySqlPool, database: &str) -> Result<Vec<Object
     }
 
     Ok(objects)
+}
+
+pub async fn list_object_statistics(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectStatistics>, String> {
+    let sql = format!(
+        "SELECT TABLE_NAME, TABLE_ROWS, COALESCE(DATA_LENGTH, 0) + COALESCE(INDEX_LENGTH, 0) AS TOTAL_BYTES \
+         FROM information_schema.TABLES \
+         WHERE TABLE_SCHEMA = {} AND TABLE_TYPE <> 'VIEW' \
+         ORDER BY TABLE_NAME",
+        quote_value(database),
+    );
+    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
+    let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
+    Ok(rows
+        .iter()
+        .filter_map(|row| {
+            let name = get_str_by_name(row, "TABLE_NAME").trim().to_string();
+            (!name.is_empty()).then_some(ObjectStatistics {
+                name,
+                schema: Some(database.to_string()),
+                estimated_rows: get_opt_i64(row, "TABLE_ROWS"),
+                total_bytes: get_opt_i64(row, "TOTAL_BYTES"),
+            })
+        })
+        .collect())
 }
 
 pub async fn list_table_objects_show(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
@@ -1468,7 +1511,11 @@ fn mysql_top_level_limit(sql: &str) -> Option<usize> {
         if depth == 0 && mysql_keyword_at(sql, i, "LIMIT") {
             return parse_mysql_limit_value(sql, i + "LIMIT".len());
         }
+        // Move to next byte, but ensure we stay on a UTF-8 boundary
         i += 1;
+        while i < bytes.len() && !sql.is_char_boundary(i) {
+            i += 1;
+        }
     }
 
     None
@@ -1497,13 +1544,20 @@ fn parse_usize_token(sql: &str, i: &mut usize) -> Option<usize> {
     if *i == start {
         return None;
     }
-    sql[start..*i].parse().ok()
+    // Ensure the slice is valid UTF-8 before parsing
+    std::str::from_utf8(&bytes[start..*i]).ok()?.parse().ok()
 }
 
 fn mysql_keyword_at(sql: &str, i: usize, keyword: &str) -> bool {
     let end = i + keyword.len();
-    end <= sql.len()
-        && sql[i..end].eq_ignore_ascii_case(keyword)
+    if end > sql.len() {
+        return false;
+    }
+    // Ensure indices are on UTF-8 boundaries before slicing
+    if !sql.is_char_boundary(i) || !sql.is_char_boundary(end) {
+        return false;
+    }
+    sql[i..end].eq_ignore_ascii_case(keyword)
         && (i == 0 || !is_mysql_identifier_byte(sql.as_bytes()[i - 1]))
         && (end == sql.len() || !is_mysql_identifier_byte(sql.as_bytes()[end]))
 }

@@ -4,7 +4,7 @@ use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
 use dbx_core::storage::Storage;
 use dbx_core::transfer::{
     get_db_type, transfer_postgres_schema_dependencies, transfer_postgres_schema_objects, transfer_table, TransferMode,
-    TransferRequest,
+    TransferRequest, TransferTableNameCase,
 };
 use serde_json::json;
 
@@ -46,6 +46,7 @@ fn postgres_test_config(id: &str, database: &str) -> ConnectionConfig {
         redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
         etcd_endpoints: String::new(),
         gbase_server: String::new(),
+        informix_server: String::new(),
         external_config: None,
         jdbc_driver_class: None,
         jdbc_driver_paths: Vec::new(),
@@ -189,6 +190,7 @@ async fn live_postgres_transfer_preserves_data_and_schema_objects() {
         tables: vec!["users".to_string(), "audit_logs".to_string()],
         create_table: true,
         mode: TransferMode::Append,
+        target_table_name_case: TransferTableNameCase::Preserve,
         batch_size: 100,
     };
 

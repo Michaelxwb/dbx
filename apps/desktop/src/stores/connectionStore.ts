@@ -36,6 +36,7 @@ import {
   buildTableTreeNodes,
   expandCachedObjectBrowserNodes,
   mergeTableInfosIntoObjects,
+  mergeTableTreePageChildren,
   objectGroupRefreshParentId,
   objectTypesForGroupNode,
   tablePartitionGroups,
@@ -48,6 +49,7 @@ import { prunePinnedTreeNodeIdsForConnection } from "@/lib/pinnedTreeNodeIds";
 import { supportsDatabaseUserAdmin } from "@/lib/databaseUserAdmin";
 import { getTableMetadataCapabilities } from "@/lib/tableMetadataCapabilities";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { encodeSqlServerLinkedSchema, parseSqlServerLinkedSchema } from "@/lib/sqlServerLinkedServers";
 
 const PINNED_TREE_NODES_STORAGE_KEY = "dbx-pinned-tree-nodes";
 const ACTIVE_CONNECTION_STORAGE_KEY = "dbx-active-connection";
@@ -57,6 +59,46 @@ function sidebarObjectGroupPageSize(): number {
   return typeof size === "number" && size > 0 ? size : 500;
 }
 type ImportSource = "dbx" | "navicat" | "dbeaver" | "datagrip";
+
+function nodeIdPart(value: string): string {
+  return encodeURIComponent(value);
+}
+
+function sqlServerLinkedRootId(connectionId: string): string {
+  return `${connectionId}:__linked_servers`;
+}
+
+function sqlServerLinkedServerId(connectionId: string, server: string): string {
+  return `${sqlServerLinkedRootId(connectionId)}:${nodeIdPart(server)}`;
+}
+
+function sqlServerLinkedCatalogId(connectionId: string, server: string, catalog: string): string {
+  return `${sqlServerLinkedServerId(connectionId, server)}:${nodeIdPart(catalog)}`;
+}
+
+function sqlServerLinkedRuntimeDatabase(config?: ConnectionConfig): string {
+  return config?.database?.trim() || "master";
+}
+
+function sqlServerLinkedRootNode(connectionId: string, database: string): TreeNode {
+  return {
+    id: sqlServerLinkedRootId(connectionId),
+    label: "tree.linkedServers",
+    type: "linked-server-root",
+    connectionId,
+    database,
+    isExpanded: false,
+    children: [],
+  };
+}
+
+function ensureSqlServerLinkedRootNode(connectionId: string, children: TreeNode[], config?: ConnectionConfig): TreeNode[] {
+  if (config?.db_type !== "sqlserver") return children;
+  if (children.some((child) => child.type === "linked-server-root" || child.id === sqlServerLinkedRootId(connectionId))) {
+    return children;
+  }
+  return [...children, sqlServerLinkedRootNode(connectionId, sqlServerLinkedRuntimeDatabase(config))];
+}
 
 // Temporary storage for DataGrip import payload (used to read Keychain passwords after import)
 let pendingDataGripPayload: { format: "datagrip-import"; dataSources: string; dataSourcesLocal?: string } | null = null;
@@ -251,6 +293,8 @@ export const useConnectionStore = defineStore("connection", () => {
       mongodb: "MongoDB",
       oracle: "Oracle",
       elasticsearch: "Elasticsearch",
+      qdrant: "Qdrant",
+      milvus: "Milvus",
       doris: "Doris",
       starrocks: "StarRocks",
       manticoresearch: "Manticore Search",
@@ -466,7 +510,7 @@ export const useConnectionStore = defineStore("connection", () => {
     // When searching, fetch all matching tables (no pagination) — backend filter
     // already narrows the result set, so client-side filtering is not needed.
     const fetchLimit = searchFilter ? undefined : options.pageSize + 1;
-    const tables = await api.listTables(options.node.connectionId, options.node.database, options.querySchema, searchFilter, fetchLimit, searchFilter ? undefined : options.offset);
+    const tables = await api.listTables(options.node.connectionId, options.node.database, options.querySchema, searchFilter, fetchLimit, searchFilter ? undefined : options.offset, options.objectTypes);
     const hasMore = searchFilter ? false : tables.length > options.pageSize;
     const pageTables = hasMore ? tables.slice(0, options.pageSize) : tables;
     const objects = mergeTableInfosIntoObjects([], pageTables, options.effectiveSchema);
@@ -499,7 +543,10 @@ export const useConnectionStore = defineStore("connection", () => {
     const payload = await api.loadSchemaCache<unknown>(cacheKey).catch(() => null);
     const decoded = decodeSchemaTreeCache<TreeNode[]>(payload);
     if (!decoded) return { hit: false, isStale: false };
-    const normalizedChildren = sortSidebarTreeChildrenForParent(node, normalizeCataloglessDatabaseNodes(expandCachedObjectBrowserNodes(decoded.children)), node.connectionId ? getConfig(node.connectionId)?.db_type : undefined);
+    const config = node.connectionId ? getConfig(node.connectionId) : undefined;
+    const cachedChildren = normalizeCataloglessDatabaseNodes(expandCachedObjectBrowserNodes(decoded.children));
+    const childrenWithLinkedServers = node.type === "connection" && node.connectionId ? ensureSqlServerLinkedRootNode(node.connectionId, cachedChildren, config) : cachedChildren;
+    const normalizedChildren = sortSidebarTreeChildrenForParent(node, childrenWithLinkedServers, config?.db_type);
     setChildren(node, node.type === "connection" && node.connectionId ? withSavedSqlRoot(node.connectionId, normalizedChildren, node) : normalizedChildren);
     node.isExpanded = true;
     return { hit: true, isStale: decoded.isStale };
@@ -675,6 +722,10 @@ export const useConnectionStore = defineStore("connection", () => {
     connectedIds.value.delete(config.id);
     invalidateCompletionCache(config.id);
     clearLoadedChildrenCache(config.id);
+    const node = findNode(treeNodes.value, config.id);
+    if (node?.isExpanded) {
+      await reloadConnectionDatabaseChildren(config.id);
+    }
   }
 
   async function setDefaultDatabase(connectionId: string, database: string) {
@@ -739,6 +790,8 @@ export const useConnectionStore = defineStore("connection", () => {
       await loadMongoDatabases(connectionId);
     } else if (config.db_type === "elasticsearch") {
       await loadElasticsearchIndices(connectionId);
+    } else if (config.db_type === "qdrant" || config.db_type === "milvus") {
+      await loadVectorCollections(connectionId);
     } else if (config.db_type === "mq") {
       await loadMqTenants(connectionId, { force: true });
     } else {
@@ -930,13 +983,29 @@ export const useConnectionStore = defineStore("connection", () => {
         const visibleNameSet = new Set(visibleNames);
         const visibleDatabases = databases.filter((database) => visibleNameSet.has(database.name));
         const effectiveDbType = effectiveDatabaseTypeForConnection(config);
-        const children = withSavedSqlRoot(
-          connectionId,
-          buildDatabaseTreeNodes(connectionId, visibleDatabases, {
-            includeDefaultWhenEmpty: usesTreeSchemaMode(effectiveDbType) || shouldIncludeDefaultDatabaseNode(config, visibleDatabases),
-          }),
-          node,
-        );
+        const databaseNodes = buildDatabaseTreeNodes(connectionId, visibleDatabases, {
+          includeDefaultWhenEmpty: usesTreeSchemaMode(effectiveDbType) || shouldIncludeDefaultDatabaseNode(config, visibleDatabases),
+        });
+        if (config?.db_type === "sqlserver") {
+          const linkedServers = await api.listSqlServerLinkedServers(connectionId).catch(() => []);
+          const linkedDatabase = sqlServerLinkedRuntimeDatabase(config);
+          databaseNodes.push({
+            ...sqlServerLinkedRootNode(connectionId, linkedDatabase),
+            children: linkedServers.map((server) => ({
+              id: sqlServerLinkedServerId(connectionId, server.name),
+              label: server.name,
+              type: "linked-server",
+              connectionId,
+              database: linkedDatabase,
+              linkedServer: server.name,
+              comment: [server.product, server.provider, server.data_source].filter(Boolean).join(" / ") || null,
+              isExpanded: false,
+              children: [],
+            })),
+          });
+          if (linkedServers.length > 0) loadedTreeNodeChildrenIds.value.add(sqlServerLinkedRootId(connectionId));
+        }
+        const children = withSavedSqlRoot(connectionId, databaseNodes, node);
         setChildren(node, children);
         await savePersistedTreeChildren(cacheKey, children);
       }
@@ -1133,9 +1202,41 @@ export const useConnectionStore = defineStore("connection", () => {
         withSavedSqlRoot(
           connectionId,
           sortSidebarNames(indices).map((index) => ({
-            id: `${connectionId}:__es_index:${index}`,
+            id: `${connectionId}:__collection:${index}`,
             label: index,
             type: "elasticsearch-index" as const,
+            connectionId,
+            database: "default",
+            isExpanded: false,
+          })),
+          node,
+        ),
+      );
+      node.isExpanded = true;
+    } catch (e) {
+      recordMetadataLoadError(connectionId, e);
+      throw e;
+    } finally {
+      node.isLoading = false;
+    }
+  }
+
+  async function loadVectorCollections(connectionId: string) {
+    const node = findNode(treeNodes.value, connectionId);
+    if (!node) return;
+
+    node.isLoading = true;
+    try {
+      await ensureConnected(connectionId);
+      const collections = await api.vectorListCollections(connectionId);
+      setChildren(
+        node,
+        withSavedSqlRoot(
+          connectionId,
+          sortSidebarNames(collections).map((collection) => ({
+            id: `${connectionId}:__vector_collection:${collection}`,
+            label: collection,
+            type: "vector-collection" as const,
             connectionId,
             database: "default",
             isExpanded: false,
@@ -1249,6 +1350,116 @@ export const useConnectionStore = defineStore("connection", () => {
       node.isExpanded = true;
     } catch (e) {
       recordMetadataLoadError(connectionId, e);
+      throw e;
+    } finally {
+      node.isLoading = false;
+    }
+  }
+
+  async function loadSqlServerLinkedServers(connectionId: string, options?: LoadTreeOptions) {
+    const node = findNode(treeNodes.value, sqlServerLinkedRootId(connectionId));
+    if (!node) return;
+    node.isLoading = true;
+    try {
+      await ensureConnected(connectionId);
+      if (useCachedChildren(node, options)) return;
+      const config = getConfig(connectionId);
+      const database = sqlServerLinkedRuntimeDatabase(config);
+      const linkedServers = await api.listSqlServerLinkedServers(connectionId);
+      setChildren(
+        node,
+        linkedServers.map((server) => ({
+          id: sqlServerLinkedServerId(connectionId, server.name),
+          label: server.name,
+          type: "linked-server" as const,
+          connectionId,
+          database,
+          linkedServer: server.name,
+          comment: [server.product, server.provider, server.data_source].filter(Boolean).join(" / ") || null,
+          isExpanded: false,
+          children: [],
+        })),
+      );
+      node.isExpanded = true;
+    } catch (e) {
+      recordMetadataLoadError(connectionId, e);
+      throw e;
+    } finally {
+      node.isLoading = false;
+    }
+  }
+
+  async function loadSqlServerLinkedServerCatalogs(node: TreeNode, options?: LoadTreeOptions) {
+    if (!node.connectionId || !node.linkedServer) return;
+    const connectionId = node.connectionId;
+    const server = node.linkedServer;
+    node.isLoading = true;
+    try {
+      await ensureConnected(connectionId);
+      if (useCachedChildren(node, options)) return;
+      const catalogs = await api.listSqlServerLinkedServerCatalogs(connectionId, server);
+      const database = node.database || sqlServerLinkedRuntimeDatabase(getConfig(connectionId));
+      setChildren(
+        node,
+        catalogs
+          .filter((catalog) => catalog.name.trim())
+          .map((catalog) => ({
+            id: sqlServerLinkedCatalogId(connectionId, server, catalog.name),
+            label: catalog.name,
+            type: "linked-server-catalog" as const,
+            connectionId,
+            database,
+            linkedServer: server,
+            linkedCatalog: catalog.name,
+            isExpanded: false,
+            children: [],
+          })),
+      );
+      node.isExpanded = true;
+    } catch (e) {
+      recordMetadataLoadError(connectionId, e);
+      throw e;
+    } finally {
+      node.isLoading = false;
+    }
+  }
+
+  async function loadSqlServerLinkedServerSchemas(node: TreeNode, options?: LoadTreeOptions) {
+    if (!node.connectionId || !node.linkedServer || !node.linkedCatalog) return;
+    node.isLoading = true;
+    try {
+      await ensureConnected(node.connectionId);
+      if (useCachedChildren(node, options)) return;
+      const schemas = await api.listSqlServerLinkedServerSchemas(node.connectionId, node.linkedServer, node.linkedCatalog);
+      const database = node.database || sqlServerLinkedRuntimeDatabase(getConfig(node.connectionId));
+      setChildren(
+        node,
+        sortSidebarNames(schemas)
+          .filter((schema) => schema.trim())
+          .map((schema) => {
+            const encodedSchema = encodeSqlServerLinkedSchema({
+              server: node.linkedServer!,
+              catalog: node.linkedCatalog!,
+              schema,
+            });
+            return {
+              id: `${node.connectionId}:${database}:${encodedSchema}`,
+              label: schema,
+              type: "linked-server-schema" as const,
+              connectionId: node.connectionId,
+              database,
+              schema: encodedSchema,
+              linkedServer: node.linkedServer,
+              linkedCatalog: node.linkedCatalog,
+              linkedSchema: schema,
+              isExpanded: false,
+              children: [],
+            };
+          }),
+      );
+      node.isExpanded = true;
+    } catch (e) {
+      recordMetadataLoadError(node.connectionId, e);
       throw e;
     } finally {
       node.isLoading = false;
@@ -1396,7 +1607,8 @@ export const useConnectionStore = defineStore("connection", () => {
         pageSize: node.loadMore.pageSize,
       });
       const currentChildren = withoutLoadMoreNodes(parent.children);
-      const nextChildren = page.hasMore ? [...currentChildren, ...page.children, buildLoadMoreNode(parent, page.nextOffset, node.loadMore.pageSize)] : [...currentChildren, ...page.children];
+      const mergedChildren = mergeTableTreePageChildren(currentChildren, page.children, parent.connectionId, parent.database);
+      const nextChildren = page.hasMore ? [...mergedChildren, buildLoadMoreNode(parent, page.nextOffset, node.loadMore.pageSize)] : mergedChildren;
       parent.objectCount = (parent.objectCount ?? currentChildren.length) + page.objectCount;
       setChildren(parent, nextChildren);
       await savePersistedTreeChildren(objectGroupCacheKey(parent), nextChildren);
@@ -1435,7 +1647,7 @@ export const useConnectionStore = defineStore("connection", () => {
 
     const config = getConfig(connectionId);
     const metadataCapabilities = getTableMetadataCapabilities(effectiveDatabaseTypeForConnection(config));
-    if (node.type === "table") {
+    if (node.type === "table" && !parseSqlServerLinkedSchema(schema)) {
       if (metadataCapabilities.indexes) {
         children.push({
           id: `${parentId}:__indexes`,
@@ -1646,6 +1858,8 @@ export const useConnectionStore = defineStore("connection", () => {
         await loadMongoDatabases(node.connectionId);
       } else if (config?.db_type === "elasticsearch") {
         await loadElasticsearchIndices(node.connectionId);
+      } else if (config?.db_type === "qdrant" || config?.db_type === "milvus") {
+        await loadVectorCollections(node.connectionId);
       } else if (config?.db_type === "mq") {
         await loadMqTenants(node.connectionId, options);
       } else {
@@ -1664,6 +1878,14 @@ export const useConnectionStore = defineStore("connection", () => {
         await loadTables(node.connectionId, node.database, undefined, options);
       }
     } else if (node.type === "schema" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.schema) {
+      await loadTables(node.connectionId, node.database, node.schema, options);
+    } else if (node.type === "linked-server-root" && node.connectionId) {
+      await loadSqlServerLinkedServers(node.connectionId, options);
+    } else if (node.type === "linked-server" && node.connectionId) {
+      await loadSqlServerLinkedServerCatalogs(node, options);
+    } else if (node.type === "linked-server-catalog" && node.connectionId) {
+      await loadSqlServerLinkedServerSchemas(node, options);
+    } else if (node.type === "linked-server-schema" && node.connectionId && hasTreeNodeDatabaseContext(node) && node.schema) {
       await loadTables(node.connectionId, node.database, node.schema, options);
     } else if ((node.type === "table" || node.type === "view" || node.type === "materialized_view") && node.connectionId && hasTreeNodeDatabaseContext(node)) {
       await loadTableGroups(node.connectionId, node.database, node.label, node.schema, node.id);
@@ -2043,7 +2265,7 @@ export const useConnectionStore = defineStore("connection", () => {
                   return tables.map((table) => ({
                     name: table.name,
                     schema: s,
-                    type: table.table_type === "VIEW" || table.table_type === "MATERIALIZED VIEW" ? ("view" as const) : ("table" as const),
+                    type: table.table_type === "VIEW" || table.table_type === "MATERIALIZED_VIEW" ? ("view" as const) : ("table" as const),
                   })) as SqlCompletionTable[];
                 } catch {
                   return [] as SqlCompletionTable[];
@@ -2065,7 +2287,7 @@ export const useConnectionStore = defineStore("connection", () => {
                     return tables.map((table) => ({
                       name: table.name,
                       schema: s,
-                      type: table.table_type === "VIEW" || table.table_type === "MATERIALIZED VIEW" ? ("view" as const) : ("table" as const),
+                      type: table.table_type === "VIEW" || table.table_type === "MATERIALIZED_VIEW" ? ("view" as const) : ("table" as const),
                     })) as SqlCompletionTable[];
                   } catch {
                     return [] as SqlCompletionTable[];
@@ -2092,7 +2314,7 @@ export const useConnectionStore = defineStore("connection", () => {
               return tables.map((table) => ({
                 name: table.name,
                 schema,
-                type: table.table_type === "VIEW" || table.table_type === "MATERIALIZED VIEW" ? ("view" as const) : ("table" as const),
+                type: table.table_type === "VIEW" || table.table_type === "MATERIALIZED_VIEW" ? ("view" as const) : ("table" as const),
               }));
             } catch {
               return [];
@@ -2111,7 +2333,7 @@ export const useConnectionStore = defineStore("connection", () => {
       }
       completionTablesCache.value[cacheKey] = tables.map((table) => ({
         name: table.name,
-        type: table.table_type === "VIEW" || table.table_type === "MATERIALIZED VIEW" ? ("view" as const) : ("table" as const),
+        type: table.table_type === "VIEW" || table.table_type === "MATERIALIZED_VIEW" ? ("view" as const) : ("table" as const),
       }));
       completionTablesCache.value[cacheKey] = limit ? completionTablesCache.value[cacheKey].slice(0, limit) : completionTablesCache.value[cacheKey];
       indexCompletionTables(connectionId, database, schema, completionTablesCache.value[cacheKey]);
@@ -2783,9 +3005,13 @@ export const useConnectionStore = defineStore("connection", () => {
     updateRedisDbKeyStats,
     loadMongoDatabases,
     loadElasticsearchIndices,
+    loadVectorCollections,
     loadMongoCollections,
     loadSchemas,
     loadSqlServerDatabaseObjects,
+    loadSqlServerLinkedServers,
+    loadSqlServerLinkedServerCatalogs,
+    loadSqlServerLinkedServerSchemas,
     loadTables,
     loadObjectGroupChildren,
     loadMoreObjectGroupChildren,

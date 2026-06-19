@@ -135,6 +135,7 @@ const defaultForm = (): ConnectionForm => ({
   redis_key_separator: ":",
   etcd_endpoints: "",
   gbase_server: "",
+  informix_server: "",
   external_config: undefined,
   read_only: false,
   visible_databases: undefined,
@@ -154,6 +155,7 @@ function defaultSshTunnel(): SshTunnelConfig {
     connect_timeout_secs: 5,
     expose_lan: false,
     use_ssh_agent: false,
+    ssh_agent_sock_path: "",
   };
 }
 
@@ -171,6 +173,7 @@ function normalizeSshTunnel(hop: Partial<SshTunnelConfig>): SshTunnelConfig {
     connect_timeout_secs: Number(hop.connect_timeout_secs) || 5,
     expose_lan: !!hop.expose_lan,
     use_ssh_agent: !!hop.use_ssh_agent,
+    ssh_agent_sock_path: hop.ssh_agent_sock_path || "",
   };
 }
 
@@ -247,6 +250,7 @@ function sshLayersForConfig(config: LegacyConnectionConfig): SshTunnelConfig[] {
         connect_timeout_secs: config.ssh_connect_timeout_secs || 5,
         expose_lan: config.ssh_expose_lan || false,
         use_ssh_agent: false,
+        ssh_agent_sock_path: "",
       }),
     ];
   }
@@ -403,6 +407,8 @@ const driverProfiles: Record<
     label: "Elasticsearch",
     icon: "elasticsearch",
   },
+  qdrant: { type: "qdrant", port: 6333, user: "", label: "Qdrant", icon: "qdrant" },
+  milvus: { type: "milvus", port: 19530, user: "root", label: "Milvus", icon: "milvus" },
   mariadb: { type: "mysql", port: 3306, user: "root", label: "MariaDB", icon: "mariadb" },
   tidb: { type: "mysql", port: 4000, user: "root", label: "TiDB", icon: "tidb" },
   oceanbase: { type: "mysql", port: 2881, user: "root", label: "OceanBase", icon: "oceanbase" },
@@ -736,6 +742,7 @@ watch(
         redis_cluster_nodes: config.redis_cluster_nodes || "",
         redis_key_separator: config.redis_key_separator ?? ":",
         etcd_endpoints: config.etcd_endpoints || "",
+        informix_server: config.informix_server || "",
         read_only: config.read_only || false,
         visible_databases: config.visible_databases,
       };
@@ -865,6 +872,8 @@ const iconTypeMap: Record<string, string> = {
   sqlserver: "sqlserver",
   oracle: "oracle",
   elasticsearch: "elasticsearch",
+  qdrant: "qdrant",
+  milvus: "milvus",
   mariadb: "mariadb",
   tidb: "tidb",
   oceanbase: "oceanbase",
@@ -928,6 +937,8 @@ const dbOptions: DbOption[] = [
   { value: "sqlite", label: "SQLite" },
   { value: "sqlserver", label: "SQL Server" },
   { value: "elasticsearch", label: "Elasticsearch" },
+  { value: "qdrant", label: "Qdrant" },
+  { value: "milvus", label: "Milvus" },
   { value: "dm", label: "DM (Dameng)" },
   { value: "opengauss", label: "openGauss" },
   { value: "turso", label: "Turso" },
@@ -1029,7 +1040,7 @@ const sqliteExtensionPaths = computed({
     form.value.url_params = setSqliteExtensionPaths(form.value.url_params, value);
   },
 });
-const tlsCapableDatabaseTypes = new Set<DatabaseType>(["mysql", "postgres", "redshift", "gaussdb", "kwdb", "opengauss", "questdb", "redis", "etcd", "clickhouse", "elasticsearch", "influxdb"]);
+const tlsCapableDatabaseTypes = new Set<DatabaseType>(["mysql", "postgres", "redshift", "gaussdb", "kwdb", "opengauss", "questdb", "redis", "etcd", "clickhouse", "elasticsearch", "qdrant", "milvus", "influxdb"]);
 const supportsTlsToggle = computed(() => tlsCapableDatabaseTypes.has(form.value.db_type));
 const supportsCaCertificatePath = computed(() => form.value.db_type === "clickhouse");
 const supportsGenericUrlParams = computed(() => form.value.db_type !== "manticoresearch");
@@ -1254,6 +1265,13 @@ function connectionConfigForSubmit(id: string): ConnectionConfig {
   config.keepalive_interval_secs = Number.isFinite(keepaliveInterval) && keepaliveInterval >= 0 ? keepaliveInterval : 0;
   if (config.db_type === "manticoresearch") {
     config.url_params = "";
+  }
+  if (config.db_type === "informix" && config.informix_server) {
+    // Strip INFORMIXSERVER from url_params to avoid duplicate when dedicated field is used
+    config.url_params = (config.url_params || "")
+      .replace(/(?:^|[;])\s*INFORMIXSERVER\s*=[^;]*/gi, "")
+      .replace(/^[;]|[;]$/g, "")
+      .trim();
   }
   if (!config.one_time) config.one_time = undefined;
   if (!config.read_only) config.read_only = undefined;
@@ -2973,6 +2991,11 @@ function openExternalUrl(url: string) {
                     <Input v-model="form.gbase_server" class="col-span-3" placeholder="gbase01" />
                   </div>
 
+                  <div v-if="form.db_type === 'informix'" class="grid grid-cols-4 items-center gap-4">
+                    <Label class="text-right text-xs">{{ t("connection.informixServer") }}</Label>
+                    <Input v-model="form.informix_server" class="col-span-3" placeholder="ol_informix1170" />
+                  </div>
+
                   <div class="grid grid-cols-4 items-center gap-4">
                     <Label class="text-right">{{ t("connection.user") }}</Label>
                     <Input v-model="form.username" class="col-span-3" />
@@ -3043,7 +3066,7 @@ function openExternalUrl(url: string) {
                               : form.db_type === 'bigquery'
                                 ? 'OAuthType=0;OAuthServiceAcctEmail=svc@project.iam.gserviceaccount.com;OAuthPvtKeyPath=/path/key.json'
                                 : form.db_type === 'informix'
-                                  ? 'INFORMIXSERVER=informix;CLIENT_LOCALE=en_US.utf8;DB_LOCALE=en_US.utf8'
+                                  ? 'CLIENT_LOCALE=en_US.utf8;DB_LOCALE=en_US.utf8'
                                   : 'sslmode=disable'
                       "
                     />
@@ -3462,6 +3485,10 @@ function openExternalUrl(url: string) {
                         <input type="checkbox" v-model="selectedSshLayer.use_ssh_agent" class="mr-0" :disabled="selectedSshLayer.enabled === false" />
                         <span class="text-xs text-muted-foreground">{{ t("connection.sshUseAgent") }}</span>
                       </label>
+                    </div>
+                    <div v-if="selectedSshLayer.use_ssh_agent" class="grid grid-cols-4 items-center gap-4">
+                      <Label class="text-right text-xs">{{ t("connection.sshAgentSockPath") }}</Label>
+                      <Input v-model="selectedSshLayer.ssh_agent_sock_path" class="col-span-3" :placeholder="t('connection.sshAgentSockPathPlaceholder')" :disabled="selectedSshLayer.enabled === false" />
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <span />

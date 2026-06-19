@@ -213,6 +213,7 @@ mod tests {
             redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
+            informix_server: String::new(),
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
@@ -547,7 +548,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
             }
             DatabaseType::Redis => {
                 let con = if config.uses_redis_cluster() {
-                    db::redis_driver::connect_cluster(&config).await?;
+                    state.connect_redis_cluster(&tunnel_id, &config).await?;
                     return Ok("Connection successful".to_string());
                 } else if config.uses_redis_sentinel() {
                     db::redis_driver::connect_sentinel(&config).await?
@@ -641,6 +642,24 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     connect_timeout,
                 );
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout)
+                    .await
+                    .map(|_| "Connection successful".to_string())
+            }
+            DatabaseType::Qdrant | DatabaseType::Milvus => {
+                let kind = match config.db_type {
+                    DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
+                    DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
+                    _ => unreachable!(),
+                };
+                let client = db::vector_driver::VectorClient::new(
+                    kind,
+                    &url,
+                    Some(&config.username),
+                    Some(&config.password),
+                    config.ssl,
+                    connect_timeout,
+                );
+                db::vector_driver::test_connection(&client, connect_timeout)
                     .await
                     .map(|_| "Connection successful".to_string())
             }
@@ -778,7 +797,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         DatabaseType::Redis => {
             let con = if db_config.uses_redis_cluster() {
                 PoolKind::Redis(db::redis_driver::RedisConnection::Cluster(
-                    db::redis_driver::connect_cluster(&db_config).await?,
+                    state.connect_redis_cluster(&id, &db_config).await?,
                 ))
             } else if db_config.uses_redis_sentinel() {
                 PoolKind::Redis(db::redis_driver::RedisConnection::Direct(tokio::sync::Mutex::new(
@@ -884,6 +903,23 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             );
             db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
             PoolKind::Elasticsearch(client)
+        }
+        DatabaseType::Qdrant | DatabaseType::Milvus => {
+            let kind = match db_config.db_type {
+                DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
+                DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
+                _ => unreachable!(),
+            };
+            let client = db::vector_driver::VectorClient::new(
+                kind,
+                &url,
+                Some(&db_config.username),
+                Some(&db_config.password),
+                db_config.ssl,
+                connect_timeout,
+            );
+            db::vector_driver::test_connection(&client, connect_timeout).await?;
+            PoolKind::VectorDb(client)
         }
         DatabaseType::Rqlite => {
             let client = db::rqlite_driver::RqliteClient::new(

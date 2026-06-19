@@ -3,8 +3,10 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ConnectionConfig,
   DatabaseInfo,
+  LinkedServerInfo,
   TableInfo,
   ObjectInfo,
+  ObjectStatistics,
   ObjectSource,
   ObjectSourceKind,
   ColumnInfo,
@@ -129,6 +131,7 @@ export interface DesktopSettings {
   driver_store_dir?: string | null;
   plugin_store_dir?: string | null;
   agent_store_dir?: string | null;
+  sidebar_table_page_size?: number | null;
 }
 
 export interface SavedSqlSyncEntry {
@@ -474,6 +477,22 @@ export async function listDatabases(connectionId: string): Promise<DatabaseInfo[
   return invoke("list_databases", { connectionId });
 }
 
+export async function listSqlServerLinkedServers(connectionId: string): Promise<LinkedServerInfo[]> {
+  return invoke("list_sqlserver_linked_servers", { connectionId });
+}
+
+export async function listSqlServerLinkedServerCatalogs(connectionId: string, server: string): Promise<DatabaseInfo[]> {
+  return invoke("list_sqlserver_linked_server_catalogs", { connectionId, server });
+}
+
+export async function listSqlServerLinkedServerSchemas(connectionId: string, server: string, catalog: string): Promise<string[]> {
+  return invoke("list_sqlserver_linked_server_schemas", { connectionId, server, catalog });
+}
+
+export async function listSqlServerLinkedServerTables(connectionId: string, server: string, catalog: string, schema: string, filter?: string, limit?: number, offset?: number): Promise<TableInfo[]> {
+  return invoke("list_sqlserver_linked_server_tables", { connectionId, server, catalog, schema, filter, limit, offset });
+}
+
 export async function saveSchemaCache(cacheKey: string, payload: unknown): Promise<void> {
   return invoke("save_schema_cache", { cacheKey, payload });
 }
@@ -486,12 +505,16 @@ export async function deleteSchemaCachePrefix(prefix: string): Promise<void> {
   return invoke("delete_schema_cache_prefix", { prefix });
 }
 
-export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number): Promise<TableInfo[]> {
-  return invoke("list_tables", { connectionId, database, schema, filter, limit, offset });
+export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number, objectTypes?: SidebarObjectKind[]): Promise<TableInfo[]> {
+  return invoke("list_tables", { connectionId, database, schema, filter, limit, offset, objectTypes });
 }
 
 export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[]): Promise<ObjectInfo[]> {
   return invoke("list_objects", { connectionId, database, schema, objectTypes });
+}
+
+export async function listObjectStatistics(connectionId: string, database: string, schema: string): Promise<ObjectStatistics[]> {
+  return invoke("list_object_statistics", { connectionId, database, schema });
 }
 
 export async function listCompletionObjects(connectionId: string, database: string, schema: string): Promise<ObjectInfo[]> {
@@ -787,8 +810,8 @@ export async function listTriggers(connectionId: string, database: string, schem
   return invoke("list_triggers", { connectionId, database, schema, table });
 }
 
-export async function getTableDdl(connectionId: string, database: string, schema: string, table: string): Promise<string> {
-  return invoke("get_table_ddl", { connectionId, database, schema, table });
+export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind): Promise<string> {
+  return invoke("get_table_ddl", { connectionId, database, schema, table, objectType });
 }
 
 export async function prepareSchemaDiff(options: SchemaDiffPreparationOptions): Promise<SchemaDiffPreparation> {
@@ -1282,6 +1305,10 @@ export async function elasticsearchListIndices(connectionId: string): Promise<st
   return mongoListCollections(connectionId, "default");
 }
 
+export async function vectorListCollections(connectionId: string): Promise<string[]> {
+  return mongoListCollections(connectionId, "default");
+}
+
 export async function mongoFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, sort?: string, executionId?: string): Promise<MongoDocumentResult> {
   return invoke("mongo_find_documents", { connectionId, database, collection, skip, limit, filter, sort, executionId });
 }
@@ -1426,6 +1453,7 @@ export async function listenSqlFileProgress(handler: (progress: SqlFileProgress)
 
 // --- Data Transfer ---
 export type TransferMode = "append" | "overwrite" | "upsert";
+export type TransferTableNameCase = "preserve" | "lower" | "upper";
 
 export interface TransferRequest {
   transferId: string;
@@ -1438,6 +1466,7 @@ export interface TransferRequest {
   tables: string[];
   createTable: boolean;
   mode: TransferMode;
+  targetTableNameCase: TransferTableNameCase;
   batchSize: number;
 }
 
@@ -1477,6 +1506,24 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
 
 export async function cancelTransfer(transferId: string): Promise<void> {
   return invoke("cancel_transfer", { transferId });
+}
+
+export interface SortTablesByFkOptions {
+  connectionId: string;
+  database: string;
+  schema: string;
+  tables: string[];
+  parentsFirst: boolean;
+}
+
+export async function sortTablesByFkDependency(options: SortTablesByFkOptions): Promise<string[]> {
+  return invoke("sort_tables_by_fk_dependency", {
+    connectionId: options.connectionId,
+    database: options.database,
+    schema: options.schema,
+    tables: options.tables,
+    parentsFirst: options.parentsFirst,
+  });
 }
 
 // --- Table File Import ---
@@ -1702,6 +1749,15 @@ export async function exportQueryResultXlsx(filePath: string, sheetName: string 
       sheetName,
       columns,
       rows,
+    },
+  });
+}
+
+export async function exportQueryResultsXlsx(filePath: string, worksheets: readonly { sheetName?: string; columns: string[]; rows: readonly (readonly XlsxCellValue[])[] }[]): Promise<void> {
+  return invoke("export_query_results_xlsx", {
+    request: {
+      filePath,
+      worksheets,
     },
   });
 }

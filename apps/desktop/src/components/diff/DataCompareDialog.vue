@@ -114,7 +114,7 @@ const showModified = ref(true);
 
 let syncPlanRequestId = 0;
 
-const sqlConnections = computed(() => store.connections.filter((connection) => !["redis", "mongodb", "elasticsearch", "etcd"].includes(connection.db_type)));
+const sqlConnections = computed(() => store.connections.filter((connection) => !["redis", "mongodb", "elasticsearch", "qdrant", "milvus", "etcd"].includes(connection.db_type)));
 const selectedSourceTableNames = computed(() => sourceTables.value.filter((table) => selectedSourceTables.value.has(table)));
 const isBatchCompare = computed(() => selectedSourceTableNames.value.length > 1);
 const filteredSourceTables = computed(() => {
@@ -357,7 +357,7 @@ async function loadTables(side: "source" | "target") {
   const database = side === "source" ? sourceDatabase.value : targetDatabase.value;
   if (!connectionId || !database) return;
   const schema = side === "source" ? sourceSchema.value || (await resolveSchema(connectionId, database, props.prefillSchema)) : targetSchema.value || (await resolveSchema(connectionId, database));
-  const tables = (await api.listTables(connectionId, database, schema)).filter((table) => table.table_type !== "VIEW" && table.table_type !== "MATERIALIZED VIEW").map((table) => table.name);
+  const tables = (await api.listTables(connectionId, database, schema)).filter((table) => table.table_type !== "VIEW" && table.table_type !== "MATERIALIZED_VIEW").map((table) => table.name);
 
   if (side === "source") {
     const preferredSelection = props.prefillTable && tables.includes(props.prefillTable) ? [props.prefillTable] : [...selectedSourceTables.value].filter((table) => tables.includes(table));

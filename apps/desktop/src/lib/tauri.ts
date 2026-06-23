@@ -1,4 +1,4 @@
-﻿import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ConnectionConfig,
@@ -126,6 +126,8 @@ export interface DriverRuntimeSummary {
 export interface DesktopSettings {
   show_tray_icon: boolean;
   icon_theme: "default" | "black";
+  quit_on_close: boolean;
+  close_action_prompted: boolean;
   debug_logging_enabled: boolean;
   saved_sql_sync_dir?: string | null;
   driver_store_dir?: string | null;
@@ -342,6 +344,8 @@ export interface DriverStoreMigrationResult {
   driver_store_dir: string | null;
   plugin_store_dir: string | null;
   agent_store_dir: string | null;
+  plugins_dir: string;
+  agents_dir: string;
   migrated_plugins: boolean;
   migrated_agents: boolean;
 }
@@ -469,6 +473,10 @@ export async function disconnectDb(connectionId: string): Promise<void> {
   return invoke("disconnect_db", { connectionId });
 }
 
+export async function checkConnectionHealth(connectionId: string): Promise<void> {
+  return invoke("check_connection_health", { connectionId });
+}
+
 export async function closeDatabaseConnection(connectionId: string, database: string): Promise<boolean> {
   return invoke("close_database_connection", { connectionId, database });
 }
@@ -507,6 +515,10 @@ export async function deleteSchemaCachePrefix(prefix: string): Promise<void> {
 
 export async function listTables(connectionId: string, database: string, schema: string, filter?: string, limit?: number, offset?: number, objectTypes?: SidebarObjectKind[]): Promise<TableInfo[]> {
   return invoke("list_tables", { connectionId, database, schema, filter, limit, offset, objectTypes });
+}
+
+export async function getTableComment(connectionId: string, database: string, schema: string, table: string): Promise<string | null> {
+  return invoke("get_table_comment", { connectionId, database, schema, table });
 }
 
 export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: SidebarObjectKind[]): Promise<ObjectInfo[]> {
@@ -891,6 +903,10 @@ export async function installJdbcDriverFromMaven(coordinate: string, repositorie
   return invoke("install_jdbc_driver_from_maven", { request: { coordinate, repositories } });
 }
 
+export async function installPrestoSqlJdbcDriver(): Promise<JdbcDriverInfo[]> {
+  return invoke("install_prestosql_jdbc_driver");
+}
+
 export async function deleteJdbcDriver(path: string): Promise<JdbcDriverInfo[]> {
   return invoke("delete_jdbc_driver", { path });
 }
@@ -1151,8 +1167,8 @@ export async function redisScanKeys(connectionId: string, db: number, cursor: nu
   return invoke("redis_scan_keys", { connectionId, db, cursor, pattern, count });
 }
 
-export async function redisScanKeysBatch(connectionId: string, db: number, cursor: number, pattern: string, count: number, maxIterations: number): Promise<RedisScanResult> {
-  return invoke("redis_scan_keys_batch", { connectionId, db, cursor, pattern, count, maxIterations });
+export async function redisScanKeysBatch(connectionId: string, db: number, cursor: number, pattern: string, count: number, maxIterations: number, includeTypes = true): Promise<RedisScanResult> {
+  return invoke("redis_scan_keys_batch", { connectionId, db, cursor, pattern, count, maxIterations, includeTypes });
 }
 
 export async function redisScanValues(connectionId: string, db: number, cursor: number, pattern: string, query: string, count: number, includeKeyMatches = false): Promise<RedisScanResult> {

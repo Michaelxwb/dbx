@@ -9,13 +9,15 @@ use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvi
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::ParsedCertificate;
 use std::fs::File;
+use std::future::Future;
 use std::io::BufReader;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_postgres::config::SslMode;
 use tokio_postgres::types::{FromSql, Type};
-use tokio_postgres::{Row, SimpleQueryMessage};
+use tokio_postgres::{NoTls, Row, SimpleQueryMessage};
+use tokio_util::sync::CancellationToken;
 
 use super::file_validator::validate_file_path;
 use crate::sql::starts_with_executable_sql_keyword;
@@ -590,7 +592,7 @@ pub async fn connect(url: &str, fallback_timeout: Duration) -> Result<Pool, Stri
             mgr_config,
         );
         let pool = Pool::builder(mgr)
-            .max_size(4)
+            .max_size(10)
             .runtime(Runtime::Tokio1)
             .wait_timeout(Some(timeout))
             .build()
@@ -962,6 +964,22 @@ pub async fn list_tables_filtered(
         .collect())
 }
 
+pub async fn get_table_comment(pool: &Pool, schema: &str, table: &str) -> Result<Option<String>, String> {
+    let schema = if schema.is_empty() { "public" } else { schema };
+    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let stmt = client.prepare_cached(postgres_table_comment_sql()).await.map_err(|e| e.to_string())?;
+    let rows = client.query(&stmt, &[&schema, &table]).await.map_err(|e| e.to_string())?;
+    Ok(rows.first().and_then(|row| row.try_get::<_, Option<String>>(0).ok().flatten()).filter(|s| !s.is_empty()))
+}
+
+fn postgres_table_comment_sql() -> &'static str {
+    "SELECT obj_description(c.oid) AS table_comment \
+     FROM pg_catalog.pg_class c \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','m','f','p') \
+     LIMIT 1"
+}
+
 fn postgres_tables_sql() -> &'static str {
     "SELECT c.relname AS table_name, \
          CASE c.relkind WHEN 'r' THEN 'BASE TABLE' WHEN 'v' THEN 'VIEW' \
@@ -976,7 +994,7 @@ fn postgres_tables_sql() -> &'static str {
          LEFT JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent \
          LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
          WHERE n.nspname = $1 AND c.relkind IN ('r','v','m','f','p') \
-           AND ($2 = '%%' OR c.relname ILIKE $2 ESCAPE '\\') \
+           AND ($2 = '%%' OR c.relname ILIKE $2 ESCAPE '~') \
          ORDER BY c.relname \
          LIMIT $3 OFFSET $4"
 }
@@ -989,8 +1007,8 @@ fn like_contains_pattern(value: &str) -> String {
     let mut pattern = String::with_capacity(value.len() + 2);
     pattern.push('%');
     for ch in value.chars() {
-        if ch == '\\' || ch == '%' || ch == '_' {
-            pattern.push('\\');
+        if ch == '~' || ch == '%' || ch == '_' {
+            pattern.push('~');
         }
         pattern.push(ch);
     }
@@ -1330,6 +1348,24 @@ pub async fn execute_query_with_max_rows(
     }
 }
 
+pub async fn execute_query_with_max_rows_and_cancel(
+    pool: &Pool,
+    sql: &str,
+    max_rows: Option<usize>,
+    cancel_token: Option<CancellationToken>,
+    timeout_duration: Option<Duration>,
+) -> Result<QueryResult, String> {
+    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let pg_cancel_token = client.cancel_token();
+    wait_postgres_query(
+        pg_cancel_token,
+        cancel_token,
+        timeout_duration,
+        execute_query_with_max_rows_inner(&client, sql, max_rows),
+    )
+    .await
+}
+
 pub async fn execute_query_with_schema(pool: &Pool, schema: &str, sql: &str) -> Result<QueryResult, String> {
     execute_query_with_schema_and_max_rows(pool, schema, sql, None).await
 }
@@ -1387,6 +1423,131 @@ pub async fn execute_query_with_schema_and_max_rows(
     );
 
     result
+}
+
+pub async fn execute_query_with_schema_and_max_rows_and_cancel(
+    pool: &Pool,
+    schema: &str,
+    sql: &str,
+    max_rows: Option<usize>,
+    cancel_token: Option<CancellationToken>,
+    timeout_duration: Option<Duration>,
+) -> Result<QueryResult, String> {
+    let start = Instant::now();
+    let checkout_start = Instant::now();
+    let client = pool.get().await.map_err(|e| e.to_string())?;
+    log::info!(
+        "[postgres][execute_with_schema:pool:done] elapsed_ms={} total_ms={} schema={}",
+        checkout_start.elapsed().as_millis(),
+        start.elapsed().as_millis(),
+        schema
+    );
+    if is_transaction_recovery_statement(sql) {
+        log::info!(
+            "[postgres][execute_with_schema:skip-search-path] total_ms={} reason=transaction-recovery",
+            start.elapsed().as_millis()
+        );
+        let pg_cancel_token = client.cancel_token();
+        return wait_postgres_query(
+            pg_cancel_token,
+            cancel_token,
+            timeout_duration,
+            execute_query_with_max_rows_inner(&client, sql, max_rows),
+        )
+        .await;
+    }
+
+    let set_schema_start = Instant::now();
+    client.execute(&format!("SET search_path TO {}", pg_quote_ident(schema)), &[]).await.map_err(pg_error_to_string)?;
+    log::info!(
+        "[postgres][execute_with_schema:set-search-path:done] elapsed_ms={} total_ms={}",
+        set_schema_start.elapsed().as_millis(),
+        start.elapsed().as_millis()
+    );
+
+    let query_start = Instant::now();
+    let pg_cancel_token = client.cancel_token();
+    let result = wait_postgres_query(
+        pg_cancel_token,
+        cancel_token,
+        timeout_duration,
+        execute_query_with_max_rows_inner(&client, sql, max_rows),
+    )
+    .await;
+    if result.is_ok() {
+        clear_postgres_caches_after_ddl(pool, Some(&client), sql);
+    }
+    log::info!(
+        "[postgres][execute_with_schema:query:done] elapsed_ms={} total_ms={} ok={}",
+        query_start.elapsed().as_millis(),
+        start.elapsed().as_millis(),
+        result.is_ok()
+    );
+
+    let reset_start = Instant::now();
+    let _ = client.execute("RESET search_path", &[]).await;
+    log::info!(
+        "[postgres][execute_with_schema:reset-search-path:done] elapsed_ms={} total_ms={}",
+        reset_start.elapsed().as_millis(),
+        start.elapsed().as_millis()
+    );
+
+    result
+}
+
+async fn wait_postgres_query<T, F>(
+    pg_cancel_token: tokio_postgres::CancelToken,
+    cancel_token: Option<CancellationToken>,
+    timeout_duration: Option<Duration>,
+    future: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    match (cancel_token, timeout_duration) {
+        (Some(token), Some(duration)) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    cancel_postgres_query(pg_cancel_token).await;
+                    Err(crate::query::canceled_error())
+                }
+                result = tokio::time::timeout(duration, future) => match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        cancel_postgres_query(pg_cancel_token).await;
+                        Err(format!("Query timed out after {} seconds", duration.as_secs()))
+                    }
+                },
+            }
+        }
+        (None, Some(duration)) => match tokio::time::timeout(duration, future).await {
+            Ok(result) => result,
+            Err(_) => {
+                cancel_postgres_query(pg_cancel_token).await;
+                Err(format!("Query timed out after {} seconds", duration.as_secs()))
+            }
+        },
+        (Some(token), None) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    cancel_postgres_query(pg_cancel_token).await;
+                    Err(crate::query::canceled_error())
+                }
+                result = future => result,
+            }
+        }
+        (None, None) => future.await,
+    }
+}
+
+async fn cancel_postgres_query(pg_cancel_token: tokio_postgres::CancelToken) {
+    match tokio::time::timeout(Duration::from_secs(2), pg_cancel_token.cancel_query(NoTls)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => log::warn!("Failed to send PostgreSQL cancel request: {err}"),
+        Err(_) => log::warn!("Timed out sending PostgreSQL cancel request"),
+    }
 }
 
 fn is_transaction_recovery_statement(sql: &str) -> bool {
@@ -2148,6 +2309,17 @@ mod tests {
     }
 
     #[test]
+    fn postgres_table_comment_sql_targets_single_table() {
+        let sql = postgres_table_comment_sql();
+
+        assert!(sql.contains("obj_description(c.oid)"));
+        assert!(sql.contains("n.nspname = $1"));
+        assert!(sql.contains("c.relname = $2"));
+        assert!(sql.contains("LIMIT 1"));
+        assert!(!sql.contains("ORDER BY"));
+    }
+
+    #[test]
     fn postgres_column_metadata_reads_identity_extra() {
         assert!(POSTGRES_COLUMNS_SQL.contains("a.attidentity"));
         assert!(POSTGRES_COLUMNS_SQL.contains("pg_sequence"));
@@ -2335,7 +2507,15 @@ mod tests {
     #[test]
     fn like_contains_pattern_escapes_wildcards() {
         assert_eq!(like_contains_pattern(""), "%%");
-        assert_eq!(like_contains_pattern("order_100%"), "%order\\_100\\%%");
-        assert_eq!(like_contains_pattern(r"foo\bar"), r"%foo\\bar%");
+        assert_eq!(like_contains_pattern("order_100%"), "%order~_100~%%");
+        assert_eq!(like_contains_pattern("tilde~name"), "%tilde~~name%");
+        assert_eq!(like_contains_pattern(r"foo\bar"), r"%foo\bar%");
+    }
+
+    #[test]
+    fn postgres_tables_sql_uses_non_backslash_like_escape() {
+        let sql = postgres_tables_sql();
+
+        assert!(sql.contains("ILIKE $2 ESCAPE '~'"));
     }
 }

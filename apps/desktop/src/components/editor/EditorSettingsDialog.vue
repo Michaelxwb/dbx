@@ -16,7 +16,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
+import { HelpTooltip, Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import {
   useSettingsStore,
   AI_PROVIDER_PRESETS,
@@ -102,10 +102,13 @@ const editCustomThemes = ref<CustomTheme[]>([...settingsStore.editorSettings.cus
 const editActiveCustomThemeId = ref(settingsStore.editorSettings.activeCustomThemeId);
 const showThemeCustomizer = ref(false);
 const editExecuteMode = ref(settingsStore.editorSettings.executeMode);
+const editShowExecutionTargetPicker = ref(settingsStore.editorSettings.showExecutionTargetPicker);
 const editWordWrap = ref(settingsStore.editorSettings.wordWrap);
 const editConfirmDangerousSqlExecution = ref(settingsStore.editorSettings.confirmDangerousSqlExecution);
 const editAppLayout = ref(settingsStore.editorSettings.appLayout);
 const editShowTrayIcon = ref(settingsStore.desktopSettings.show_tray_icon);
+const editQuitOnClose = ref(settingsStore.desktopSettings.quit_on_close);
+const desktopCloseBehaviorResetPending = ref(false);
 const editIconTheme = ref<DesktopIconTheme>(settingsStore.desktopSettings.icon_theme);
 const editDebugLoggingEnabled = ref(settingsStore.desktopSettings.debug_logging_enabled);
 const editSidebarTablePageSize = ref(settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE);
@@ -361,10 +364,12 @@ watch(
       editCustomThemes.value = [...settingsStore.editorSettings.customThemes];
       editActiveCustomThemeId.value = settingsStore.editorSettings.activeCustomThemeId;
       editExecuteMode.value = settingsStore.editorSettings.executeMode;
+      editShowExecutionTargetPicker.value = settingsStore.editorSettings.showExecutionTargetPicker;
       editWordWrap.value = settingsStore.editorSettings.wordWrap;
       editConfirmDangerousSqlExecution.value = settingsStore.editorSettings.confirmDangerousSqlExecution;
       editAppLayout.value = settingsStore.editorSettings.appLayout;
       editShowTrayIcon.value = settingsStore.desktopSettings.show_tray_icon;
+      editQuitOnClose.value = settingsStore.desktopSettings.quit_on_close;
       editIconTheme.value = settingsStore.desktopSettings.icon_theme;
       editDebugLoggingEnabled.value = settingsStore.desktopSettings.debug_logging_enabled;
       editSidebarTablePageSize.value = settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
@@ -417,10 +422,12 @@ function hasChanges(): boolean {
     JSON.stringify(editCustomThemes.value) !== JSON.stringify(settingsStore.editorSettings.customThemes) ||
     editActiveCustomThemeId.value !== settingsStore.editorSettings.activeCustomThemeId ||
     editExecuteMode.value !== settingsStore.editorSettings.executeMode ||
+    editShowExecutionTargetPicker.value !== settingsStore.editorSettings.showExecutionTargetPicker ||
     editWordWrap.value !== settingsStore.editorSettings.wordWrap ||
     editConfirmDangerousSqlExecution.value !== settingsStore.editorSettings.confirmDangerousSqlExecution ||
     editAppLayout.value !== settingsStore.editorSettings.appLayout ||
     editShowTrayIcon.value !== settingsStore.desktopSettings.show_tray_icon ||
+    editQuitOnClose.value !== settingsStore.desktopSettings.quit_on_close ||
     editIconTheme.value !== settingsStore.desktopSettings.icon_theme ||
     editDebugLoggingEnabled.value !== settingsStore.desktopSettings.debug_logging_enabled ||
     editSidebarTablePageSize.value !== (settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE) ||
@@ -458,6 +465,7 @@ async function persistSettings() {
     customThemes: editCustomThemes.value,
     activeCustomThemeId: editActiveCustomThemeId.value,
     executeMode: editExecuteMode.value,
+    showExecutionTargetPicker: editShowExecutionTargetPicker.value,
     wordWrap: editWordWrap.value,
     confirmDangerousSqlExecution: editConfirmDangerousSqlExecution.value,
     appLayout: editAppLayout.value,
@@ -484,10 +492,13 @@ async function persistSettings() {
   });
   await settingsStore.updateDesktopSettings({
     show_tray_icon: editShowTrayIcon.value,
+    quit_on_close: editQuitOnClose.value,
+    close_action_prompted: desktopCloseBehaviorResetPending.value ? false : true,
     icon_theme: editIconTheme.value,
     debug_logging_enabled: editDebugLoggingEnabled.value,
     sidebar_table_page_size: editSidebarTablePageSize.value,
   });
+  desktopCloseBehaviorResetPending.value = false;
   if (sidebarObjectDisplayChanged) {
     await connectionStore.refreshAllTree();
   }
@@ -502,7 +513,57 @@ async function applySettingsAndClose() {
   emit("update:open", false);
 }
 
-function resetDefaults() {
+function resetDefaultsForTab(tab: SettingsCategory) {
+  if (tab === "editor") {
+    editFontFamily.value = DEFAULT_EDITOR_SETTINGS.fontFamily;
+    editFontSize.value = DEFAULT_EDITOR_SETTINGS.fontSize;
+    editExecuteMode.value = DEFAULT_EDITOR_SETTINGS.executeMode;
+    editShowExecutionTargetPicker.value = DEFAULT_EDITOR_SETTINGS.showExecutionTargetPicker;
+    editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
+    editConfirmDangerousSqlExecution.value = DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution;
+  } else if (tab === "formatter") {
+    editSqlFormatter.value = normalizeSqlFormatterSettings(DEFAULT_EDITOR_SETTINGS.sqlFormatter);
+    sqlFormatterConfigValid.value = true;
+  } else if (tab === "appearance") {
+    editUiScale.value = DEFAULT_EDITOR_SETTINGS.uiScale;
+    editTheme.value = DEFAULT_EDITOR_SETTINGS.theme;
+    editCustomThemes.value = [...DEFAULT_EDITOR_SETTINGS.customThemes];
+    editActiveCustomThemeId.value = DEFAULT_EDITOR_SETTINGS.activeCustomThemeId;
+    editAppLayout.value = DEFAULT_EDITOR_SETTINGS.appLayout;
+    editShowTrayIcon.value = DEFAULT_DESKTOP_SETTINGS.show_tray_icon;
+    editQuitOnClose.value = DEFAULT_DESKTOP_SETTINGS.quit_on_close;
+    desktopCloseBehaviorResetPending.value = true;
+    editIconTheme.value = DEFAULT_DESKTOP_SETTINGS.icon_theme;
+    editDebugLoggingEnabled.value = DEFAULT_DESKTOP_SETTINGS.debug_logging_enabled;
+  } else if (tab === "navigation") {
+    editSidebarTablePageSize.value = DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
+    editSidebarActivation.value = DEFAULT_EDITOR_SETTINGS.sidebarActivation;
+    editSidebarObjectDisplay.value = DEFAULT_EDITOR_SETTINGS.sidebarObjectDisplay;
+    editAutoSelectActiveSidebarNode.value = DEFAULT_EDITOR_SETTINGS.autoSelectActiveSidebarNode;
+    editDisconnectTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
+    editReuseDataTab.value = DEFAULT_EDITOR_SETTINGS.reuseDataTab;
+    editUpdateNotificationsEnabled.value = DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled;
+    editSidebarHideTableComments.value = DEFAULT_EDITOR_SETTINGS.sidebarHideTableComments;
+    editSidebarAllowHorizontalScroll.value = DEFAULT_EDITOR_SETTINGS.sidebarAllowHorizontalScroll;
+    editSidebarHiddenTablePrefixes.value = DEFAULT_EDITOR_SETTINGS.sidebarHiddenTablePrefixes.join("\n");
+    editToolbarItems.value = { ...DEFAULT_EDITOR_SETTINGS.toolbarItems };
+  } else if (tab === "data") {
+    editShowColumnCommentsInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader;
+    editShowColumnTypesInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader;
+    editCompactColumnHeaderActions.value = DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions;
+    editInfiniteScroll.value = DEFAULT_EDITOR_SETTINGS.infiniteScroll;
+    editInfiniteScrollMaxRows.value = DEFAULT_EDITOR_SETTINGS.infiniteScrollMaxRows;
+    editExportBatchSize.value = DEFAULT_EDITOR_SETTINGS.exportBatchSize;
+  } else if (tab === "redis") {
+    editRedisScanPageSize.value = DEFAULT_EDITOR_SETTINGS.redisScanPageSize;
+  } else if (tab === "shortcuts") {
+    editShortcuts.value = normalizeShortcutSettings(DEFAULT_EDITOR_SETTINGS.shortcuts);
+  } else if (tab === "snippets") {
+    editSnippets.value = DEFAULT_SQL_SNIPPETS.map((s) => ({ ...s }));
+  }
+}
+
+function resetAllDefaults() {
   editFontFamily.value = DEFAULT_EDITOR_SETTINGS.fontFamily;
   editFontSize.value = DEFAULT_EDITOR_SETTINGS.fontSize;
   editUiScale.value = DEFAULT_EDITOR_SETTINGS.uiScale;
@@ -510,10 +571,13 @@ function resetDefaults() {
   editCustomThemes.value = [...DEFAULT_EDITOR_SETTINGS.customThemes];
   editActiveCustomThemeId.value = DEFAULT_EDITOR_SETTINGS.activeCustomThemeId;
   editExecuteMode.value = DEFAULT_EDITOR_SETTINGS.executeMode;
+  editShowExecutionTargetPicker.value = DEFAULT_EDITOR_SETTINGS.showExecutionTargetPicker;
   editWordWrap.value = DEFAULT_EDITOR_SETTINGS.wordWrap;
   editConfirmDangerousSqlExecution.value = DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution;
   editAppLayout.value = DEFAULT_EDITOR_SETTINGS.appLayout;
   editShowTrayIcon.value = DEFAULT_DESKTOP_SETTINGS.show_tray_icon;
+  editQuitOnClose.value = DEFAULT_DESKTOP_SETTINGS.quit_on_close;
+  desktopCloseBehaviorResetPending.value = true;
   editIconTheme.value = DEFAULT_DESKTOP_SETTINGS.icon_theme;
   editDebugLoggingEnabled.value = DEFAULT_DESKTOP_SETTINGS.debug_logging_enabled;
   editSidebarTablePageSize.value = DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
@@ -1057,6 +1121,7 @@ watch(
       await settingsStore.initAiConfig();
       await settingsStore.initDesktopSettings();
       editShowTrayIcon.value = settingsStore.desktopSettings.show_tray_icon;
+      editQuitOnClose.value = settingsStore.desktopSettings.quit_on_close;
       editIconTheme.value = settingsStore.desktopSettings.icon_theme;
       editDebugLoggingEnabled.value = settingsStore.desktopSettings.debug_logging_enabled;
       editSidebarTablePageSize.value = settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
@@ -1617,7 +1682,15 @@ watch(
                   </Select>
                 </div>
 
-                <div class="flex items-center justify-between gap-4 self-end rounded-md border bg-muted/20 px-3 py-2">
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="editor-show-execution-target-picker">{{ t("settings.showExecutionTargetPicker") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.showExecutionTargetPickerDescription") }}</p>
+                  </div>
+                  <Switch id="editor-show-execution-target-picker" v-model="editShowExecutionTargetPicker" class="mt-0.5" />
+                </div>
+
+                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-word-wrap">{{ t("settings.wordWrap") }}</Label>
                     <p class="text-xs text-muted-foreground">{{ t("settings.wordWrapDescription") }}</p>
@@ -1872,6 +1945,14 @@ watch(
                 <Switch id="show-tray-icon" v-model="editShowTrayIcon" />
               </div>
 
+              <div v-if="!isWeb" class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="space-y-1">
+                  <Label for="quit-on-close">{{ t("settings.quitOnClose") }}</Label>
+                  <p class="text-xs text-muted-foreground">{{ t("settings.quitOnCloseDescription") }}</p>
+                </div>
+                <Switch id="quit-on-close" v-model="editQuitOnClose" />
+              </div>
+
               <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="space-y-1">
                   <Label for="update-notifications-enabled">{{ t("settings.updateNotificationsEnabled") }}</Label>
@@ -1979,16 +2060,9 @@ watch(
               <div class="space-y-2">
                 <div class="flex items-center gap-2">
                   <Label>{{ t("settings.toolbarTitle") }}</Label>
-                  <TooltipProvider>
-                    <Tooltip>
-                      <TooltipTrigger as-child>
-                        <CircleHelp class="h-3.5 w-3.5 text-muted-foreground cursor-help" />
-                      </TooltipTrigger>
-                      <TooltipContent class="max-w-64">
-                        <p>{{ t("settings.toolbarHiddenHint") }}</p>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
+                  <HelpTooltip :label="t('settings.toolbarTitle')" content-class="max-w-64">
+                    <p>{{ t("settings.toolbarHiddenHint") }}</p>
+                  </HelpTooltip>
                 </div>
                 <div class="grid grid-cols-3 gap-2 mt-2">
                   <div
@@ -2040,14 +2114,9 @@ watch(
               <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="reuse-data-tab">{{ t("settings.reuseDataTab") }}</Label>
-                  <Tooltip>
-                    <TooltipTrigger as-child>
-                      <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                    </TooltipTrigger>
-                    <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                      {{ t("settings.reuseDataTabDescription") }}
-                    </TooltipContent>
-                  </Tooltip>
+                  <HelpTooltip :label="t('settings.reuseDataTab')">
+                    {{ t("settings.reuseDataTabDescription") }}
+                  </HelpTooltip>
                 </div>
                 <Switch id="reuse-data-tab" v-model="editReuseDataTab" />
               </div>
@@ -2093,28 +2162,18 @@ watch(
               <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="auto-select-active-sidebar-node">{{ t("settings.autoSelectActiveSidebarNode") }}</Label>
-                  <Tooltip>
-                    <TooltipTrigger as-child>
-                      <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                    </TooltipTrigger>
-                    <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                      {{ t("settings.autoSelectActiveSidebarNodeDescription") }}
-                    </TooltipContent>
-                  </Tooltip>
+                  <HelpTooltip :label="t('settings.autoSelectActiveSidebarNode')">
+                    {{ t("settings.autoSelectActiveSidebarNodeDescription") }}
+                  </HelpTooltip>
                 </div>
                 <Switch id="auto-select-active-sidebar-node" v-model="editAutoSelectActiveSidebarNode" />
               </div>
               <div class="space-y-2 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="disconnect-tab-handling-mode">{{ t("settings.disconnectTabHandlingMode") }}</Label>
-                  <Tooltip>
-                    <TooltipTrigger as-child>
-                      <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                    </TooltipTrigger>
-                    <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                      {{ t("settings.disconnectTabHandlingModeDescription") }}
-                    </TooltipContent>
-                  </Tooltip>
+                  <HelpTooltip :label="t('settings.disconnectTabHandlingMode')">
+                    {{ t("settings.disconnectTabHandlingModeDescription") }}
+                  </HelpTooltip>
                 </div>
                 <Select :model-value="editDisconnectTabHandlingMode" @update:model-value="onDisconnectTabHandlingModeChange">
                   <SelectTrigger id="disconnect-tab-handling-mode" class="w-full">
@@ -2137,14 +2196,9 @@ watch(
               <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="sidebar-hide-table-comments">{{ t("settings.sidebarHideTableComments") }}</Label>
-                  <Tooltip>
-                    <TooltipTrigger as-child>
-                      <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                    </TooltipTrigger>
-                    <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                      {{ t("settings.sidebarHideTableCommentsDescription") }}
-                    </TooltipContent>
-                  </Tooltip>
+                  <HelpTooltip :label="t('settings.sidebarHideTableComments')">
+                    {{ t("settings.sidebarHideTableCommentsDescription") }}
+                  </HelpTooltip>
                 </div>
                 <Switch id="sidebar-hide-table-comments" v-model="editSidebarHideTableComments" />
               </div>
@@ -2153,14 +2207,9 @@ watch(
                   <Label for="sidebar-allow-horizontal-scroll">
                     {{ t("settings.sidebarAllowHorizontalScroll") }}
                   </Label>
-                  <Tooltip>
-                    <TooltipTrigger as-child>
-                      <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                    </TooltipTrigger>
-                    <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                      {{ t("settings.sidebarAllowHorizontalScrollDescription") }}
-                    </TooltipContent>
-                  </Tooltip>
+                  <HelpTooltip :label="t('settings.sidebarAllowHorizontalScroll')">
+                    {{ t("settings.sidebarAllowHorizontalScrollDescription") }}
+                  </HelpTooltip>
                 </div>
                 <Switch id="sidebar-allow-horizontal-scroll" v-model="editSidebarAllowHorizontalScroll" />
               </div>
@@ -2399,21 +2448,18 @@ watch(
                       <X class="size-3.5" />
                     </button>
                   </div>
-                  <label class="flex items-center gap-2 text-xs text-muted-foreground">
-                    <input v-model="webdavRememberPassword" type="checkbox" class="h-4 w-4 shrink-0 accent-primary" />
-                    <span>
-                      {{ t("settings.syncRememberWebDavPassword") }}
-                      <span v-if="webdavHasSavedPassword">{{ t("settings.syncSavedPassword") }}</span>
-                    </span>
-                    <Tooltip>
-                      <TooltipTrigger as-child>
-                        <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                      </TooltipTrigger>
-                      <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                        {{ t("settings.syncRememberWebDavPasswordDescription") }}
-                      </TooltipContent>
-                    </Tooltip>
-                  </label>
+                  <div class="flex items-center gap-2 text-xs text-muted-foreground">
+                    <label class="flex items-center gap-2">
+                      <input v-model="webdavRememberPassword" type="checkbox" class="h-4 w-4 shrink-0 accent-primary" />
+                      <span>
+                        {{ t("settings.syncRememberWebDavPassword") }}
+                        <span v-if="webdavHasSavedPassword">{{ t("settings.syncSavedPassword") }}</span>
+                      </span>
+                    </label>
+                    <HelpTooltip :label="t('settings.syncRememberWebDavPassword')">
+                      {{ t("settings.syncRememberWebDavPasswordDescription") }}
+                    </HelpTooltip>
+                  </div>
                 </div>
                 <div class="space-y-2 md:col-span-2">
                   <Label for="webdav-remote-path">{{ t("settings.syncRemotePath") }}</Label>
@@ -2660,14 +2706,9 @@ watch(
                     <div class="flex items-center gap-2">
                       <PackageSearch class="h-4 w-4 text-muted-foreground" />
                       <Label class="text-base">{{ t("settings.mcpTitle") }}</Label>
-                      <Tooltip>
-                        <TooltipTrigger as-child>
-                          <CircleHelp class="h-3.5 w-3.5 cursor-help text-muted-foreground hover:text-foreground" />
-                        </TooltipTrigger>
-                        <TooltipContent class="max-w-[320px] text-xs leading-relaxed" side="top" align="start">
-                          {{ t("settings.mcpDescription") }}
-                        </TooltipContent>
-                      </Tooltip>
+                      <HelpTooltip :label="t('settings.mcpTitle')">
+                        {{ t("settings.mcpDescription") }}
+                      </HelpTooltip>
                     </div>
                   </div>
                   <Badge variant="outline" class="shrink-0 rounded-md" :class="mcpStatusTone === 'ok' ? 'border-green-500/40 text-green-600 dark:text-green-400' : mcpStatusTone === 'warning' ? 'border-amber-500/40 text-amber-600 dark:text-amber-400' : 'text-muted-foreground'">
@@ -2899,7 +2940,7 @@ watch(
           </div>
 
           <DialogFooter v-if="hasSettingsApplyFooter(activeSettingsTab as SettingsCategory)" class="mx-0 mb-0 flex-row flex-wrap items-center justify-end gap-2 rounded-none border-t border-border/60 bg-transparent px-0 pb-0 pt-3 sm:flex-row sm:gap-2 [&>button]:w-auto [&>button]:shrink-0">
-            <Button variant="outline" @click="resetDefaults">
+            <Button variant="outline" @click="resetDefaultsForTab(activeSettingsTab as SettingsCategory)">
               {{ t("settings.resetDefaults") }}
             </Button>
             <div class="flex-1" />
@@ -2994,6 +3035,10 @@ watch(
           </DialogFooter>
 
           <DialogFooter v-else-if="activeSettingsTab === 'about'" class="mx-0 mb-0 flex-row flex-wrap items-center justify-end gap-2 rounded-none border-t border-border/60 bg-transparent px-0 pb-0 pt-3 sm:flex-row sm:gap-2 [&>button]:w-auto [&>button]:shrink-0">
+            <Button variant="outline" @click="resetAllDefaults">
+              {{ t("settings.resetAllDefaults") }}
+            </Button>
+            <div class="flex-1" />
             <Button variant="outline" @click="emit('update:open', false)">
               {{ t("common.close") }}
             </Button>

@@ -87,7 +87,7 @@ import type { BuildSingleColumnAlterSqlOptions } from "@/lib/tableStructureEdito
 import { buildTableSelectSql, quoteTableIdentifier } from "@/lib/tableSelectSql";
 import { uuid } from "@/lib/utils";
 import { resolveHeaderColumnType } from "@/lib/dataGridColumnType";
-import { canEditExistingTableRows, hiveTablePropertiesIndicateTransactional, isHiddenGridColumn, isTdengineExistingRowReadonlyColumn, usesSyntheticRowIdKey } from "@/lib/tableEditing";
+import { canEditExistingTableRows, canUseKeylessRowPredicate, hiveTablePropertiesIndicateTransactional, isHiddenGridColumn, isTdengineExistingRowReadonlyColumn, usesSyntheticRowIdKey } from "@/lib/tableEditing";
 import { buildDataGridContextFilterCondition, buildDataGridCountSql, buildHiveTablePropertiesSql, type DataGridContextFilterMode } from "@/lib/dataGridSql";
 import {
   buildVisibleTransposeRows,
@@ -129,7 +129,7 @@ import { parseClipboardTable } from "@/lib/gridSelection";
 
 import { useToast } from "@/composables/useToast";
 import { useDataGridExport } from "@/composables/useDataGridExport";
-import { readTextFromClipboard } from "@/lib/clipboard";
+import { eventTargetAllowsNativeClipboard, isPlainClipboardShortcut, readTextFromClipboard } from "@/lib/clipboard";
 import ExportProgressDialog from "@/components/export/ExportProgressDialog.vue";
 import { DATA_GRID_ROW_NUM_WIDTH, useDataGridColumnResize } from "@/composables/useDataGridColumnResize";
 import { useDataGridSelection } from "@/composables/useDataGridSelection";
@@ -2345,6 +2345,7 @@ const canJumpLastPage = computed(() => canGoNextPage.value && (hasKnownTotalRowC
 const totalRowCountBusy = computed(() => props.totalRowCountLoading === true || manualTotalRowCountLoading.value);
 const canCalculateTotalRowCount = computed(() => !isResultsContext.value && !!props.connectionId && (!!props.tableMeta || !!props.countSql));
 const showQueryEditReadyBadge = computed(() => isResultsContext.value && hasData.value && !!props.editable && !!props.tableMeta);
+const showKeylessEditWarning = computed(() => !!props.editable && !!props.tableMeta && canUseKeylessRowPredicate(props.databaseType, props.tableMeta.primaryKeys ?? []));
 const canShowWhereSearch = computed(() => !!props.onExecuteSql && !isResultsContext.value);
 const canUseWhereSearch = computed(() => !!props.tableMeta && !!props.onExecuteSql && !isResultsContext.value);
 type DataGridTableMeta = NonNullable<typeof props.tableMeta>;
@@ -4379,6 +4380,9 @@ function drawCanvasGrid() {
     rowCellsUseSelectionVisual,
     cellIsSelected,
     cellCanHover: canEditCellItem,
+    infiniteScrollEnabled: infiniteScrollEnabled.value,
+    pageSize: pageSize.value,
+    currentPage: currentPage.value,
   });
 }
 
@@ -4743,25 +4747,6 @@ function openImagePreview(src: string, title: string) {
   imagePreviewOpen.value = true;
 }
 
-function selectionNodeElement(node: Node | null): Element | null {
-  if (!node) return null;
-  return node instanceof Element ? node : node.parentElement;
-}
-
-function hasNativeClipboardSelection(): boolean {
-  const selection = window.getSelection();
-  if (!selection || selection.isCollapsed) return false;
-  const anchorRegion = selectionNodeElement(selection.anchorNode)?.closest("[data-native-clipboard]");
-  const focusRegion = selectionNodeElement(selection.focusNode)?.closest("[data-native-clipboard]");
-  return !!anchorRegion && anchorRegion === focusRegion;
-}
-
-function eventTargetAllowsNativeClipboard(event: KeyboardEvent): boolean {
-  const target = event.target as HTMLElement | null;
-  if (target?.closest("input, textarea, [contenteditable='true'], [role='textbox']")) return true;
-  return clipboardShortcut(event, "c") && hasNativeClipboardSelection();
-}
-
 function onDrawerContextMenu(event: MouseEvent) {
   event.stopPropagation();
   const target = event.target as HTMLElement | null;
@@ -4770,7 +4755,7 @@ function onDrawerContextMenu(event: MouseEvent) {
 }
 
 function clipboardShortcut(event: KeyboardEvent, key: string): boolean {
-  return (event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === key;
+  return isPlainClipboardShortcut(event, key);
 }
 
 let lastPasteEventAt = 0;
@@ -6736,6 +6721,17 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                   {{ t("grid.queryEditReadyHint", { table: tableMeta?.tableName }) }}
                 </TooltipContent>
               </Tooltip>
+              <Tooltip v-if="showKeylessEditWarning">
+                <TooltipTrigger as-child>
+                  <div class="flex h-5 items-center gap-1 rounded border border-amber-500/30 bg-amber-500/10 px-1.5 text-xs font-medium text-amber-700 dark:text-amber-300">
+                    <KeyRound class="h-3 w-3" />
+                    {{ t("grid.keylessEditWarning") }}
+                  </div>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" class="max-w-sm">
+                  {{ t("grid.keylessEditWarningHint") }}
+                </TooltipContent>
+              </Tooltip>
               <Button v-if="props.context !== 'results'" variant="ghost" size="sm" class="h-5 text-xs px-1.5 shrink-0" :disabled="isSaving" @click="onToolbarRefresh">
                 <Loader2 v-if="loading" class="w-3 h-3 mr-1 animate-spin" />
                 <RefreshCcw v-else class="w-3 h-3 mr-1" />
@@ -6938,7 +6934,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                           autocapitalize="off"
                           autocorrect="off"
                           spellcheck="false"
-                          class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-1.5 py-0 text-xs leading-[26px] outline-none z-10"
+                          class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-1.5 py-0 text-[13px] leading-[26px] outline-none z-10"
                           @blur="commitEditFromBlur"
                           @click.stop
                           @keydown.stop="onEditKeydown"
@@ -7334,7 +7330,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                 <div class="relative" :style="{ width: `${totalWidth}px`, height: `${canvasContentHeight}px` }">
                   <canvas
                     ref="canvasRef"
-                    class="canvas-grid-surface dbx-data-grid-font-family sticky left-0 top-0 z-0 block text-[12.5px]/[1rem] font-normal"
+                    class="canvas-grid-surface dbx-data-grid-font-family sticky left-0 top-0 z-0 block text-[13px]/[1rem] font-normal"
                     :style="{ width: `${canvasSurfaceWidth}px`, height: `${canvasViewportHeight}px` }"
                     @mousemove="onCanvasMouseMove"
                     @mouseleave="onCanvasMouseLeave"
@@ -7359,7 +7355,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                         autocapitalize="off"
                         autocorrect="off"
                         spellcheck="false"
-                        class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 text-[12.5px] leading-[22px] outline-none z-10"
+                        class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 text-[13px] leading-[22px] outline-none z-10"
                         @blur="commitEditFromBlur"
                         @click.stop
                         @keydown.stop="onEditKeydown"
@@ -7405,7 +7401,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
               <RecycleScroller
                 v-else-if="hasVisibleRows"
                 ref="scrollerRef"
-                class="data-grid-scroller dbx-data-grid-font-family flex-1 overflow-x-auto overscroll-none text-[12.5px]"
+                class="data-grid-scroller dbx-data-grid-font-family flex-1 overflow-x-auto overscroll-none text-[13px]"
                 :class="{ 'is-scrolling': isScrolling }"
                 :items="displayItems"
                 :item-size="26"
@@ -7432,13 +7428,13 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                       @dblclick.stop="toggleTranspose(item.displayIndex)"
                       @contextmenu="onRowContext(item.id, item.displayIndex)"
                     >
-                      {{ item.displayIndex + 1 }}
+                      {{ infiniteScrollEnabled ? item.displayIndex + 1 : item.displayIndex + 1 + (currentPage - 1) * pageSize }}
                     </div>
                     <div class="shrink-0" :style="{ width: `${horizontalColumnWindow.beforeWidth}px` }" />
                     <div
                       v-for="col in renderedGridColumns"
                       :key="col.actualColIdx"
-                      class="group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none flex items-center tabular-nums text-[12.5px]"
+                      class="group/cell shrink-0 px-3 py-1 border-r border-border whitespace-nowrap overflow-hidden text-ellipsis relative select-none inline-block items-center tabular-nums text-[13px]"
                       :style="renderedColumnStyle(col.visibleColIdx)"
                       :class="{
                         'text-muted-foreground italic': isNull(item.data[col.actualColIdx]),
@@ -7469,7 +7465,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
                           autocapitalize="off"
                           autocorrect="off"
                           spellcheck="false"
-                          class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 text-[12.5px] leading-[22px] outline-none z-10"
+                          class="cell-edit-input absolute inset-0 bg-background border-2 border-primary px-2.5 py-0 text-[13px] leading-[22px] outline-none z-10"
                           @blur="commitEditFromBlur"
                           @click.stop
                           @keydown.stop="onEditKeydown"
@@ -7921,7 +7917,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
     <ErrorBanner v-if="saveError" :message="saveError" copy-mode="label" dismissible @dismiss="saveError = ''" />
 
     <!-- Bottom status bar -->
-    <div v-if="!isErrorResult" class="grid grid-cols-[minmax(0,1fr)_minmax(0,38%)_minmax(0,1fr)] items-center gap-2 px-3 py-1 border-t text-xs text-muted-foreground bg-muted/30 shrink-0">
+    <div v-if="!isErrorResult" class="grid grid-cols-[max-content_minmax(0,1fr)_max-content] items-center gap-2 px-3 py-1 border-t text-xs text-muted-foreground bg-muted/30 shrink-0">
       <div class="flex min-w-0 items-center gap-2 overflow-hidden">
         <span v-if="hasData" class="shrink-0">
           {{ t("grid.totalRows", { count: result.rows.length }) }}
@@ -7956,7 +7952,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
       </Tooltip>
       <span v-else class="min-w-0" />
 
-      <div class="flex min-w-0 items-center justify-end gap-1">
+      <div class="flex min-w-max items-center justify-end gap-1">
         <Loader2 v-if="loading" class="w-3 h-3 animate-spin text-muted-foreground" />
         <template v-if="infiniteScrollEnabled">
           <span v-if="infiniteScrollAllLoaded" class="text-xs text-muted-foreground shrink-0">
@@ -7968,7 +7964,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
             :model-value="String(pageSize)"
             :items="pageSizeMenuItems"
             :trigger-label="`${pageSize}${t('grid.rowsPerPageShort')}`"
-            trigger-class="inline-flex h-5 items-center justify-center rounded-md px-1.5 text-xs hover:bg-accent hover:text-accent-foreground"
+            trigger-class="inline-flex h-5 shrink-0 items-center justify-center whitespace-nowrap rounded-md px-1.5 text-xs hover:bg-accent hover:text-accent-foreground"
             content-class="w-36"
             :highlight-selected="false"
             check-position="none"
@@ -7997,17 +7993,17 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
               </Tooltip>
             </div>
           </LightDropdown>
-          <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="currentPage <= 1" @click="firstPage">
+          <Button variant="ghost" size="icon" class="h-5 w-5 shrink-0" :disabled="currentPage <= 1" @click="firstPage">
             <ChevronsLeft class="h-3 w-3" />
           </Button>
-          <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="currentPage <= 1" @click="prevPage">
+          <Button variant="ghost" size="icon" class="h-5 w-5 shrink-0" :disabled="currentPage <= 1" @click="prevPage">
             <ChevronLeft class="h-3 w-3" />
           </Button>
-          <span>{{ currentPage }}</span>
-          <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="!canGoNextPage" @click="nextPage">
+          <span class="shrink-0 tabular-nums">{{ currentPage }}</span>
+          <Button variant="ghost" size="icon" class="h-5 w-5 shrink-0" :disabled="!canGoNextPage" @click="nextPage">
             <ChevronRight class="h-3 w-3" />
           </Button>
-          <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="!canJumpLastPage" @click="lastPage">
+          <Button variant="ghost" size="icon" class="h-5 w-5 shrink-0" :disabled="!canJumpLastPage" @click="lastPage">
             <ChevronsRight class="h-3 w-3" />
           </Button>
         </template>
@@ -8017,7 +8013,7 @@ const gridContextMenuItems = computed<ContextMenuItem[]>(() => {
           :aria-label="t('grid.export')"
           :trigger-icon="Download"
           :trigger-label="t('grid.export')"
-          trigger-class="inline-flex h-6 shrink-0 items-center justify-center gap-1 rounded-md px-2 text-foreground/80 hover:bg-accent hover:text-accent-foreground"
+          trigger-class="inline-flex h-6 shrink-0 items-center justify-center gap-1 whitespace-nowrap rounded-md px-2 text-foreground/80 hover:bg-accent hover:text-accent-foreground"
           trigger-icon-class="h-3.5 w-3.5"
           :show-trigger-label="true"
           :show-chevron="true"

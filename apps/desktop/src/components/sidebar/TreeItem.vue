@@ -66,7 +66,7 @@ import type { ColumnInfo, ConnectionConfig, DatabaseType, TreeNode, TreeNodeType
 import * as api from "@/lib/api";
 import { uuid } from "@/lib/utils";
 import { resolveDefaultDatabase } from "@/lib/defaultDatabase";
-import { canTreeNodeShowExpander, treeItemPaddingLeft, usesFullWidthTreeLabel } from "@/lib/sidebarTreeItemLayout";
+import { canTreeNodePin, canTreeNodeShowExpander, treeItemPaddingLeft, usesFullWidthTreeLabel } from "@/lib/sidebarTreeItemLayout";
 import { buildTableSelectSql } from "@/lib/tableSelectSql";
 import { buildTableDeleteTemplate, buildTableInsertTemplate, buildTableSelectTemplate, buildTableUpdateTemplate } from "@/lib/tableSqlTemplates";
 import { connectionFilePath, defaultSqliteBackupFileName, isMemorySqlitePath, sqliteBackupSourcePath } from "@/lib/connectionFile";
@@ -109,6 +109,7 @@ import { sidebarDisplayTableName } from "@/lib/sidebarTableNameDisplay";
 import { selectedTreeNodesInVisibleOrder as orderSelectedTreeNodes, treeSelectionRangeIdsByIndex, treeSelectionRangeIds } from "@/lib/sidebarTreeSelection";
 import { selectedConnectionDeleteTargets } from "@/lib/sidebarConnectionSelection";
 import { supportsDatabaseUserAdmin } from "@/lib/databaseUserAdmin";
+import { canCloseSidebarDatabaseConnection, isSidebarDatabaseOpened } from "@/lib/sidebarDatabaseOpenState";
 import { sidebarTreeContextKey } from "@/lib/sidebarTreeContext";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ProcedureExecutionDialog from "@/components/objects/ProcedureExecutionDialog.vue";
@@ -301,8 +302,6 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
 }
 
 const groupTypes: Set<TreeNodeType> = new Set(["group-columns", "group-indexes", "group-fkeys", "group-triggers", "group-tables", "group-views", "group-materialized-views", "group-procedures", "group-functions", "group-sequences", "group-packages", "group-partitions"]);
-const pinnableTypes: Set<TreeNodeType> = new Set(["connection-group", "database", "linked-server", "linked-server-catalog", "linked-server-schema", "schema", "table", "view", "materialized_view", "redis-db", "mongo-db", "mongo-collection", "vector-collection", "elasticsearch-index"]);
-
 function isGroupLabel(node: TreeNode): boolean {
   return groupTypes.has(node.type);
 }
@@ -906,24 +905,46 @@ async function openData() {
   });
   const tableSchema = connectionObjectTreeNodeSchema(config, node.database, node.schema);
   const tableType = node.type === "view" ? "VIEW" : node.type === "materialized_view" ? "MATERIALIZED_VIEW" : "TABLE";
+  const isSameDataTableTab = (tab: (typeof queryStore.tabs)[number]) => tab.mode === "data" && tab.connectionId === node.connectionId && tab.database === node.database && (tab.schema || "") === (tableSchema || "") && (tab.tableMeta?.tableName || tab.title) === node.label;
+  const activateExistingSameTableTab = () => {
+    const existing = queryStore.tabs.find(isSameDataTableTab);
+    if (!existing) return false;
+    queryStore.activeTabId = existing.id;
+    return true;
+  };
+  const resetReusedDataTabState = (tab: (typeof queryStore.tabs)[number]) => {
+    tab.title = node.label;
+    tab.schema = tableSchema;
+    tab.whereInput = undefined;
+    tab.orderByInput = undefined;
+    tab.previewSql = undefined;
+    tab.resultSortColumn = undefined;
+    tab.resultSortColumnIndex = undefined;
+    tab.resultSortDirection = undefined;
+    tab.resultSortMode = undefined;
+    tab.resultLocalSortOriginalRows = undefined;
+    tab.resultSortedSql = undefined;
+    tab.resultPageSql = undefined;
+    tab.resultPageLimit = undefined;
+    tab.resultPageOffset = undefined;
+    tab.resultTotalRowCount = undefined;
+    tab.resultTotalRowCountLoading = undefined;
+    tab.queryAnalysis = undefined;
+    tab.querySourceColumns = undefined;
+    tab.queryEditabilityReason = undefined;
+  };
+
+  if (activateExistingSameTableTab()) {
+    logPhase("existing-tab-activated", { table: node.label });
+    return;
+  }
+
   const tabId = (() => {
     if (settingsStore.editorSettings.reuseDataTab) {
       const existing = queryStore.tabs.find((tab) => tab.mode === "data" && tab.connectionId === node.connectionId && tab.database === node.database);
       if (existing) {
-        existing.title = node.label;
-        existing.schema = tableSchema;
-        // Reset per-table filter/sort state so the reused tab doesn't keep
-        // the previous table's WHERE/ORDER BY. DataGrid remounts (result is
-        // cleared below) and reinitializes its inputs from these props.
-        existing.whereInput = undefined;
-        existing.orderByInput = undefined;
-        existing.resultSortColumn = undefined;
-        existing.resultSortColumnIndex = undefined;
-        existing.resultSortDirection = undefined;
-        existing.resultSortMode = undefined;
-        existing.resultLocalSortOriginalRows = undefined;
-        existing.resultSortedSql = undefined;
         queryStore.activeTabId = existing.id;
+        resetReusedDataTabState(existing);
         return existing.id;
       }
     }
@@ -2794,6 +2815,7 @@ async function exportTableData(format: "csv" | "xlsx") {
     const queryColumns = config.db_type === "neo4j" ? (await api.getColumns(connectionId, database, node.schema || database, node.label)).map((c) => c.name) : undefined;
 
     // Step 4: Start streaming export (background, non-blocking)
+    const rowLimit = settingsStore.editorSettings.exportRowLimitEnabled ? settingsStore.editorSettings.exportRowLimit : null;
     const request: api.TableExportRequest = {
       exportId: currentTask.exportId,
       connectionId,
@@ -2804,6 +2826,7 @@ async function exportTableData(format: "csv" | "xlsx") {
       format,
       columns: queryColumns,
       batchSize: settingsStore.editorSettings.exportBatchSize,
+      rowLimit,
     };
 
     await api.startTableExport(request, (progress) => {
@@ -3023,7 +3046,7 @@ const canExpand = computed(() =>
     childCount: props.node.children?.length ?? 0,
   }),
 );
-const canPin = computed(() => pinnableTypes.has(props.node.type));
+const canPin = computed(() => canTreeNodePin(props.node.type));
 const canOpenSqlFileExecution = computed(() => {
   return supportsSqlFileExecution(rawDatabaseType());
 });
@@ -3062,11 +3085,12 @@ const tableComment = computed(() =>
 const paddingLeft = computed(() => treeItemPaddingLeft(props.depth));
 const isConnected = computed(() => props.node.type === "connection" && !!props.node.connectionId && connectionStore.connectedIds.has(props.node.connectionId));
 const isConnectionReadonly = computed(() => props.node.type === "connection" && !!props.node.connectionId && (connectionStore.getConfig(props.node.connectionId)?.read_only ?? false));
-const canCloseDatabaseConnection = computed(() => props.node.type === "database" && !!props.node.connectionId && props.node.database != null && connectionStore.connectedIds.has(props.node.connectionId));
+const isOpenedDatabase = computed(() => isSidebarDatabaseOpened(props.node, connectionStore.isTreeNodeChildrenLoaded));
+const canCloseDatabaseConnection = computed(() => canCloseSidebarDatabaseConnection(props.node, connectionStore.isTreeNodeChildrenLoaded));
 const nodeIconClass = computed(() => {
   const infoClass = getIconInfo(props.node)?.colorClass;
   if (props.node.type !== "database") return infoClass;
-  return canCloseDatabaseConnection.value ? infoClass : "text-muted-foreground/65";
+  return isOpenedDatabase.value ? infoClass : "text-muted-foreground/65";
 });
 
 const canConfigureVisibleDatabases = computed(() => {
@@ -3537,12 +3561,11 @@ function treeItemMenuItems(): ContextMenuItem[] {
     });
     if (canConfigureVisibleDatabases.value) {
       items.push({
-        label: t("contextMenu.selectVisibleDatabases"),
+        label: t("contextMenu.configureVisibleObjects"),
         action: openVisibleDatabasesDialog,
         icon: ListFilter,
       });
-    }
-    if (canConfigureVisibleSchemas.value) {
+    } else if (canConfigureVisibleSchemas.value) {
       items.push({
         label: t("visibleSchemas.title"),
         action: openVisibleSchemasDialog,

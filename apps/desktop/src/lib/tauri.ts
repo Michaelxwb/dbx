@@ -549,8 +549,8 @@ export async function getObjectSource(connectionId: string, database: string, sc
   return invoke("get_object_source", { connectionId, database, schema, name, objectType });
 }
 
-export async function listSchemas(connectionId: string, database: string): Promise<string[]> {
-  return invoke("list_schemas", { connectionId, database });
+export async function listSchemas(connectionId: string, database: string, applyVisibleFilter = false): Promise<string[]> {
+  return invoke("list_schemas", { connectionId, database, applyVisibleFilter });
 }
 
 export async function listSchemaInfos(connectionId: string, database: string): Promise<SchemaInfo[]> {
@@ -1749,6 +1749,7 @@ export interface TableExportRequest {
   orderBy?: string;
   skipCount?: boolean;
   batchSize?: number;
+  rowLimit?: number | null;
 }
 
 export interface TableCsvExportOptions {

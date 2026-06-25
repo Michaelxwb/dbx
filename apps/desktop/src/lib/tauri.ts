@@ -3,9 +3,12 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ConnectionConfig,
   DatabaseInfo,
+  SchemaInfo,
   LinkedServerInfo,
   TableInfo,
   ObjectInfo,
+  CompletionAssistantRequest,
+  CompletionAssistantResponse,
   ObjectStatistics,
   ObjectSource,
   ObjectSourceKind,
@@ -187,6 +190,7 @@ export interface QueryPaginationExecutionPlanOptions {
   databaseType?: DatabaseType;
   pagination: QueryPagination;
   useAgentCursor: boolean;
+  firstPageUsesActualSql?: boolean;
 }
 
 export interface QueryPaginationExecutionPlan {
@@ -426,6 +430,10 @@ export async function readExternalSqlFile(path: string): Promise<string> {
   return invoke("read_external_sql_file", { path });
 }
 
+export async function writeExternalSqlFile(path: string, content: string): Promise<void> {
+  return invoke("write_external_sql_file", { path, content });
+}
+
 // --- AI Conversations ---
 
 export interface AiChatMessage {
@@ -533,12 +541,20 @@ export async function listCompletionObjects(connectionId: string, database: stri
   return invoke("list_completion_objects", { connectionId, database, schema });
 }
 
+export async function completionAssistantSearch(request: CompletionAssistantRequest): Promise<CompletionAssistantResponse> {
+  return invoke("completion_assistant_search", { request });
+}
+
 export async function getObjectSource(connectionId: string, database: string, schema: string, name: string, objectType: ObjectSourceKind): Promise<ObjectSource> {
   return invoke("get_object_source", { connectionId, database, schema, name, objectType });
 }
 
 export async function listSchemas(connectionId: string, database: string): Promise<string[]> {
   return invoke("list_schemas", { connectionId, database });
+}
+
+export async function listSchemaInfos(connectionId: string, database: string): Promise<SchemaInfo[]> {
+  return invoke("list_schema_infos", { connectionId, database });
 }
 
 export async function getColumns(connectionId: string, database: string, schema: string, table: string): Promise<ColumnInfo[]> {
@@ -1044,6 +1060,10 @@ export async function revealPathInFileManager(path: string): Promise<void> {
   return invoke("reveal_path_in_file_manager", { path });
 }
 
+export async function isSqliteDatabaseFile(path: string): Promise<boolean> {
+  return invoke("is_sqlite_database_file", { path });
+}
+
 export async function backupSqliteDatabase(connectionId: string, destinationPath: string): Promise<void> {
   return invoke("backup_sqlite_database", { connectionId, destinationPath });
 }
@@ -1109,10 +1129,10 @@ export async function getAppVersion(): Promise<string> {
 export interface RedisKeyInfo {
   key_display: string;
   key_raw: string;
-  key_type: string;
-  ttl: number;
-  size: number;
-  value_preview: string;
+  key_type?: string;
+  ttl?: number;
+  size?: number;
+  value_preview?: string;
 }
 
 export interface RedisDatabaseInfo {
@@ -1281,6 +1301,16 @@ export interface KvKeyMetadata {
   version?: number | null;
   lease?: number | null;
   valueSize?: number | null;
+  czxid?: number | null;
+  mzxid?: number | null;
+  pzxid?: number | null;
+  ctime?: number | null;
+  mtime?: number | null;
+  cversion?: number | null;
+  aversion?: number | null;
+  ephemeralOwner?: number | null;
+  dataLength?: number | null;
+  numChildren?: number | null;
 }
 
 export interface KvKeySummary extends KvKeyMetadata {
@@ -1302,6 +1332,18 @@ export interface KvGetResponse {
 
 export interface KvPutResponse {
   revision?: number | null;
+  version?: number | null;
+  mtime?: number | null;
+  key?: string | null;
+  createdKey?: string | null;
+}
+
+export type KvWriteMode = "upsert" | "create" | "update";
+export type KvCreateMode = "persistent" | "ephemeral" | "persistent_sequential" | "ephemeral_sequential";
+
+export interface KvPutOptions {
+  writeMode?: KvWriteMode | null;
+  createMode?: KvCreateMode | null;
 }
 
 export interface KvDeleteResponse {
@@ -1323,6 +1365,23 @@ export async function etcdPut(connectionId: string, key: string, value: KvValue,
 
 export async function etcdDelete(connectionId: string, key: string): Promise<KvDeleteResponse> {
   return invoke("etcd_delete", { connectionId, key });
+}
+
+// --- ZooKeeper ---
+export async function zookeeperListPrefix(connectionId: string, prefix: string, limit: number, continuation?: string | null): Promise<KvListPrefixResponse> {
+  return invoke("zookeeper_list_prefix", { connectionId, prefix, limit, continuation });
+}
+
+export async function zookeeperGet(connectionId: string, key: string): Promise<KvGetResponse> {
+  return invoke("zookeeper_get", { connectionId, key });
+}
+
+export async function zookeeperPut(connectionId: string, key: string, value: KvValue, options?: KvPutOptions | null): Promise<KvPutResponse> {
+  return invoke("zookeeper_put", { connectionId, key, value, options: options ?? null });
+}
+
+export async function zookeeperDelete(connectionId: string, key: string): Promise<KvDeleteResponse> {
+  return invoke("zookeeper_delete", { connectionId, key });
 }
 
 // --- MongoDB ---
@@ -1712,6 +1771,26 @@ export interface TableExportProgress {
   errorMessage?: string;
 }
 
+export interface QueryResultExportRequest {
+  exportId: string;
+  connectionId: string;
+  database: string;
+  schema?: string;
+  sql: string;
+  queryBaseSql: string;
+  databaseType: DatabaseType;
+  useAgentCursor: boolean;
+  filePath: string;
+  format: "csv" | "xlsx";
+  pageSize: number;
+  rowLimit?: number | null;
+  totalRows?: number | null;
+  timeoutSecs?: number;
+  keysetOptimizationEnabled: boolean;
+  clientSessionId?: string;
+  executionId?: string;
+}
+
 export async function startTableExport(request: TableExportRequest, onProgress: (progress: TableExportProgress) => void): Promise<TableExportProgress> {
   let unlisten: UnlistenFn | undefined;
   let settled = false;
@@ -1755,6 +1834,51 @@ export async function startTableExport(request: TableExportRequest, onProgress: 
 
 export async function cancelTableExport(exportId: string): Promise<void> {
   return invoke("cancel_table_export", { exportId });
+}
+
+export async function startQueryResultExport(request: QueryResultExportRequest, onProgress: (progress: TableExportProgress) => void): Promise<TableExportProgress> {
+  let unlisten: UnlistenFn | undefined;
+  let settled = false;
+  let resolveTerminal: (progress: TableExportProgress) => void = () => {};
+  let rejectTerminal: (error: unknown) => void = () => {};
+
+  const terminalProgress = new Promise<TableExportProgress>((resolve, reject) => {
+    resolveTerminal = resolve;
+    rejectTerminal = reject;
+  });
+
+  const finish = (callback: () => void) => {
+    if (settled) return;
+    settled = true;
+    unlisten?.();
+    callback();
+  };
+
+  try {
+    unlisten = await listen<TableExportProgress>("query-result-export-progress", (event) => {
+      if (event.payload.exportId !== request.exportId) return;
+      onProgress(event.payload);
+      if (event.payload.status === "Done" || event.payload.status === "Error" || event.payload.status === "Cancelled") {
+        if (event.payload.status === "Error") {
+          finish(() => rejectTerminal(new Error(event.payload.errorMessage || "Export failed")));
+        } else {
+          finish(() => resolveTerminal(event.payload));
+        }
+      }
+    });
+    await invoke("start_query_result_export", { request });
+    return await terminalProgress;
+  } catch (error) {
+    if (!settled) {
+      settled = true;
+      unlisten?.();
+    }
+    throw error;
+  }
+}
+
+export async function cancelQueryResultExport(exportId: string, executionId?: string): Promise<void> {
+  return invoke("cancel_query_result_export", { exportId, executionId: executionId || null });
 }
 
 export async function exportDatabaseSql(request: DatabaseExportRequest, onProgress: (progress: ExportProgress) => void): Promise<void> {
@@ -1833,3 +1957,4 @@ export async function exportQueryResultMarkdown(filePath: string, columns: strin
 }
 
 export * from "./mq-tauri";
+export * from "./nacos-tauri";

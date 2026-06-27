@@ -31,6 +31,7 @@ import type {
   SavedSqlFolder,
   SavedSqlLibrary,
 } from "@/types/database";
+import type { CollectionInfo } from "@/types/database";
 import type { SidebarObjectKind } from "@/lib/databaseObjectCapabilities";
 import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
 import type { QueryEditability } from "@/lib/sqlAnalysis";
@@ -251,10 +252,17 @@ export interface AiMessage {
   content: string;
 }
 
+export interface AiTaskContract {
+  action?: string;
+  mode?: string;
+  userRequest?: string;
+}
+
 export interface AiCompletionRequest {
   config: AiConfig;
   systemPrompt: string;
   messages: AiMessage[];
+  taskContract?: AiTaskContract;
   maxTokens?: number;
   temperature?: number;
 }
@@ -559,6 +567,10 @@ export async function listSchemaInfos(connectionId: string, database: string): P
 
 export async function getColumns(connectionId: string, database: string, schema: string, table: string): Promise<ColumnInfo[]> {
   return invoke("get_columns", { connectionId, database, schema, table });
+}
+
+export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
+  return invoke("list_data_types", { connectionId, database });
 }
 
 export async function executeQuery(
@@ -1091,6 +1103,13 @@ export interface UpdateInfo {
   release_notes: string;
 }
 
+export type UpdateDownloadSource = "official" | "cnb";
+
+export interface UpdateDownloadProgress {
+  downloaded: number;
+  total: number | null;
+}
+
 export interface McpServerStatus {
   installed: boolean;
   npm_available: boolean;
@@ -1118,6 +1137,10 @@ export async function checkForUpdates(): Promise<UpdateInfo> {
 
 export async function getSystemProxyUrl(): Promise<string | null> {
   return invoke("get_system_proxy_url");
+}
+
+export async function downloadAndInstallUpdate(source: UpdateDownloadSource, latestVersion?: string): Promise<void> {
+  return invoke("download_and_install_update", { source, latestVersion });
 }
 
 export async function getAppVersion(): Promise<string> {
@@ -1394,7 +1417,7 @@ export async function mongoListDatabases(connectionId: string): Promise<string[]
   return invoke("mongo_list_databases", { connectionId });
 }
 
-export async function mongoListCollections(connectionId: string, database: string): Promise<string[]> {
+export async function mongoListCollections(connectionId: string, database: string): Promise<CollectionInfo[]> {
   return invoke("mongo_list_collections", { connectionId, database });
 }
 
@@ -1411,10 +1434,11 @@ export async function mongoDropCollection(connectionId: string, database: string
 }
 
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
-  return mongoListCollections(connectionId, "default");
+  const collections = await mongoListCollections(connectionId, "default");
+  return collections.map((c) => c.name);
 }
 
-export async function vectorListCollections(connectionId: string): Promise<string[]> {
+export async function vectorListCollections(connectionId: string): Promise<CollectionInfo[]> {
   return mongoListCollections(connectionId, "default");
 }
 
@@ -1598,7 +1622,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
         unlisten = await listen<TransferProgress>("transfer-progress", (event) => {
           if (event.payload.transferId !== request.transferId) return;
           onProgress(event.payload);
-          if (event.payload.status === "done" || event.payload.status === "cancelled") {
+          if (event.payload.status === "done" || event.payload.status === "error" || event.payload.status === "cancelled") {
             unlisten?.();
             resolve();
           }

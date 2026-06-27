@@ -30,6 +30,7 @@ import type {
   SavedSqlFolder,
   SavedSqlLibrary,
 } from "@/types/database";
+import type { CollectionInfo } from "@/types/database";
 import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, TableDiff, FunctionDiff, SequenceDiff, RuleDiff, OwnerDiff } from "@/lib/schemaDiff";
 import type { SidebarObjectKind } from "@/lib/databaseObjectCapabilities";
 import type { AiConfig, AiTestConnectionResult } from "@/stores/settingsStore";
@@ -48,6 +49,7 @@ import type {
   DriverInstallProgress,
   JavaRuntimeConfig,
   UpdateInfo,
+  UpdateDownloadSource,
   RedisDatabaseInfo,
   RedisValue,
   RedisScanResult,
@@ -524,6 +526,10 @@ export async function getObjectSource(connectionId: string, database: string, sc
 
 export async function getColumns(connectionId: string, database: string, schema: string, table: string): Promise<ColumnInfo[]> {
   return get(`/api/schema/columns?${qs({ connection_id: connectionId, database, schema, table })}`);
+}
+
+export async function listDataTypes(connectionId: string, database: string): Promise<string[]> {
+  return get(`/api/schema/data-types?${qs({ connection_id: connectionId, database })}`);
 }
 
 export async function listIndexes(connectionId: string, database: string, schema: string, table: string): Promise<IndexInfo[]> {
@@ -1142,7 +1148,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
     es.onmessage = (e) => {
       const progress: TransferProgress = JSON.parse(e.data);
       onProgress(progress);
-      if (progress.status === "done" || progress.status === "cancelled") {
+      if (progress.status === "done" || progress.status === "error" || progress.status === "cancelled") {
         es.close();
         resolve();
       }
@@ -1684,7 +1690,7 @@ export async function mongoListDatabases(connectionId: string): Promise<string[]
   return post("/api/mongo/list-databases", { connectionId });
 }
 
-export async function mongoListCollections(connectionId: string, database: string): Promise<string[]> {
+export async function mongoListCollections(connectionId: string, database: string): Promise<CollectionInfo[]> {
   return post("/api/mongo/list-collections", { connectionId, database });
 }
 
@@ -1701,10 +1707,11 @@ export async function mongoDropCollection(connectionId: string, database: string
 }
 
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
-  return mongoListCollections(connectionId, "default");
+  const collections = await mongoListCollections(connectionId, "default");
+  return collections.map((c) => c.name);
 }
 
-export async function vectorListCollections(connectionId: string): Promise<string[]> {
+export async function vectorListCollections(connectionId: string): Promise<CollectionInfo[]> {
   return mongoListCollections(connectionId, "default");
 }
 
@@ -1802,6 +1809,10 @@ export async function installMcpServer(): Promise<string> {
 
 export async function getSystemProxyUrl(): Promise<string | null> {
   return null;
+}
+
+export async function downloadAndInstallUpdate(_source: UpdateDownloadSource, _latestVersion?: string): Promise<void> {
+  throw new Error("In-app update installation is only available in the desktop app.");
 }
 
 export async function getAppVersion(): Promise<string> {

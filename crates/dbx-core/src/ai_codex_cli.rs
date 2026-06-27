@@ -1,12 +1,12 @@
 use crate::agent_events::AgentEvent;
 use crate::ai::{AiConfig, AiModelInfo, AiTestConnectionResult};
 use crate::ai_cli_agent::{
-    append_config_overrides, build_cli_agent_prompt, dbx_mcp_enabled_tools, dbx_mcp_scope_env, model_infos,
-    parse_cli_jsonl_event, run_cli_jsonl_agent, toml_string, toml_string_array, CliAgentCommandSpec,
+    append_config_overrides, build_cli_agent_prompt, cli_command, dbx_mcp_enabled_tools, dbx_mcp_scope_env,
+    model_infos, parse_cli_jsonl_event, run_cli_jsonl_agent, toml_string, toml_string_array, CliAgentCommandSpec,
     CliAgentJsonlDialect, CliAgentProcessSpec, CliAgentRunOptions,
 };
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -15,6 +15,7 @@ use tokio::process::Command;
 use tokio::sync::Notify;
 
 const DEFAULT_CODEX_MODELS: &[&str] = &["default", "gpt-5.5", "gpt-5.4-mini"];
+#[cfg(not(windows))]
 const CODEX_PATH_MARKER: &str = "__DBX_CODEX_PATH__";
 
 pub type CodexRunOptions = CliAgentRunOptions;
@@ -27,17 +28,52 @@ fn codex_program(config: &AiConfig) -> String {
 async fn resolve_codex_command(config: &AiConfig) -> CodexCommandSpec {
     let configured = codex_program(config);
     if is_path_like_program(&configured) {
-        return CodexCommandSpec { program: expand_tilde(&configured), args: Vec::new() };
+        let expanded = expand_tilde(&configured);
+        return codex_command_for_program(direct_program_path(&expanded).unwrap_or(expanded));
     }
     if let Some(path) = resolve_program_path(&configured).await {
-        CodexCommandSpec { program: path, args: Vec::new() }
+        codex_command_for_program(path)
     } else {
         CodexCommandSpec { program: configured, args: Vec::new() }
     }
 }
 
-fn command_env(command: &CodexCommandSpec) -> Vec<(String, String)> {
-    command.parent_dir().map(|dir| ("PATH".to_string(), merged_path_with_dir(&dir))).into_iter().collect()
+fn codex_command_for_program(program: String) -> CodexCommandSpec {
+    #[cfg(windows)]
+    if let Some(command) = windows_npm_codex_shim_command(&program) {
+        return command;
+    }
+
+    CodexCommandSpec { program, args: Vec::new() }
+}
+
+#[cfg(windows)]
+fn windows_npm_codex_shim_command(program: &str) -> Option<CodexCommandSpec> {
+    let path = Path::new(program);
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    if extension != "cmd" && extension != "bat" {
+        return None;
+    }
+
+    let parent = path.parent()?;
+    let codex_js = parent.join("node_modules").join("@openai").join("codex").join("bin").join("codex.js");
+    if !codex_js.is_file() {
+        return None;
+    }
+
+    let bundled_node = parent.join("node.exe");
+    let node = if bundled_node.is_file() { bundled_node.to_string_lossy().to_string() } else { "node".to_string() };
+
+    Some(CodexCommandSpec { program: node, args: vec![codex_js.to_string_lossy().to_string()] })
+}
+
+fn codex_process_env(config: &AiConfig, command: &CodexCommandSpec) -> Result<Vec<(String, String)>, String> {
+    let mut env = BTreeMap::from_iter(codex_cli_env(config)?);
+    if let Some(dir) = command.parent_dir() {
+        let user_path = env.get("PATH").map(String::as_str);
+        env.insert("PATH".to_string(), merged_path_with_dir(&dir, user_path));
+    }
+    Ok(env.into_iter().collect())
 }
 
 trait CommandParentDir {
@@ -66,18 +102,53 @@ async fn resolve_program_path(program: &str) -> Option<String> {
 fn direct_program_path(program: &str) -> Option<String> {
     let path = Path::new(program);
     if path.is_absolute() && path.is_file() {
-        Some(path.to_string_lossy().to_string())
+        #[cfg(windows)]
+        return windows_launchable_program_path(path);
+        #[cfg(not(windows))]
+        return Some(path.to_string_lossy().to_string());
     } else {
         None
     }
+}
+
+#[cfg(windows)]
+fn windows_launchable_program_path(path: &Path) -> Option<String> {
+    if is_windows_launchable_program(path) {
+        return Some(path.to_string_lossy().to_string());
+    }
+    let parent = path.parent()?;
+    let stem = path.file_name()?.to_str()?;
+    program_path_candidates(parent, stem)
+        .into_iter()
+        .find(|candidate| is_windows_launchable_program(candidate))
+        .and_then(|candidate| candidate.is_file().then(|| candidate.to_string_lossy().to_string()))
+}
+
+#[cfg(windows)]
+fn is_windows_launchable_program(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()).map(str::to_ascii_lowercase).as_deref(),
+        Some("exe" | "cmd" | "bat" | "com")
+    )
 }
 
 fn common_program_path(program: &str) -> Option<String> {
     common_executable_dirs()
         .into_iter()
         .flat_map(|dir| program_path_candidates(&dir, program))
+        .filter(|path| is_launchable_program_path(path))
         .find(|path| path.is_file())
         .map(|path| path.to_string_lossy().to_string())
+}
+
+#[cfg(not(windows))]
+fn is_launchable_program_path(_path: &Path) -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn is_launchable_program_path(path: &Path) -> bool {
+    is_windows_launchable_program(path)
 }
 
 #[cfg(not(windows))]
@@ -91,7 +162,10 @@ fn program_path_candidates(dir: &Path, program: &str) -> Vec<PathBuf> {
     if path.extension().is_some() {
         return vec![dir.join(program)];
     }
-    ["", ".cmd", ".exe", ".bat", ".ps1"].iter().map(|extension| dir.join(format!("{program}{extension}"))).collect()
+    [".cmd", ".exe", ".bat", ".com", "", ".ps1"]
+        .iter()
+        .map(|extension| dir.join(format!("{program}{extension}")))
+        .collect()
 }
 
 #[cfg(not(windows))]
@@ -114,19 +188,23 @@ async fn shell_program_path(program: &str) -> Option<String> {
 
 #[cfg(windows)]
 async fn shell_program_path(program: &str) -> Option<String> {
-    let script = format!("(Get-Command {} -ErrorAction SilentlyContinue).Source", windows_shell_quote(program));
+    let script = format!("(Get-Command -All {} -ErrorAction SilentlyContinue).Source", windows_shell_quote(program));
     let mut command = Command::new("powershell.exe");
     command.args(["-NoProfile", "-Command", &script]);
     command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
     let output = command.output().await.ok()?;
     output.status.success().then_some(())?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .filter(|path| Path::new(path).is_file())
-        .map(ToString::to_string)
+    first_windows_program_path(&stdout)
+}
+
+#[cfg(windows)]
+fn first_windows_program_path(value: &str) -> Option<String> {
+    let paths = value.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
+    paths
+        .into_iter()
+        .find(|path| is_windows_launchable_program(Path::new(path)) && Path::new(path).is_file())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(windows)]
@@ -167,9 +245,12 @@ fn common_executable_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn merged_path_with_dir(dir: &str) -> String {
+fn merged_path_with_dir(dir: &str, user_path: Option<&str>) -> String {
     let mut seen = BTreeSet::new();
     let mut dirs = vec![PathBuf::from(dir)];
+    if let Some(path) = user_path {
+        dirs.extend(env::split_paths(path));
+    }
     dirs.extend(common_executable_dirs());
     let paths = dirs.into_iter().filter(|path| seen.insert(path.clone())).collect::<Vec<_>>();
     env::join_paths(paths).unwrap_or_default().to_string_lossy().to_string()
@@ -227,6 +308,58 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn validate_codex_program(config: &AiConfig) -> Result<String, String> {
+    let program = codex_program(config);
+    if starts_with_env_assignment(&program) {
+        return Err("[codexCliPathInvalid] Codex CLI path should contain only the executable path. Add environment variables in the Codex CLI environment variables section.".to_string());
+    }
+    Ok(program)
+}
+
+pub fn codex_cli_env(config: &AiConfig) -> Result<Vec<(String, String)>, String> {
+    let mut env = BTreeMap::new();
+    for (key, value) in &config.codex_cli_env {
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        if !is_env_var_name(key) {
+            return Err(format!(
+                "[codexEnvInvalid] Invalid Codex CLI environment variable name `{key}`. Use names like HTTPS_PROXY."
+            ));
+        }
+        if is_reserved_dbx_mcp_env_name(key) {
+            return Err(format!(
+                "[codexEnvReserved] `{key}` is managed by DBX for the scoped MCP server and cannot be set here."
+            ));
+        }
+        env.insert(key.to_string(), value.clone());
+    }
+    Ok(env.into_iter().collect())
+}
+
+fn starts_with_env_assignment(program: &str) -> bool {
+    let Some(first_token) = program.split_whitespace().next() else {
+        return false;
+    };
+    let Some((key, _)) = first_token.split_once('=') else {
+        return false;
+    };
+    is_env_var_name(key)
+}
+
+fn is_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic()) && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn is_reserved_dbx_mcp_env_name(name: &str) -> bool {
+    name.to_ascii_uppercase().starts_with("DBX_MCP_")
+}
+
 pub fn codex_enabled_tools(agent_mode: bool) -> Vec<&'static str> {
     dbx_mcp_enabled_tools(agent_mode)
 }
@@ -239,7 +372,7 @@ fn codex_mcp_config_overrides(options: &CodexRunOptions) -> Vec<String> {
         "mcp_servers.dbx.required=true".to_string(),
         "mcp_servers.dbx.startup_timeout_sec=20".to_string(),
         "mcp_servers.dbx.tool_timeout_sec=120".to_string(),
-        "mcp_servers.dbx.default_tools_approval_mode=\"auto\"".to_string(),
+        "mcp_servers.dbx.default_tools_approval_mode=\"approve\"".to_string(),
         format!("mcp_servers.dbx.enabled_tools={}", toml_string_array(&dbx_mcp_enabled_tools(options.agent_mode))),
     ];
     if let Some(command) = options.mcp_server_command.as_ref().filter(|command| !command.args.is_empty()) {
@@ -284,10 +417,12 @@ pub fn build_codex_prompt(system_prompt: &str, messages: &[crate::ai::AiMessage]
 }
 
 pub async fn list_codex_models(config: &AiConfig) -> Result<Vec<AiModelInfo>, String> {
+    validate_codex_program(config)?;
     let command = resolve_codex_command(config).await;
-    let output = Command::new(&command.program)
+    let output = cli_command(&command.program)
+        .args(command.args.iter().map(String::as_str))
         .args(["debug", "models"])
-        .envs(command_env(&command).iter().map(|(key, value)| (key.as_str(), value.as_str())))
+        .envs(codex_process_env(config, &command)?.iter().map(|(key, value)| (key.as_str(), value.as_str())))
         .output()
         .await;
 
@@ -335,30 +470,16 @@ fn parse_codex_models(stdout: &str) -> Option<Vec<AiModelInfo>> {
 
 pub async fn test_codex_connection(config: &AiConfig) -> Result<AiTestConnectionResult, String> {
     let start = Instant::now();
+    validate_codex_program(config)?;
     let codex_command = resolve_codex_command(config).await;
-    let mut command = Command::new(&codex_command.program);
-    command.args(["exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only"]);
-    command.envs(command_env(&codex_command).iter().map(|(key, value)| (key.as_str(), value.as_str())));
+    let mut command = cli_command(&codex_command.program);
+    command.args(codex_command.args.iter().map(String::as_str));
+    command.args(["login", "status"]);
+    command.envs(codex_process_env(config, &codex_command)?.iter().map(|(key, value)| (key.as_str(), value.as_str())));
 
-    let model = config.model.trim();
-    if !model.is_empty() && !model.eq_ignore_ascii_case("default") {
-        command.args(["--model", model]);
-    }
-
-    let output = command
-        .arg("Reply with exactly: DBX Codex OK")
-        .output()
-        .await
-        .map_err(|e| classify_codex_spawn_error(&e.to_string()))?;
+    let output = command.output().await.map_err(|e| classify_codex_spawn_error(&e.to_string()))?;
 
     if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.contains("DBX Codex OK") {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "[codexRunFailed] Codex CLI smoke test returned unexpected output. stdout: {stdout} stderr: {stderr}"
-            ));
-        }
         Ok(AiTestConnectionResult {
             success: true,
             message: format!("OK - {}ms", start.elapsed().as_millis()),
@@ -405,10 +526,12 @@ pub async fn run_codex_agent(
     cancelled: &Notify,
     on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
 ) -> Result<String, String> {
+    validate_codex_program(config)?;
     let mut command = build_codex_exec_command(config, prompt, &options);
     let resolved_command = resolve_codex_command(config).await;
     command.program = resolved_command.program;
-    let env = command_env(&command);
+    command.args.splice(0..0, resolved_command.args);
+    let env = codex_process_env(config, &command)?;
     run_cli_jsonl_agent(
         CliAgentProcessSpec {
             command,
@@ -428,8 +551,14 @@ mod tests {
     #[cfg(not(windows))]
     use super::shell_quote;
     use super::{
-        build_codex_exec_command, codex_enabled_tools, command_env, common_executable_dirs, is_path_like_program,
-        merged_path_with_dir, parse_codex_jsonl_event, parse_codex_models, CodexRunOptions, DEFAULT_CODEX_MODELS,
+        build_codex_exec_command, codex_cli_env, codex_enabled_tools, is_path_like_program, parse_codex_jsonl_event,
+        parse_codex_models, validate_codex_program, CodexRunOptions, DEFAULT_CODEX_MODELS,
+    };
+    #[cfg(not(windows))]
+    use super::{codex_process_env, common_executable_dirs, merged_path_with_dir};
+    #[cfg(windows)]
+    use super::{
+        direct_program_path, first_windows_program_path, program_path_candidates, windows_npm_codex_shim_command,
     };
     use crate::agent_events::AgentEvent;
     use crate::ai::{AiApiStyle, AiAuthMethod, AiConfig, AiProvider, AiReasoningLevel};
@@ -449,6 +578,7 @@ mod tests {
             reasoning_level: AiReasoningLevel::Default,
             context_window: None,
             codex_cli_path: None,
+            codex_cli_env: Default::default(),
         }
     }
 
@@ -471,6 +601,7 @@ mod tests {
         assert!(!spec.args.contains(&"--model".to_string()));
         assert!(!spec.args.contains(&"--ask-for-approval".to_string()));
         assert!(spec.args.contains(&"mcp_servers.dbx.command=\"dbx-mcp-server\"".to_string()));
+        assert!(spec.args.contains(&"mcp_servers.dbx.default_tools_approval_mode=\"approve\"".to_string()));
         assert!(spec.args.contains(&"mcp_servers.dbx.env.DBX_MCP_ALLOW_WRITES=\"0\"".to_string()));
         assert!(spec.args.contains(&"mcp_servers.dbx.env.DBX_MCP_SCOPE_CONNECTION_ID=\"conn-1\"".to_string()));
         assert!(spec.args.iter().any(|arg| arg.contains("dbx_execute_query")));
@@ -521,6 +652,90 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn windows_codex_lookup_prefers_cmd_over_extensionless_shim() {
+        let candidates = program_path_candidates(std::path::Path::new(r"C:\nvm4w\nodejs"), "codex");
+
+        assert_eq!(candidates[0], std::path::Path::new(r"C:\nvm4w\nodejs\codex.cmd"));
+        assert!(candidates.iter().position(|path| path == std::path::Path::new(r"C:\nvm4w\nodejs\codex")).unwrap() > 0);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_shell_lookup_prefers_launchable_command() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let extensionless = dir.join("codex");
+        let cmd = dir.join("codex.cmd");
+        std::fs::write(&extensionless, "#!/bin/sh\n").unwrap();
+        std::fs::write(&cmd, "@echo off\n").unwrap();
+
+        let output = format!("{}\n{}\n", extensionless.display(), cmd.display());
+        let resolved = first_windows_program_path(&output).unwrap();
+
+        assert_eq!(resolved, cmd.to_string_lossy());
+        let _ = std::fs::remove_file(extensionless);
+        let _ = std::fs::remove_file(cmd);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_direct_extensionless_path_uses_cmd_sibling() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-direct-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let extensionless = dir.join("codex");
+        let cmd = dir.join("codex.cmd");
+        std::fs::write(&extensionless, "#!/bin/sh\n").unwrap();
+        std::fs::write(&cmd, "@echo off\n").unwrap();
+
+        let resolved = direct_program_path(extensionless.to_string_lossy().as_ref()).unwrap();
+
+        assert_eq!(resolved, cmd.to_string_lossy().as_ref());
+        let _ = std::fs::remove_file(extensionless);
+        let _ = std::fs::remove_file(cmd);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_direct_extensionless_path_is_not_launchable_without_sibling() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-direct-missing-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let extensionless = dir.join("codex");
+        std::fs::write(&extensionless, "#!/bin/sh\n").unwrap();
+
+        let resolved = direct_program_path(extensionless.to_string_lossy().as_ref());
+
+        assert!(resolved.is_none());
+        let _ = std::fs::remove_file(extensionless);
+        let _ = std::fs::remove_dir(dir);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_npm_codex_cmd_shim_uses_node_directly() {
+        let dir = std::env::temp_dir().join(format!("dbx-codex-npm-shim-test-{}", std::process::id()));
+        let bin_dir = dir.join("node_modules").join("@openai").join("codex").join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let cmd = dir.join("codex.cmd");
+        let node = dir.join("node.exe");
+        let codex_js = bin_dir.join("codex.js");
+        std::fs::write(&cmd, "@echo off\nnode codex.js %*\n").unwrap();
+        std::fs::write(&node, "").unwrap();
+        std::fs::write(&codex_js, "#!/usr/bin/env node\n").unwrap();
+
+        let command = windows_npm_codex_shim_command(cmd.to_string_lossy().as_ref()).unwrap();
+
+        assert_eq!(command.program, node.to_string_lossy().as_ref());
+        assert_eq!(command.args, vec![codex_js.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_file(cmd);
+        let _ = std::fs::remove_file(node);
+        let _ = std::fs::remove_file(codex_js);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     #[cfg(not(windows))]
     fn common_codex_lookup_dirs_include_homebrew_and_system_paths() {
         let dirs = common_executable_dirs();
@@ -533,8 +748,9 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn codex_command_env_prepends_resolved_program_dir_and_keeps_node_dirs() {
+        let config = codex_config("default");
         let command = CliAgentCommandSpec { program: "/opt/homebrew/bin/codex".to_string(), args: Vec::new() };
-        let env = command_env(&command);
+        let env = codex_process_env(&config, &command).unwrap();
         let path = env.iter().find(|(key, _)| key == "PATH").map(|(_, value)| value).unwrap();
         let dirs = std::env::split_paths(path).collect::<Vec<_>>();
 
@@ -545,11 +761,26 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn merged_path_deduplicates_codex_dir() {
-        let path = merged_path_with_dir("/opt/homebrew/bin");
+        let path = merged_path_with_dir("/opt/homebrew/bin", None);
         let dirs = std::env::split_paths(&path).collect::<Vec<_>>();
         let count = dirs.iter().filter(|dir| *dir == std::path::Path::new("/opt/homebrew/bin")).count();
 
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn codex_process_env_keeps_resolved_program_dir_before_user_path() {
+        let mut config = codex_config("default");
+        config.codex_cli_env.insert("PATH".to_string(), "/custom/bin:/usr/bin".to_string());
+        let command = CliAgentCommandSpec { program: "/opt/homebrew/bin/codex".to_string(), args: Vec::new() };
+
+        let env = codex_process_env(&config, &command).unwrap();
+        let path = env.iter().find(|(key, _)| key == "PATH").map(|(_, value)| value).unwrap();
+        let dirs = std::env::split_paths(path).collect::<Vec<_>>();
+
+        assert_eq!(dirs.first().unwrap(), std::path::Path::new("/opt/homebrew/bin"));
+        assert!(dirs.iter().any(|dir| dir == std::path::Path::new("/custom/bin")));
     }
 
     #[test]
@@ -562,6 +793,55 @@ mod tests {
     #[test]
     fn default_model_list_matches_plan() {
         assert_eq!(model_infos(DEFAULT_CODEX_MODELS), model_infos(&["default", "gpt-5.5", "gpt-5.4-mini"]));
+    }
+
+    #[test]
+    fn normalizes_codex_cli_env() {
+        let mut config = codex_config("default");
+        config.codex_cli_env.insert(" HTTPS_PROXY ".to_string(), "http://proxy:9800".to_string());
+        config.codex_cli_env.insert("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string());
+        config.codex_cli_env.insert("".to_string(), "ignored".to_string());
+
+        let env = codex_cli_env(&config).unwrap();
+
+        assert_eq!(
+            env,
+            vec![
+                ("HTTPS_PROXY".to_string(), "http://proxy:9800".to_string()),
+                ("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_codex_cli_env_name() {
+        let mut config = codex_config("default");
+        config.codex_cli_env.insert("BAD-NAME".to_string(), "value".to_string());
+
+        let err = codex_cli_env(&config).unwrap_err();
+
+        assert!(err.contains("[codexEnvInvalid]"));
+    }
+
+    #[test]
+    fn rejects_reserved_dbx_mcp_env_name() {
+        let mut config = codex_config("default");
+        config.codex_cli_env.insert("DBX_MCP_ALLOW_DANGEROUS_SQL".to_string(), "1".to_string());
+
+        let err = codex_cli_env(&config).unwrap_err();
+
+        assert!(err.contains("[codexEnvReserved]"));
+    }
+
+    #[test]
+    fn rejects_shell_style_env_prefix_in_codex_cli_path() {
+        let mut config = codex_config("default");
+        config.codex_cli_path = Some("HTTPS_PROXY=http://proxy:9800 /opt/homebrew/bin/codex".to_string());
+
+        let err = validate_codex_program(&config).unwrap_err();
+
+        assert!(err.contains("[codexCliPathInvalid]"));
+        assert!(err.contains("environment variables section"));
     }
 
     #[test]
@@ -601,6 +881,30 @@ mod tests {
         .unwrap();
         assert!(
             matches!(&tool_done[0], AgentEvent::ToolCallEnd { tool_name, is_error, .. } if tool_name == "dbx_list_tables" && !is_error)
+        );
+
+        let current_started = parse_codex_jsonl_event(
+            r#"{"type":"item.started","item":{"id":"item_0","type":"mcp_tool_call","server":"dbx","tool":"dbx_execute_query","arguments":{"sql":"SELECT 1"},"result":null,"error":null,"status":"in_progress"}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(&current_started[0], AgentEvent::ToolCallStart { tool_name, args, .. } if tool_name == "dbx_execute_query" && args["sql"] == "SELECT 1")
+        );
+
+        let current_tool_done = parse_codex_jsonl_event(
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"mcp_tool_call","server":"dbx","tool":"dbx_execute_query","arguments":{"sql":"SELECT 1"},"result":{"content":[{"type":"text","text":"ok"}],"structured_content":null},"error":null,"status":"completed"}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(&current_tool_done[0], AgentEvent::ToolCallEnd { tool_name, result, is_error, .. } if tool_name == "dbx_execute_query" && result["content"][0]["text"] == "ok" && !is_error)
+        );
+
+        let current_tool_error = parse_codex_jsonl_event(
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"mcp_tool_call","server":"dbx","tool":"dbx_execute_query","arguments":{"sql":"SELECT 1"},"result":null,"error":{"message":"user cancelled MCP tool call"},"status":"failed"}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(&current_tool_error[0], AgentEvent::ToolCallEnd { tool_name, result, is_error, .. } if tool_name == "dbx_execute_query" && result["message"] == "user cancelled MCP tool call" && *is_error)
         );
 
         let turn_done =

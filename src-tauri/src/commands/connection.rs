@@ -248,6 +248,7 @@ mod tests {
             redis_sentinel_tls: false,
             redis_cluster_nodes: String::new(),
             redis_key_separator: dbx_core::models::connection::default_redis_key_separator(),
+            redis_scan_page_size: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -713,11 +714,12 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     .await
                     .map(|_| "Connection successful".to_string())
             }
-            DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate => {
+            DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate | DatabaseType::ChromaDb => {
                 let kind = match config.db_type {
                     DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
                     DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
                     DatabaseType::Weaviate => db::vector_driver::VectorDbKind::Weaviate,
+                    DatabaseType::ChromaDb => db::vector_driver::VectorDbKind::ChromaDb,
                     _ => unreachable!(),
                 };
                 let client = db::vector_driver::VectorClient::new(
@@ -777,6 +779,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                     &url,
                     username,
                     password,
+                    config.url_params.clone(),
                     Some(&config.ca_cert_path),
                     connect_timeout,
                 )?;
@@ -999,11 +1002,12 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
             db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
             PoolKind::Elasticsearch(client)
         }
-        DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate => {
+        DatabaseType::Qdrant | DatabaseType::Milvus | DatabaseType::Weaviate | DatabaseType::ChromaDb => {
             let kind = match db_config.db_type {
                 DatabaseType::Qdrant => db::vector_driver::VectorDbKind::Qdrant,
                 DatabaseType::Milvus => db::vector_driver::VectorDbKind::Milvus,
                 DatabaseType::Weaviate => db::vector_driver::VectorDbKind::Weaviate,
+                DatabaseType::ChromaDb => db::vector_driver::VectorDbKind::ChromaDb,
                 _ => unreachable!(),
             };
             let client = db::vector_driver::VectorClient::new(
@@ -1060,6 +1064,7 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
                 &url,
                 username,
                 password,
+                db_config.url_params,
                 Some(&db_config.ca_cert_path),
                 connect_timeout,
             )?;

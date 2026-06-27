@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 
 use crate::models::connection::DatabaseType;
 use crate::sql::starts_with_executable_sql_keyword;
@@ -387,15 +388,25 @@ pub async fn connect_with_ca_cert_and_pool_limit(
     fallback_timeout: Duration,
     max_connections: usize,
 ) -> Result<MySqlPool, String> {
+    connect_with_ca_cert_pool_limit_and_idle(url, ca_cert_path, fallback_timeout, max_connections, None).await
+}
+
+pub async fn connect_with_ca_cert_pool_limit_and_idle(
+    url: &str,
+    ca_cert_path: Option<&str>,
+    fallback_timeout: Duration,
+    max_connections: usize,
+    idle_timeout_secs: Option<u64>,
+) -> Result<MySqlPool, String> {
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
-    let pool = create_pool(url, ca_cert_path, max_connections)?;
+    let pool = create_pool(url, ca_cert_path, max_connections, idle_timeout_secs)?;
     let result = verify_pool_connection(&pool, timeout).await;
 
     if let Err(ref e) = result {
         if mysql_error_should_retry_without_ssl(e) {
             if let Some(fallback_url) = ssl_fallback_url(url) {
                 log::info!("SSL handshake failed, retrying with ssl-mode=disabled");
-                let fallback_pool = create_pool(&fallback_url, None, max_connections)?;
+                let fallback_pool = create_pool(&fallback_url, None, max_connections, idle_timeout_secs)?;
                 return match verify_pool_connection(&fallback_pool, timeout).await {
                     Ok(()) => Ok(fallback_pool),
                     Err(e) => Err(e),
@@ -413,7 +424,12 @@ struct MySqlTlsFiles {
     sslkey: Option<String>,
 }
 
-fn create_pool(url: &str, ca_cert_path: Option<&str>, max_connections: usize) -> Result<MySqlPool, String> {
+fn create_pool(
+    url: &str,
+    ca_cert_path: Option<&str>,
+    max_connections: usize,
+    idle_timeout_secs: Option<u64>,
+) -> Result<MySqlPool, String> {
     let tls_url = mysql_tls_url(url)?;
     let opts =
         mysql_async::Opts::from_url(&mysql_async_url(&tls_url.url)).map_err(|e| format!("Invalid MySQL URL: {e}"))?;
@@ -422,14 +438,17 @@ fn create_pool(url: &str, ca_cert_path: Option<&str>, max_connections: usize) ->
     // Single-connection pools (max_connections == 1) are client session pools that
     // must preserve session state (e.g. TEMPORARY TABLEs) across queries.
     // Disable COM_RESET_CONNECTION for these pools to avoid clearing that state.
+    let inactive_ttl =
+        idle_timeout_secs.filter(|&s| s >= 30).map(Duration::from_secs).unwrap_or(Duration::from_secs(300));
     let pool_opts = mysql_async::PoolOpts::new()
         .with_constraints(mysql_async::PoolConstraints::new(1, max_connections).unwrap())
-        .with_inactive_connection_ttl(Duration::from_secs(300))
+        .with_inactive_connection_ttl(inactive_ttl)
         .with_reset_connection(max_connections > 1);
     let mut builder = mysql_async::OptsBuilder::from_opts(opts)
         .stmt_cache_size(0)
         .prefer_socket(false)
         .pool_opts(Some(pool_opts))
+        .tcp_keepalive(Some(30u32))
         .setup(mysql_setup_queries(url));
     if let Some(ssl_opts) = mysql_ssl_opts(base_ssl_opts, url, ca_cert_path, &tls_url.files)? {
         builder = builder.ssl_opts(ssl_opts);
@@ -992,12 +1011,12 @@ pub async fn connect_bare_with_pool_limit(
     max_connections: usize,
 ) -> Result<MySqlPool, String> {
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
-    let pool = create_pool(url, None, max_connections)?;
+    let pool = create_pool(url, None, max_connections, None)?;
     verify_pool_connection(&pool, timeout).await.map(|_| pool)
 }
 
 pub async fn list_databases(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, String> {
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let result = match conn.query_iter("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME").await
     {
         Ok(result) => result,
@@ -1018,7 +1037,7 @@ pub async fn list_databases(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, Strin
 }
 
 pub async fn list_databases_show(pool: &MySqlPool) -> Result<Vec<DatabaseInfo>, String> {
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let result = conn.query_iter("SHOW DATABASES").await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     Ok(database_infos_from_names(rows.iter().map(|row| get_str(row, 0)), true))
@@ -1045,18 +1064,28 @@ fn database_infos_from_names(
 }
 
 pub async fn list_tables(pool: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, String> {
-    let sql = format!(
-        "SELECT TABLE_NAME, TABLE_TYPE, TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = {} ORDER BY TABLE_NAME",
-        quote_value(database),
-    );
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    list_tables_filtered(pool, database, None, None, None, None).await
+}
+
+pub async fn list_tables_filtered(
+    pool: &MySqlPool,
+    database: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    object_types: Option<&[String]>,
+) -> Result<Vec<TableInfo>, String> {
+    let sql = list_tables_sql(database, filter, limit, offset, object_types);
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let result = match conn.query_iter(&sql).await {
         Ok(result) => result,
         Err(err) => {
             log::debug!(
                 "Falling back to SHOW TABLES for database `{database}` after information_schema.TABLES failed: {err}"
             );
-            return list_tables_show(pool, database).await;
+            return list_tables_show(pool, database)
+                .await
+                .map(|tables| filter_list_tables_fallback(tables, filter, limit, offset, object_types));
         }
     };
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
@@ -1077,12 +1106,103 @@ pub async fn list_tables(pool: &MySqlPool, database: &str) -> Result<Vec<TableIn
         })
         .collect();
 
-    if tables.is_empty() {
+    if tables.is_empty() && should_fallback_empty_list_tables(filter, limit, offset, object_types) {
         log::debug!("Falling back to SHOW TABLES for database `{database}` after information_schema.TABLES returned no named tables");
         return list_tables_show(pool, database).await;
     }
 
     Ok(tables)
+}
+
+fn should_fallback_empty_list_tables(
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    object_types: Option<&[String]>,
+) -> bool {
+    let has_filter = filter.is_some_and(|filter| !filter.trim().is_empty());
+    let has_object_types = object_types.is_some_and(|object_types| !object_types.is_empty());
+    !has_filter && limit.is_none() && offset.unwrap_or(0) == 0 && !has_object_types
+}
+
+fn filter_list_tables_fallback(
+    tables: Vec<TableInfo>,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    object_types: Option<&[String]>,
+) -> Vec<TableInfo> {
+    let filter = filter.unwrap_or("").trim();
+    let normalized_object_types: Vec<String> = object_types
+        .unwrap_or(&[])
+        .iter()
+        .map(|object_type| object_type.to_ascii_uppercase().replace(' ', "_"))
+        .collect();
+    let wants_table =
+        normalized_object_types.is_empty() || normalized_object_types.iter().any(|object_type| object_type == "TABLE");
+    let wants_view =
+        normalized_object_types.is_empty() || normalized_object_types.iter().any(|object_type| object_type == "VIEW");
+
+    tables
+        .into_iter()
+        .filter(|table| crate::sql::contains_or_fuzzy_match(&table.name, filter))
+        .filter(|table| if table.table_type.eq_ignore_ascii_case("VIEW") { wants_view } else { wants_table })
+        .skip(offset.unwrap_or(0))
+        .take(limit.unwrap_or(usize::MAX))
+        .collect()
+}
+
+fn list_tables_sql(
+    database: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    object_types: Option<&[String]>,
+) -> String {
+    let mut sql = format!(
+        "SELECT TABLE_NAME, TABLE_TYPE, TABLE_COMMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA = {}",
+        quote_value(database),
+    );
+    if let Some(object_types) = object_types.filter(|object_types| !object_types.is_empty()) {
+        let wants_table = object_types
+            .iter()
+            .map(|object_type| object_type.to_ascii_uppercase().replace(' ', "_"))
+            .any(|object_type| object_type == "TABLE");
+        let wants_view = object_types
+            .iter()
+            .map(|object_type| object_type.to_ascii_uppercase().replace(' ', "_"))
+            .any(|object_type| object_type == "VIEW");
+        match (wants_table, wants_view) {
+            (true, false) => sql.push_str(" AND TABLE_TYPE <> 'VIEW'"),
+            (false, true) => sql.push_str(" AND TABLE_TYPE = 'VIEW'"),
+            (false, false) => sql.push_str(" AND 1 = 0"),
+            (true, true) => {}
+        }
+    }
+    if let Some(filter) = filter.map(str::trim).filter(|filter| !filter.is_empty()) {
+        let escaped = filter.to_ascii_lowercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{}%", escaped);
+        if crate::sql::fuzzy_filter_enabled(filter) {
+            let fuzzy_pattern = crate::sql::fuzzy_like_pattern_with_escape(&filter.to_ascii_lowercase(), |value| {
+                value.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+            });
+            sql.push_str(&format!(
+                " AND (LOWER(TABLE_NAME) LIKE {} ESCAPE '\\\\' OR LOWER(TABLE_NAME) LIKE {} ESCAPE '\\\\')",
+                quote_value(&pattern),
+                quote_value(&fuzzy_pattern)
+            ));
+        } else {
+            sql.push_str(&format!(" AND LOWER(TABLE_NAME) LIKE {} ESCAPE '\\\\'", quote_value(&pattern)));
+        }
+    }
+    sql.push_str(" ORDER BY TABLE_NAME");
+    if let Some(limit) = limit {
+        sql.push_str(&format!(" LIMIT {}", limit));
+    }
+    if let Some(offset) = offset.filter(|offset| *offset > 0) {
+        sql.push_str(&format!(" OFFSET {}", offset));
+    }
+    sql
 }
 
 pub async fn completion_assistant_search(
@@ -1097,7 +1217,7 @@ pub async fn completion_assistant_search(
         request.object_kinds.clone()
     };
     let pattern = mysql_completion_like_pattern(&request.mask, request.match_mode.as_ref());
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let mut candidates = Vec::new();
 
     if kinds
@@ -1320,7 +1440,7 @@ fn table_comment_sql(database: &str, table: &str) -> String {
 
 pub async fn get_table_comment(pool: &MySqlPool, database: &str, table: &str) -> Result<Option<String>, String> {
     let sql = table_comment_sql(database, table);
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     Ok(rows
@@ -1343,7 +1463,7 @@ async fn list_table_status_show(pool: &MySqlPool, database: &str) -> Result<Hash
     } else {
         format!("SHOW TABLE STATUS FROM {}", quote_identifier(database))
     };
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     Ok(rows
@@ -1366,7 +1486,7 @@ async fn list_table_status_show(pool: &MySqlPool, database: &str) -> Result<Hash
 
 async fn list_table_names_show(pool: &MySqlPool, database: &str) -> Result<Vec<TableInfo>, String> {
     let sql = show_tables_sql(database, true);
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let rows: Vec<mysql_async::Row> = match conn.query_iter(&sql).await {
         Ok(result) => result.collect_and_drop().await.map_err(|e| e.to_string())?,
         Err(_) => {
@@ -1488,7 +1608,7 @@ fn row_to_object(row: &mysql_async::Row, database: &str) -> ObjectInfo {
 }
 
 pub async fn list_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
 
     let tables_sql = list_tables_objects_sql(database);
     let result = conn.query_iter(&tables_sql).await.map_err(|e| e.to_string())?;
@@ -1524,7 +1644,7 @@ pub async fn list_object_statistics(pool: &MySqlPool, database: &str) -> Result<
          ORDER BY TABLE_NAME",
         quote_value(database),
     );
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
     Ok(rows
@@ -1571,7 +1691,7 @@ pub async fn list_table_objects_show(pool: &MySqlPool, database: &str) -> Result
 }
 
 async fn list_routine_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let routines_sql = list_routines_sql(database);
     let result = conn.query_iter(&routines_sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
@@ -1579,7 +1699,7 @@ async fn list_routine_objects(pool: &MySqlPool, database: &str) -> Result<Vec<Ob
 }
 
 pub async fn list_completion_objects(pool: &MySqlPool, database: &str) -> Result<Vec<ObjectInfo>, String> {
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let mut objects = Vec::new();
 
     let routines_sql = list_routines_sql(database);
@@ -1890,31 +2010,115 @@ fn skip_mysql_quoted(sql: &str, start: usize, quote: u8) -> usize {
 /// Get a connection from the pool with a health check. If the connection is dead
 /// (e.g. after app was backgrounded), it tries again with a fresh connection.
 pub async fn get_conn_with_health_check(pool: &MySqlPool) -> Result<mysql_async::Conn, String> {
-    let timeout = crate::db::connection_timeout();
-    let mut conn = get_conn_with_timeout(pool, timeout).await?;
-    match ping_conn_with_timeout(&mut conn, timeout).await {
-        Ok(()) => Ok(conn),
-        _ => {
-            let _ = tokio::time::timeout(timeout, conn.disconnect()).await;
-            let mut conn = get_conn_with_timeout(pool, timeout).await?;
-            ping_conn_with_timeout(&mut conn, timeout).await?;
+    get_conn_with_health_check_with_timeout(pool, super::connection_timeout()).await
+}
+
+pub async fn get_conn_with_health_check_with_timeout(
+    pool: &MySqlPool,
+    timeout: Duration,
+) -> Result<mysql_async::Conn, String> {
+    get_conn_with_health_check_with_cancel(pool, timeout, timeout, None).await
+}
+
+pub async fn get_conn_with_health_check_with_cancel(
+    pool: &MySqlPool,
+    timeout: Duration,
+    cleanup_timeout: Duration,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<mysql_async::Conn, String> {
+    let start = Instant::now();
+    let mut conn = get_conn_with_timeout_and_cancel(pool, timeout, cancel_token).await?;
+    match ping_conn_with_timeout_and_cancel(&mut conn, timeout, cancel_token).await {
+        Ok(()) => {
+            log::debug!(
+                "[db:health.check:done] elapsed_ms={} timeout_ms={}",
+                start.elapsed().as_millis(),
+                timeout.as_millis()
+            );
+            Ok(conn)
+        }
+        Err(err) if err == crate::query::QUERY_CANCELED => {
+            let _ = tokio::time::timeout(cleanup_timeout, conn.disconnect()).await;
+            Err(err)
+        }
+        Err(err) => {
+            log::warn!(
+                "[db:health.check:error] elapsed_ms={} timeout_ms={} error={}; retrying",
+                start.elapsed().as_millis(),
+                timeout.as_millis(),
+                err
+            );
+            let _ = tokio::time::timeout(cleanup_timeout, conn.disconnect()).await;
+            let mut conn = get_conn_with_timeout_and_cancel(pool, timeout, cancel_token).await?;
+            if let Err(err) = ping_conn_with_timeout_and_cancel(&mut conn, timeout, cancel_token).await {
+                if err == crate::query::QUERY_CANCELED {
+                    let _ = tokio::time::timeout(cleanup_timeout, conn.disconnect()).await;
+                }
+                return Err(err);
+            }
+            log::info!(
+                "[db:health.check:recovered] elapsed_ms={} timeout_ms={}",
+                start.elapsed().as_millis(),
+                timeout.as_millis()
+            );
             Ok(conn)
         }
     }
 }
 
-async fn get_conn_with_timeout(pool: &MySqlPool, timeout: Duration) -> Result<mysql_async::Conn, String> {
+async fn get_conn_with_timeout_and_cancel(
+    pool: &MySqlPool,
+    timeout: Duration,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<mysql_async::Conn, String> {
+    let get_future = async {
+        tokio::time::timeout(timeout, pool.get_conn())
+            .await
+            .map_err(|_| "MySQL get connection timed out".to_string())?
+            .map_err(|e| e.to_string())
+    };
+
+    match cancel_token {
+        Some(token) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => Err(crate::query::canceled_error()),
+                result = get_future => result,
+            }
+        }
+        None => get_future.await,
+    }
+}
+
+pub async fn get_conn_with_timeout(pool: &MySqlPool, timeout: Duration) -> Result<mysql_async::Conn, String> {
     tokio::time::timeout(timeout, pool.get_conn())
         .await
         .map_err(|_| "MySQL get connection timed out".to_string())?
         .map_err(|e| e.to_string())
 }
 
-async fn ping_conn_with_timeout(conn: &mut mysql_async::Conn, timeout: Duration) -> Result<(), String> {
-    tokio::time::timeout(timeout, conn.ping())
-        .await
-        .map_err(|_| "MySQL ping timed out".to_string())?
-        .map_err(|e| e.to_string())
+async fn ping_conn_with_timeout_and_cancel(
+    conn: &mut mysql_async::Conn,
+    timeout: Duration,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<(), String> {
+    let ping_future = async {
+        tokio::time::timeout(timeout, conn.ping())
+            .await
+            .map_err(|_| "MySQL ping timed out".to_string())?
+            .map_err(|e| e.to_string())
+    };
+
+    match cancel_token {
+        Some(token) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => Err(crate::query::canceled_error()),
+                result = ping_future => result,
+            }
+        }
+        None => ping_future.await,
+    }
 }
 
 async fn execute_result_set_with_text_protocol_on_conn(
@@ -2133,13 +2337,61 @@ async fn stream_query_rows_prepared(
 }
 
 pub async fn kill_query(pool: &MySqlPool, connection_id: u32) -> Result<(), String> {
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
-    conn.query_drop(format!("KILL QUERY {connection_id}")).await.map_err(|e| e.to_string())
+    let start = Instant::now();
+    let timeout = super::connection_timeout();
+    let mut conn = tokio::time::timeout(timeout, pool.get_conn())
+        .await
+        .map_err(|_| {
+            log::warn!(
+                "[db:cancel:error] elapsed_ms={} timeout_ms={} error=MySQL kill connection checkout timed out",
+                start.elapsed().as_millis(),
+                timeout.as_millis()
+            );
+            "MySQL kill connection checkout timed out".to_string()
+        })?
+        .map_err(|e| e.to_string())?;
+    tokio::time::timeout(timeout, conn.query_drop(format!("KILL QUERY {connection_id}")))
+        .await
+        .map_err(|_| {
+            log::warn!(
+                "[db:cancel:error] elapsed_ms={} timeout_ms={} error=MySQL KILL QUERY timed out",
+                start.elapsed().as_millis(),
+                timeout.as_millis()
+            );
+            "MySQL KILL QUERY timed out".to_string()
+        })?
+        .map_err(|e| e.to_string())?;
+    log::info!("[db:cancel:done] elapsed_ms={} timeout_ms={}", start.elapsed().as_millis(), timeout.as_millis());
+    Ok(())
 }
 
 pub async fn kill_query_with_opts(opts: mysql_async::Opts, connection_id: u32) -> Result<(), String> {
-    let mut conn = mysql_async::Conn::new(opts).await.map_err(|e| e.to_string())?;
-    conn.query_drop(format!("KILL QUERY {connection_id}")).await.map_err(|e| e.to_string())
+    let start = Instant::now();
+    let timeout = super::connection_timeout();
+    let mut conn = tokio::time::timeout(timeout, mysql_async::Conn::new(opts))
+        .await
+        .map_err(|_| {
+            log::warn!(
+                "[db:cancel:error] elapsed_ms={} timeout_ms={} error=MySQL kill connection timed out",
+                start.elapsed().as_millis(),
+                timeout.as_millis()
+            );
+            "MySQL kill connection timed out".to_string()
+        })?
+        .map_err(|e| e.to_string())?;
+    tokio::time::timeout(timeout, conn.query_drop(format!("KILL QUERY {connection_id}")))
+        .await
+        .map_err(|_| {
+            log::warn!(
+                "[db:cancel:error] elapsed_ms={} timeout_ms={} error=MySQL KILL QUERY execution timed out",
+                start.elapsed().as_millis(),
+                timeout.as_millis()
+            );
+            "MySQL KILL QUERY execution timed out".to_string()
+        })?
+        .map_err(|e| e.to_string())?;
+    log::info!("[db:cancel:done] elapsed_ms={} timeout_ms={}", start.elapsed().as_millis(), timeout.as_millis());
+    Ok(())
 }
 
 pub async fn execute_query_on_conn_with_max_rows(
@@ -2299,7 +2551,7 @@ pub async fn list_indexes(pool: &MySqlPool, database: &str, table: &str) -> Resu
         quote_value(database),
         quote_value(table),
     );
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
 
@@ -2337,7 +2589,7 @@ pub async fn list_foreign_keys(pool: &MySqlPool, database: &str, table: &str) ->
         quote_value(database),
         quote_value(table),
     );
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
 
@@ -2364,7 +2616,7 @@ pub async fn list_triggers(pool: &MySqlPool, database: &str, table: &str) -> Res
         quote_value(database),
         quote_value(table),
     );
-    let mut conn = pool.get_conn().await.map_err(|e| e.to_string())?;
+    let mut conn = get_conn_with_timeout(pool, super::connection_timeout()).await?;
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
 
@@ -2382,6 +2634,7 @@ pub async fn list_triggers(pool: &MySqlPool, database: &str, table: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::connection_timeout;
     use mysql_async::consts::ColumnFlags;
 
     #[test]
@@ -2481,6 +2734,88 @@ mod tests {
         assert!(!sql.contains("UNION"));
         assert!(sql.contains("CREATE_TIME"));
         assert!(sql.contains("UPDATE_TIME"));
+    }
+
+    #[test]
+    fn mysql_list_tables_sql_applies_filter_limit_and_offset() {
+        let sql = list_tables_sql("app", Some("user_%"), Some(101), Some(200), None);
+
+        assert!(sql.contains("FROM information_schema.TABLES"));
+        assert!(sql.contains("TABLE_SCHEMA = 'app'"));
+        assert!(sql.contains("LOWER(TABLE_NAME) LIKE '%user\\\\_\\\\%%' ESCAPE '\\\\'"));
+        assert!(sql.contains("LOWER(TABLE_NAME) LIKE '%u%s%e%r%\\\\_%\\\\%%' ESCAPE '\\\\'"));
+        assert!(sql.contains("ORDER BY TABLE_NAME"));
+        assert!(sql.contains("LIMIT 101"));
+        assert!(sql.contains("OFFSET 200"));
+    }
+
+    #[test]
+    fn mysql_list_tables_sql_adds_fuzzy_filter_pattern() {
+        let sql = list_tables_sql("app", Some("sysu"), Some(100), None, None);
+
+        assert!(sql.contains("LOWER(TABLE_NAME) LIKE '%sysu%' ESCAPE '\\\\'"));
+        assert!(sql.contains("LOWER(TABLE_NAME) LIKE '%s%y%s%u%' ESCAPE '\\\\'"));
+    }
+
+    #[test]
+    fn mysql_list_tables_sql_skips_fuzzy_filter_for_single_character() {
+        let sql = list_tables_sql("app", Some("u"), Some(100), None, None);
+
+        assert!(sql.contains("LOWER(TABLE_NAME) LIKE '%u%' ESCAPE '\\\\'"));
+        assert_eq!(sql.matches("LOWER(TABLE_NAME) LIKE").count(), 1);
+        assert!(!sql.contains(" OR LOWER(TABLE_NAME) LIKE"));
+    }
+
+    #[test]
+    fn mysql_list_tables_sql_filters_table_type_before_pagination() {
+        let tables = vec!["TABLE".to_string()];
+        let table_sql = list_tables_sql("app", None, Some(1000), None, Some(&tables));
+        assert!(table_sql.contains("TABLE_TYPE <> 'VIEW'"));
+        assert!(table_sql.find("TABLE_TYPE <> 'VIEW'") < table_sql.find("ORDER BY TABLE_NAME"));
+        assert!(table_sql.find("ORDER BY TABLE_NAME") < table_sql.find("LIMIT 1000"));
+
+        let views = vec!["VIEW".to_string()];
+        let view_sql = list_tables_sql("app", None, Some(1000), None, Some(&views));
+        assert!(view_sql.contains("TABLE_TYPE = 'VIEW'"));
+    }
+
+    #[test]
+    fn mysql_empty_list_tables_fallback_only_for_unfiltered_query() {
+        assert!(should_fallback_empty_list_tables(None, None, None, None));
+        assert!(!should_fallback_empty_list_tables(Some("missing"), None, None, None));
+        assert!(!should_fallback_empty_list_tables(None, Some(1000), None, None));
+        assert!(!should_fallback_empty_list_tables(None, None, Some(1000), None));
+        assert!(!should_fallback_empty_list_tables(None, None, None, Some(&["VIEW".to_string()])));
+    }
+
+    #[test]
+    fn mysql_show_tables_fallback_applies_filter_type_limit_and_offset() {
+        let rows = vec![
+            TableInfo {
+                name: "audit_2024".to_string(),
+                table_type: "BASE TABLE".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            TableInfo {
+                name: "audit_view".to_string(),
+                table_type: "VIEW".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+            TableInfo {
+                name: "audit_2025".to_string(),
+                table_type: "BASE TABLE".to_string(),
+                comment: None,
+                parent_schema: None,
+                parent_name: None,
+            },
+        ];
+        let filtered = filter_list_tables_fallback(rows, Some("audit"), Some(1), Some(1), Some(&["TABLE".to_string()]));
+
+        assert_eq!(filtered.iter().map(|table| table.name.as_str()).collect::<Vec<_>>(), vec!["audit_2025"]);
     }
 
     #[test]
@@ -2861,7 +3196,7 @@ mod tests {
 
     #[test]
     fn parse_connect_timeout_ignores_out_of_range() {
-        let default = crate::db::connection_timeout();
+        let default = connection_timeout();
         let url = "mysql://host:3306/db?connect_timeout=999";
         assert_eq!(crate::db::parse_connect_timeout(url), default);
         let url2 = "mysql://host:3306/db?connect_timeout=0";
@@ -2870,14 +3205,14 @@ mod tests {
 
     #[test]
     fn parse_connect_timeout_returns_default_when_missing() {
-        let default = crate::db::connection_timeout();
+        let default = connection_timeout();
         let url = "mysql://host:3306/db?ssl-mode=preferred&charset=utf8mb4";
         assert_eq!(crate::db::parse_connect_timeout(url), default);
     }
 
     #[test]
     fn parse_connect_timeout_returns_default_when_no_query() {
-        let default = crate::db::connection_timeout();
+        let default = connection_timeout();
         let url = "mysql://host:3306/db";
         assert_eq!(crate::db::parse_connect_timeout(url), default);
     }
